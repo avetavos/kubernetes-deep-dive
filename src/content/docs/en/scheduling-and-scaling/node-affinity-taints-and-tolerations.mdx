@@ -1,0 +1,198 @@
+---
+title: 'Node Affinity, Taints, and Tolerations'
+description: 'The difference between nodeSelector, node affinity, and pod affinity/anti-affinity, and how taints and tolerations repel Pods from a Node unless explicitly allowed.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+**Affinity** pulls a Pod toward certain Nodes (or other Pods), while a **taint** repels Pods away from a Node unless the Pod carries a matching **toleration** — two mechanisms pointed in opposite directions that are often combined.
+
+## nodeSelector and node affinity: matching on Node labels
+
+The simplest way to constrain where a Pod runs is `nodeSelector` — an exact match against Node labels. If a Node does not have every label listed, it is not a candidate, full stop.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-inference
+spec:
+  nodeSelector:
+    hardware: gpu
+  containers:
+    - name: inference
+      image: inference-server:2.1.0
+```
+
+**Node affinity** does the same job with richer expressions (`In`, `NotIn`, `Exists`, and more) and, critically, a choice of how strictly the rule is enforced:
+
+- **`requiredDuringSchedulingIgnoredDuringExecution`** — a hard requirement. If no Node satisfies it, the Pod stays Pending.
+- **`preferredDuringSchedulingIgnoredDuringExecution`** — a soft preference with a `weight`. The scheduler favors matching Nodes but will still place the Pod elsewhere if it has to.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-inference-affinity
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: hardware
+                operator: In
+                values:
+                  - gpu
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 80
+          preference:
+            matchExpressions:
+              - key: topology.kubernetes.io/zone
+                operator: In
+                values:
+                  - us-central1-a
+  containers:
+    - name: inference
+      image: inference-server:2.1.0
+```
+
+Both suffixes end in `IgnoredDuringExecution`, meaning that once a Pod is running, a later change to Node labels never causes it to be evicted — these rules only affect the initial scheduling decision.
+
+## Pod affinity and anti-affinity: scheduling relative to other Pods
+
+Node affinity looks at Node labels. **Pod affinity** and **pod anti-affinity** instead look at the labels of *other Pods already running*, using a `topologyKey` to define what "nearby" means (a hostname, a zone, and so on). The most common use is spreading replicas of the same app apart for resilience:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - web-app
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: web-app
+          image: web-app:3.2.0
+```
+
+This anti-affinity rule tells the scheduler "never put two `web-app` Pods on the same host" — losing one Node never takes down more than one replica. The mirror case, **pod affinity**, co-locates Pods instead — for example, pinning a cache sidecar onto the same Node as the service that reads from it, to keep that traffic off the network entirely.
+
+## Taints and tolerations: a Node repelling Pods
+
+Affinity is a Pod deciding where it wants to go. A **taint** flips that around: it is applied to a **Node**, and it repels every Pod that does not carry a matching **toleration**.
+
+```bash
+# Taint a node so it repels ordinary Pods
+kubectl taint nodes gpu-node-1 hardware=gpu:NoSchedule
+```
+
+Three taint effects, in increasing strength:
+
+- **`NoSchedule`** — new Pods without a matching toleration will not be scheduled here. Pods already running are left alone.
+- **`PreferNoSchedule`** — a soft version; the scheduler tries to avoid the Node but will use it if it has to.
+- **`NoExecute`** — new Pods are blocked, *and* any already-running Pod on the Node that lacks a matching toleration is evicted.
+
+A Pod opts in with a `tolerations` entry that matches the taint's key, value, and effect:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-inference-toleration
+spec:
+  tolerations:
+    - key: hardware
+      operator: Equal
+      value: gpu
+      effect: NoSchedule
+  nodeSelector:
+    hardware: gpu
+  containers:
+    - name: inference
+      image: inference-server:2.1.0
+```
+
+A toleration only cancels out a taint — it does not attract the Pod there. That is why a dedicated GPU node pool is usually built from both mechanisms at once: the Nodes are tainted so ordinary Pods stay off them, and the GPU workload's Pods both tolerate that taint and use `nodeSelector` (or node affinity) to request scheduling there, along with a GPU resource request.
+
+<Mermaid title="A taint repels an ordinary Pod while a Pod with a matching toleration is allowed through" code={taintRepelDiagram} />
+
+export const taintRepelDiagram = `flowchart LR
+  node["Node: gpu-node-1\\n(tainted hardware=gpu:NoSchedule)"]
+  podA["Pod A: no toleration"] -- blocked --> node
+  podB["Pod B: tolerates hardware=gpu"] -- scheduled --> node`;
+
+<Callout title="The one-line takeaway">
+**Node affinity** pulls a Pod toward Nodes, hard with **`requiredDuringSchedulingIgnoredDuringExecution`** or soft with **`preferredDuringSchedulingIgnoredDuringExecution`**; **pod affinity/anti-affinity** does the same relative to other Pods, commonly to spread replicas apart. A **taint** on a Node works the opposite direction — it **repels** Pods unless they carry a matching **toleration**, with effects **`NoSchedule`**, **`PreferNoSchedule`**, and **`NoExecute`** (which also evicts Pods already running there). Dedicated node pools usually combine both: a taint keeps ordinary Pods off, and affinity plus a toleration pulls the right Pods on.
+</Callout>
+
+export const quizAffinity = [
+  {
+    q: 'What is the difference between requiredDuringSchedulingIgnoredDuringExecution and preferredDuringSchedulingIgnoredDuringExecution node affinity?',
+    options: [
+      'They behave identically, just different syntax',
+      'Required is a hard requirement the Pod stays Pending without; preferred is a soft preference the scheduler tries to honor',
+      'Required only works with taints, preferred only works with labels',
+      'Preferred is stricter than required',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'A Node has a taint with effect NoExecute. What happens to a Pod already running on that Node without a matching toleration?',
+    options: [
+      'Nothing, NoExecute only blocks new Pods',
+      'It is evicted from the Node',
+      'It is automatically given a toleration',
+      'The taint is ignored for already-running Pods permanently',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the key directional difference between affinity and taint/toleration?',
+    options: [
+      'They are the same mechanism with different names',
+      'Affinity pulls a Pod toward certain Nodes; a taint repels Pods from a Node unless tolerated',
+      'Affinity only applies to Nodes, taints only apply to Pods',
+      'Taints pull Pods in, affinity repels them',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does podAntiAffinity with topologyKey: kubernetes.io/hostname typically achieve for a Deployment?',
+    options: [
+      'It forces all replicas onto a single Node',
+      'It spreads replicas across different Nodes so one Node failure does not take down more than one replica',
+      'It deletes duplicate Pods automatically',
+      'It disables scheduling for the Deployment entirely',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="scheduling-and-scaling/node-affinity-taints-and-tolerations" questions={quizAffinity} />
+
+<ProgressTracker client:visible id="scheduling-and-scaling/node-affinity-taints-and-tolerations" />

@@ -1,0 +1,164 @@
+---
+title: 'Helm และ Package Management'
+description: 'วิธีที่ Helm package manifest ของ Kubernetes ให้เป็น Chart ที่ parameterize และ version ได้ แล้วจัดการมันในฐานะ Release ที่ track ไว้'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**Helm** คือ package manager ของ Kubernetes มันแปลง directory ของ manifest ที่ template ไว้ให้กลายเป็น **Chart** ที่ parameterize และ version ได้ แล้วติดตั้งในฐานะ **Release** ที่ถูก track
+
+## ปัญหา: raw YAML ไม่ parameterize หรือ version ได้ดี
+
+Deployment, Service, ConfigMap YAML ไม่กี่ไฟล์ทำงานได้ดีถ้ามีแค่ environment เดียว แต่พอมีมากกว่าหนึ่ง environment ปัญหาก็เริ่ม dev, staging, prod ต้องการ replica count, resource limit, image tag และ hostname ต่างกัน ทั้งที่โครงสร้างของ manifest เหมือนกันเป๊ะ การ copy-paste YAML สามชุดแล้วแก้แต่ละชุดด้วยมือหมายความว่าทุกครั้งที่เปลี่ยนอะไรก็ต้องไปแก้สามที่ให้ตรงกัน นอกจากนี้ยังไม่มีแนวคิดว่า "manifest 12 ไฟล์นี้คือหน่วยเดียวที่ version ร่วมกัน" มาให้เลย `kubectl apply` มองแต่ละไฟล์แยกจากกัน ไม่มีประวัติร่วม และไม่มีวิธีง่าย ๆ ที่จะ package ทั้งชุดให้คนอื่นเอาไปติดตั้งต่อ
+
+**Helm** แก้ทั้งสองปัญหานี้พร้อมกัน มัน package manifest ที่เกี่ยวข้องกันให้เป็นหน่วยเดียวเรียกว่า **Chart** แทนที่ค่า hardcode ด้วย template placeholder แล้ว track การติดตั้งแต่ละครั้งของ Chart นั้นในฐานะ **Release** ที่มีประวัติ version ของตัวเอง
+
+## โครงสร้างของ Chart
+
+Chart คือ directory ที่มีสามส่วนหลัก
+
+```text
+mychart/
+├── Chart.yaml        # name, version, and other chart metadata
+├── values.yaml        # default configuration values
+└── templates/
+    ├── deployment.yaml
+    ├── service.yaml
+    └── configmap.yaml
+```
+
+`Chart.yaml` เก็บ metadata (name, version, description) `values.yaml` เก็บค่า default ส่วนทุกอย่างใต้ `templates/` คือ manifest ของ Kubernetes ที่เขียนด้วย Go template syntax ซึ่ง `{{ .Values.xxx }}` จะดึงค่าจาก `values.yaml` มาใส่ตอน render
+
+```yaml
+# templates/deployment.yaml (excerpt)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-web
+spec:
+  replicas: {{ .Values.replicaCount }}
+  template:
+    spec:
+      containers:
+        - name: web
+          image: '{{ .Values.image.repository }}:{{ .Values.image.tag }}'
+```
+
+```yaml
+# values.yaml
+replicaCount: 2
+image:
+  repository: myregistry/web
+  tag: '1.4.0'
+```
+
+`helm template` (render อย่างเดียว ไม่ได้ติดตั้งจริง) หรือ `helm install` จะเติมค่าลงใน placeholder เหล่านั้นแล้วได้ Kubernetes YAML ธรรมดาออกมา Helm ไม่ได้คิดกลไก deploy ใหม่ขึ้นมาเอง มันแค่ generate manifest ที่ `kubectl` เอาไป apply ได้เหมือนเดิม
+
+## การส่งค่า configuration เฉพาะแต่ละ environment
+
+Chart เดียวกัน deploy ไปยัง dev, staging และ prod ได้ด้วยการ override `values.yaml` ตอนติดตั้ง จะใช้ override file แยกต่างหากหรือ flag `--set` ทีละค่าก็ได้
+
+```bash
+# Render the manifests without installing, to sanity-check the output
+helm template myapp ./mychart -f values-prod.yaml
+
+# Install into prod using a prod-specific values file
+helm install myapp ./mychart -f values-prod.yaml
+
+# Override a single value on the command line instead
+helm install myapp ./mychart --set replicaCount=5
+```
+
+```yaml
+# values-prod.yaml
+replicaCount: 5
+image:
+  tag: '1.4.0'
+```
+
+Template ของ Chart ไม่เปลี่ยนเลยไม่ว่าจะ deploy ไป environment ไหน เปลี่ยนแค่ค่าที่ป้อนเข้าไปเท่านั้น
+
+## Release กับคำสั่งจัดการ lifecycle
+
+ทุกครั้งที่ `helm install` จะสร้าง **Release** หนึ่งตัวคือ instance ที่ตั้งชื่อไว้และถูก track ของ Chart ที่รันอยู่ใน cluster Helm เก็บประวัติ revision ของแต่ละ Release ไว้ ดังนั้นการ upgrade กับ rollback จะทำงานกับทรัพยากรทั้งชุดที่ Chart จัดการ ไม่ใช่ทีละ Deployment แนวคิดเดียวกับ `kubectl rollout history` ของ Deployment ตัวเดียว เพียงแต่ scope กว้างขึ้นครอบคลุมทุกอย่างที่ Chart ติดตั้งไว้ด้วยกัน
+
+```bash
+# Upgrade an existing Release to a new chart version or new values
+helm upgrade myapp ./mychart -f values-prod.yaml
+
+# Roll an entire Release back to a previous revision
+helm rollback myapp 2
+
+# See the revision history for a Release
+helm history myapp
+
+# Remove a Release and the resources it created
+helm uninstall myapp
+```
+
+<Mermaid title="values และ templates ของ Chart render ออกมาเป็น manifest แล้วถูก apply เข้า cluster ในฐานะ Release ที่ track ไว้" code={helmFlowDiagram} />
+
+export const helmFlowDiagram = `flowchart LR
+  values["values.yaml (defaults)"] --> render["helm install / helm template"]
+  overrides["values-prod.yaml or --set"] --> render
+  templates["templates/ (Go-templated manifests)"] --> render
+  render --> manifests["Rendered Kubernetes manifests"]
+  manifests --> cluster["Applied to cluster as Release myapp, revision N"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**Chart** package manifest ของ Kubernetes ที่ template ไว้ พร้อม `values.yaml` ของค่า default ให้เป็นหน่วยเดียวที่ version และแชร์ได้ **Release** คือ instance หนึ่งของ Chart ที่ตั้งชื่อไว้และถูก track ในการติดตั้งใน cluster สร้างด้วย `helm install` และ config แยกตาม environment ผ่าน override values file หรือ `--set` ส่วน `helm upgrade` กับ `helm rollback` ทำงานกับประวัติ revision ทั้งชุดนั้น เป็นแนวคิด rollout เดียวกับที่ `kubectl rollout` ใช้กับ Deployment ตัวเดียว แต่ขยาย scope ครอบคลุมทุกอย่างที่ Chart จัดการร่วมกัน
+</Callout>
+
+export const quizHelm = [
+  {
+    q: 'ความต่างระหว่าง Helm Chart กับ Helm Release คืออะไร',
+    options: [
+      'มันคือสิ่งเดียวกัน แค่เรียกชื่อต่างกันสำหรับ manifest ของ Kubernetes',
+      'Chart คือ template ที่ package ไว้พร้อมค่า default ส่วน Release คือ instance หนึ่งที่ตั้งชื่อไว้และถูก track ของ Chart นั้นที่ติดตั้งใน cluster',
+      'Chart จะมีอยู่ก็ต่อเมื่อถูกติดตั้งเป็น Release แล้วเท่านั้น',
+      'Release คือไฟล์ source ส่วน Chart คือ Pod ที่รันอยู่',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ปกติแล้ว configuration เฉพาะแต่ละ environment ถูกส่งเข้า Chart ยังไง',
+    options: [
+      'เก็บ template แยกกันคนละชุดสำหรับทุก environment',
+      'แก้ template ของ Chart โดยตรงสำหรับแต่ละ environment',
+      'ผ่าน override values file ที่ส่งด้วย -f หรือ flag --set ทีละค่า ตอน install หรือ upgrade',
+      'Helm ไม่รองรับความต่างระหว่าง environment',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'helm upgrade กับ helm rollback สัมพันธ์กับ kubectl rollout ของ Deployment ตัวเดียวยังไง',
+    options: [
+      'เป็นแนวคิดที่ไม่เกี่ยวข้องกันจากคนละเครื่องมือ',
+      'ใช้แนวคิด rollout ที่อิง revision history เหมือนกัน แต่ scope ไปที่ทรัพยากรทั้งชุดที่ Chart จัดการในฐานะ Release เดียว แทนที่จะเป็น Deployment ตัวเดียว',
+      'helm rollback ใช้ได้ก็ต่อเมื่อไม่เคยใช้ kubectl rollout กับทรัพยากรชุดเดียวกันมาก่อน',
+      'helm upgrade มาแทน kubectl rollout ทั้งหมด และใช้คู่กันไม่ได้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'helm template ต่างจาก helm install ตรงไหน',
+    options: [
+      'มันแค่ render Chart ให้เป็น Kubernetes manifest ธรรมดาในเครื่อง โดยไม่ได้ติดตั้งอะไรเข้า cluster',
+      'มันติดตั้ง Chart แต่ข้ามการสร้าง Release record',
+      'ใช้ได้แค่กับ Chart ที่ไม่มี values.yaml เท่านั้น',
+      'มันเหมือนกับ helm install ทุกประการ',
+    ],
+    answer: 0,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/helm-package-management" questions={quizHelm} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/helm-package-management" />

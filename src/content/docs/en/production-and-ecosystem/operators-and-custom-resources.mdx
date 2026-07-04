@@ -1,0 +1,177 @@
+---
+title: 'Operators and Custom Resources'
+description: 'How a CustomResourceDefinition extends the Kubernetes API, and how the Operator pattern pairs it with a controller to automate operational knowledge.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A **CustomResourceDefinition** extends the Kubernetes API with a new object Kind, and an **Operator** is that CRD paired with a controller that continuously reconciles real-world state to match it.
+
+## CustomResourceDefinition: teaching the API server a new Kind
+
+A **CustomResourceDefinition (CRD)** registers a brand new object Kind with the Kubernetes API server. Once installed, instances of that Kind behave exactly like a built-in object: `kubectl get`/`kubectl apply` work on it, it is stored in etcd like everything else, and it can be watched over the API just like a Pod or a Deployment. The CRD itself defines the schema for that Kind using an OpenAPI v3 schema, so the API server validates instances on write:
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: databases.example.com
+spec:
+  group: example.com
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                engine:
+                  type: string
+                  enum: ['postgres', 'mysql']
+                storageGB:
+                  type: integer
+                  minimum: 1
+  scope: Namespaced
+  names:
+    plural: databases
+    singular: database
+    kind: Database
+    shortNames: ['db']
+```
+
+```yaml
+# An instance of the new Kind, just like any other manifest
+apiVersion: example.com/v1
+kind: Database
+metadata:
+  name: orders-db
+spec:
+  engine: postgres
+  storageGB: 20
+```
+
+```bash
+kubectl apply -f orders-db.yaml
+kubectl get databases
+kubectl get db orders-db -o yaml
+```
+
+## A CRD alone is just a schema, the controller is what makes it an Operator
+
+Applying that `Database` object does nothing on its own — the API server happily stores it in etcd and validates its shape, but nothing provisions an actual database. A CRD only adds a schema and storage for a new Kind; it has no behavior. The **Operator pattern** is that CRD paired with a **controller** that watches instances of the custom resource and drives real infrastructure to match what they describe, using the same reconciliation loop (watch, diff, act) that Kubernetes's own built-in controllers use for Deployments and ReplicaSets — just aimed at application- or operationally-specific knowledge instead of generic Pod scheduling. A database Operator might provision a real database instance when a `Database` resource is created, take periodic backups because the resource says so, and handle failover automatically when a replica goes unhealthy. Without that controller, a CRD is nothing more than a shape that `kubectl` happens to accept.
+
+## Why this is where a programmatic client earns its place
+
+Everywhere else in this course, `kubectl apply` is enough because a human runs it once and the built-in controllers take it from there. A controller for an Operator is different: it has to run continuously, reacting to every add, update, and delete of the custom resource, for as long as the cluster exists. That is exactly the situation a one-shot CLI command cannot serve and a programmatic, watch-based client can. Using `@kubernetes/client-node`'s `Watch` class against the custom resource's API path is a realistic way to build the reconciliation loop at the heart of an Operator:
+
+```typescript
+import * as k8s from '@kubernetes/client-node';
+
+const kc = new k8s.KubeConfig();
+kc.loadFromDefault();
+
+const watch = new k8s.Watch(kc);
+
+// Path for a namespace-scoped custom resource: /apis/{group}/{version}/namespaces/{namespace}/{plural}
+const path = '/apis/example.com/v1/namespaces/default/databases';
+
+async function reconcile(database: any) {
+  const name = database.metadata?.name;
+  const engine = database.spec?.engine;
+  const storageGB = database.spec?.storageGB;
+  console.log(`reconciling Database ${name}: engine=${engine} storageGB=${storageGB}`);
+  // Real controller: provision or update the actual database instance here
+}
+
+const req = await watch.watch(
+  path,
+  {},
+  (type, apiObj) => {
+    if (type === 'ADDED' || type === 'MODIFIED') {
+      reconcile(apiObj);
+    } else if (type === 'DELETED') {
+      console.log(`Database ${apiObj.metadata?.name} deleted, tearing down real instance`);
+    }
+  },
+  (err) => {
+    console.error('watch ended', err);
+  },
+);
+
+// Later, on shutdown:
+// req.abort();
+```
+
+Every `ADDED` or `MODIFIED` event runs the reconcile step again, which is the entire idea behind the Operator pattern: keep comparing desired state (the custom resource) against real state (the actual infrastructure) and correct the difference, forever, without a human re-running a command.
+
+<Mermaid title="A custom resource feeding an Operator's watch-diff-act loop, which drives a real database instance" code={operatorLoopDiagram} />
+
+export const operatorLoopDiagram = `flowchart LR
+  cr["Database custom resource (desired state)"] -->|watch| ctrl["Operator controller"]
+  ctrl -->|diff| decide{"Does real state match spec?"}
+  decide -->|no| act["Provision, resize, or repair"]
+  decide -->|yes| noop["Do nothing this cycle"]
+  act --> infra["Real PostgreSQL instance"]
+  infra -->|status| ctrl`;
+
+<Callout title="The one-line takeaway">
+A **CustomResourceDefinition** registers a new Kind with the Kubernetes API, validated by an **OpenAPI v3 schema**, so it can be created, listed, and watched exactly like a built-in object — but that alone changes nothing in the real world. The **Operator pattern** pairs that CRD with a **controller** running the same watch-diff-act reconciliation loop as built-in Kubernetes controllers, aimed at custom operational logic, and because that controller must run continuously rather than once, this is the clearest case for a **programmatic, watch-based API client** instead of one-shot `kubectl apply`.
+</Callout>
+
+export const quizOperators = [
+  {
+    q: 'What does a CustomResourceDefinition add to the Kubernetes API',
+    options: [
+      'A new object Kind with its own schema, storage in etcd, and support for kubectl and the watch API, just like a built-in object',
+      'A new built-in controller for scheduling Pods',
+      'A replacement for the etcd datastore',
+      'A new networking layer for Services',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'Why does a CRD by itself not make something an Operator',
+    options: [
+      'CRDs cannot be validated with a schema',
+      'A CRD only defines a schema and storage for a new Kind, it has no behavior, only a paired controller that reconciles real state makes it an Operator',
+      'CRDs can only be created by cluster administrators',
+      'Operators require a Helm chart and CRDs do not support Helm',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does an Operator controller need a programmatic, watch-based API client rather than one-shot kubectl apply',
+    options: [
+      'kubectl apply cannot create custom resources at all',
+      'The controller has to run continuously, reacting to every add, update, and delete of the custom resource for as long as the cluster runs, which a single command cannot do',
+      'Watch-based clients are required by the Kubernetes API server for all custom resources',
+      'kubectl apply does not support YAML files for custom resources',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'In the Operator reconciliation loop, what happens after the controller diffs desired state against real state',
+    options: [
+      'It always deletes the custom resource',
+      'If real state does not match the spec, it acts to correct the difference, otherwise it does nothing that cycle',
+      'It immediately restarts the API server',
+      'It waits for a human to manually approve every change',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/operators-and-custom-resources" questions={quizOperators} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/operators-and-custom-resources" />

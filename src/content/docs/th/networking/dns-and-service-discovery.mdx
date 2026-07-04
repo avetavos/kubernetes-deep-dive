@@ -1,0 +1,132 @@
+---
+title: 'DNS และ Service Discovery'
+description: 'วิธีที่ CoreDNS ให้ทุก Service มี DNS name ที่เสถียร และวิธีที่ headless Service เปิดเผย IP ของแต่ละ Pod ให้ StatefulSet'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**CoreDNS** ให้ทุก Service มี DNS name ที่คาดเดาได้ ทำให้ Pod หากันด้วยชื่อแทนที่จะเป็น IP และ **headless Service** เปลี่ยนจาก IP เดียวที่ load balance ให้กลายเป็น IP ของแต่ละ Pod ที่อยู่เบื้องหลังโดยตรง
+
+## CoreDNS กับ DNS name ของ Service
+
+**CoreDNS** รันเป็น Deployment อยู่ใน cluster (ปกติอยู่ใน `kube-system`) และทำหน้าที่เป็น DNS server ภายในของ cluster ทุก Pod ถูกตั้งค่าผ่าน `/etc/resolv.conf` ให้ส่ง DNS query ไปที่ CoreDNS พอ Service ถูกสร้างขึ้น CoreDNS จะเริ่มตอบให้มันทันทีด้วยชื่อเต็มในรูปแบบ
+
+```text
+<service-name>.<namespace>.svc.cluster.local
+```
+
+```bash
+# From inside any Pod in the cluster
+nslookup payments.default.svc.cluster.local
+```
+
+ถ้าอยู่ใน **namespace เดียวกัน** ชื่อแบบสั้นก็ใช้ได้เหมือนกัน เพราะ DNS search path ของ Pod จะมี suffix `svc.cluster.local` ของ namespace ตัวเองต่อท้ายให้อัตโนมัติ
+
+```bash
+# From a Pod that lives in the same namespace as the "payments" Service
+nslookup payments
+curl http://payments/health
+```
+
+สำหรับ Service ปกติ (ไม่ใช่ headless) ชื่อนั้นจะ resolve ไปที่ A/AAAA record เดียว คือ ClusterIP ของ Service ทุก request ที่ยิงไปชื่อนั้นก็ยังถูก load balance ไปยัง Pod เบื้องหลังผ่าน kube-proxy อยู่ดี DNS แค่พา client ไปหา virtual IP เท่านั้น
+
+## Headless Service: ข้าม load balancer ไปเลย
+
+บางครั้ง client ต้องการเข้าถึง Pod ตัวใดตัวหนึ่งเจาะจง ไม่ใช่แค่ "Pod ตัวไหนก็ได้ที่ healthy อยู่หลัง Service" การตั้ง `clusterIP: None` จะสร้าง **headless Service**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: cache
+spec:
+  clusterIP: None
+  selector:
+    app: cache
+  ports:
+    - port: 6379
+```
+
+headless Service จะไม่มี virtual IP เลย แทนที่ด้วยการที่ CoreDNS ตอบกลับ IP ของทุก Pod ที่ match และพร้อมใช้งานโดยตรง query ยังคง resolve ชื่อเดิม `cache.default.svc.cluster.local` แต่คำตอบตอนนี้กลายเป็นลิสต์ของ Pod IP แทนที่จะเป็น ClusterIP เดียว
+
+## ทำไม StatefulSet ถึงต้องพึ่งสิ่งนี้
+
+**StatefulSet** ให้แต่ละ Pod มี identity ที่เสถียร เช่น `web-0`, `web-1`, `web-2` และจับคู่กับ headless Service (ผ่าน `spec.serviceName`) เพื่อให้แต่ละ Pod มี DNS record ของตัวเองที่เสถียรด้วย
+
+```text
+<pod-name>.<service-name>.<namespace>.svc.cluster.local
+```
+
+```bash
+# Reach one specific ordinal Pod directly, not a load-balanced peer
+nslookup web-0.cache.default.svc.cluster.local
+```
+
+นี่คือสิ่งที่ระบบ stateful แบบ distributed ต้องการเป๊ะ ๆ database replica ต้องต่อกลับไปที่ peer *ตัวเดิม* ที่เคยต่อไว้ ไม่ใช่ตัวสุ่มที่ load balancer เลือกให้ ถ้าไม่มี headless Service DNS record รายตัวแบบนี้จะไม่มีทางเกิดขึ้นเลย
+
+<Mermaid title="DNS query ของ Pod ที่ CoreDNS resolve ให้ ไปเป็น Service ClusterIP หรือ IP ของแต่ละ Pod สำหรับ headless Service" code={dnsResolutionDiagram} />
+
+export const dnsResolutionDiagram = `flowchart TB
+  pod["Client Pod"] -->|"DNS query"| coredns["CoreDNS"]
+  coredns -->|"normal Service"| vip["Service ClusterIP\\n(load-balanced)"]
+  coredns -->|"headless Service"| p0["web-0 IP"]
+  coredns -->|"headless Service"| p1["web-1 IP"]
+  coredns -->|"headless Service"| p2["web-2 IP"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**CoreDNS** คือ DNS server ภายในของ cluster ให้ทุก Service มีชื่อในรูปแบบ `<service>.<namespace>.svc.cluster.local` (มีชื่อสั้นใช้ได้ใน namespace เดียวกัน) ซึ่งปกติ resolve ไปที่ ClusterIP ที่ load balance ของ Service **Headless Service** (`clusterIP: None`) ข้ามการ load balance แล้วคืน IP ของแต่ละ Pod โดยตรง ซึ่งเป็นสิ่งที่ **StatefulSet** ใช้เพื่อให้แต่ละ ordinal Pod มี DNS record เสถียรของตัวเองที่ `<pod-name>.<service>.<namespace>.svc.cluster.local`
+</Callout>
+
+export const quizDnsDiscovery = [
+  {
+    q: 'รูปแบบ DNS name เต็มที่ Kubernetes ตั้งให้ Service อัตโนมัติคืออะไร',
+    options: [
+      '<service-name>.cluster.local เท่านั้น',
+      '<service-name>.<namespace>.svc.cluster.local',
+      '<namespace>.<service-name>.local',
+      'Service ไม่ได้ DNS name อัตโนมัติ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม StatefulSet ถึงต้องใช้ headless Service เพื่อ DNS',
+    options: [
+      'ไม่ต้อง StatefulSet ทำงานเรื่อง networking เหมือน Deployment เป๊ะ',
+      'headless Service ให้แต่ละ ordinal Pod มี DNS record เสถียรของตัวเอง เข้าถึงเจาะจงได้ แทนที่จะเป็น address เดียวที่ load balance',
+      'headless Service resolve DNS ได้เร็วกว่า Service ปกติ',
+      'headless Service จำเป็นเพื่อให้ Pod ตัวไหนก็ตามมี DNS name ได้เลย',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'CoreDNS มีบทบาทอะไรใน cluster',
+    options: [
+      'ทำหน้าที่ route virtual IP ของ Service บนแต่ละโหนด',
+      'รันเป็น DNS server ภายในของ cluster ตอบ query ของ DNS name ของ Service กับ Pod',
+      'schedule Pod ไปยังโหนดโดยอิงจาก DNS record',
+      'ใช้แค่สำหรับ DNS lookup ที่ออกไปอินเทอร์เน็ตภายนอกเท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'headless Service (clusterIP: None) คืนอะไรตอนถูก query ด้วย DNS',
+    options: [
+      'ไม่คืนอะไรเลย headless Service query ไม่ได้',
+      'virtual IP เดียว เหมือน Service ปกติ',
+      'IP ของแต่ละ Pod ที่ match และพร้อมใช้งานโดยตรง',
+      'error เพราะไม่มี ClusterIP ให้คืน',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="networking/dns-and-service-discovery" questions={quizDnsDiscovery} />
+
+<ProgressTracker client:visible id="networking/dns-and-service-discovery" />

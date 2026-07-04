@@ -1,0 +1,182 @@
+---
+title: 'Production Checklist และ Kubernetes API Client'
+description: 'checklist สำหรับความพร้อมขึ้น production ที่ผูก resource limit, probe, disruption budget, RBAC และ network policy เข้าด้วยกัน พร้อมตัวอย่าง programmatic deployment-verification จริง'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+workload ที่พร้อมขึ้น production ไม่ใช่ feature เดียว แต่เป็น checklist ของ control ที่แยกจากกัน ทั้ง resource limit, probe, disruption budget, RBAC แบบ least-privilege, network policy, secret ที่ encrypt จริง, autoscaling ที่ bound ไว้, replica ที่กระจายตัว และ namespace quota แต่ละอันปิดช่องโหว่คนละแบบที่อันอื่นปิดไม่ได้
+
+## Checklist
+
+แต่ละข้อด้านล่างปิดช่องว่างเฉพาะเจาะจง ไม่มีข้อไหน optional ใน production cluster จริง และไม่มีข้อไหนแทนที่ข้ออื่นได้
+
+- **Resource `requests`/`limits`** ตั้งทั้งคู่ ไม่ใช่แค่อันใดอันหนึ่ง `requests` เป็นตัวขับ scheduling และกำหนด **QoS class** ของ Pod (`Guaranteed`, `Burstable`, หรือ `BestEffort`) ซึ่ง kubelet ใช้ตัดสิน eviction order ตอนโหนดขาดแคลนทรัพยากร `limits` จำกัดว่า container ที่ runaway จะแย่งทรัพยากรจากเพื่อนบ้านได้มากแค่ไหน
+- **readiness AND liveness probe** **readiness probe** ควบคุมว่า Pod จะรับ traffic จาก Service หรือไม่ (แก้ปัญหา "ส่ง traffic ไปหา Pod ที่ยังไม่พร้อม") ส่วน **liveness probe** ควบคุมว่า kubelet จะ restart container หรือไม่ (แก้ปัญหา "process ยังมีชีวิตอยู่แต่ hang แล้ว traffic ก็ fail ต่อเนื่อง") มันแก้คนละปัญหา workload เลยต้องมีทั้งคู่
+- **PodDisruptionBudget (PDB)** สำหรับ service ที่มีหลาย replica จำกัดว่า disruption แบบ **voluntary** (node drain, cluster upgrade) จะเอา replica ออกพร้อมกันได้กี่ตัว ทำให้ rolling node upgrade ไม่พา service ทั้งตัวเหลือ replica เป็นศูนย์โดยไม่ตั้งใจ
+- **RBAC scope แบบ least-privilege** Role กับ RoleBinding (หรือ ClusterRole/ClusterRoleBinding) ให้สิทธิ์เฉพาะ verb กับ resource ที่ ServiceAccount ของ workload ต้องใช้จริง ไม่ใช่ `cluster-admin` โดย default
+- **default-deny NetworkPolicy** ตรงจุดที่เหมาะสม ถ้าไม่มี Pod ทุกตัวจะเข้าถึง Pod อื่นได้หมดโดย default policy แบบ default-deny บวก allow rule ที่ระบุชัดทำให้การเคลื่อนที่แบบ lateral จาก Pod ที่ถูก compromise ยากขึ้นมาก
+- **การป้องกัน secret แบบจริงจัง** encryption at rest สำหรับ etcd (Secret ถูก encode ด้วย base64 ไม่ใช่ encrypt เว้นแต่จะตั้ง `EncryptionConfiguration`) หรือใช้ external secret manager ไม่ใช่พึ่ง base64 อย่างเดียวเป็น security boundary
+- **HorizontalPodAutoscaler ที่ bound ไว้อย่างเหมาะสม** `minReplicas` ป้องกันไม่ให้ scale ลงเหลือศูนย์สำหรับ service ที่ต้อง available ตลอดเวลา `maxReplicas` จำกัด cost และ load ที่ไปกระทบ dependency ปลายทาง (database และอื่น ๆ) ตอน traffic พุ่ง
+- **replica หลายตัวกระจายข้ามโหนด/zone** Pod anti-affinity หรือ topology spread constraint ทำให้โหนดเดียวหรือ availability zone เดียวล่มไม่พา replica ทุกตัวหายไปพร้อมกัน จำนวน replica เฉยๆ ไม่ได้การันตีเรื่องนี้
+- **ResourceQuota/LimitRange ต่อ namespace** `ResourceQuota` จำกัด resource รวมของ namespace ส่วน `LimitRange` ให้ค่า default ต่อ container ที่สมเหตุสมผล เพื่อไม่ให้ Pod ที่ deploy โดยไม่ตั้ง `requests`/`limits` กลายเป็น `BestEffort` แบบเงียบ ๆ
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-api
+spec:
+  replicas: 3
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: 'kubernetes.io/hostname'
+              labelSelector:
+                matchLabels:
+                  app: orders-api
+      containers:
+        - name: orders-api
+          image: myregistry/orders-api:2.3.0
+          resources:
+            requests:
+              cpu: '250m'
+              memory: '256Mi'
+            limits:
+              cpu: '500m'
+              memory: '512Mi'
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: 8080
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: 8080
+            periodSeconds: 10
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: orders-api-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: orders-api
+```
+
+## ปิดวงจรด้วย programmatic verification script
+
+`kubectl rollout status` ครอบคลุมกรณีที่ใช้แบบ interactive ได้ แต่ deployment pipeline บ่อยครั้งต้องการเช็คแบบเดียวกันในรูป code เช่น gate ขั้นตอน promotion ด้วยการเช็คว่า Deployment ถึง replica count ที่ต้องการจริง ๆ ไม่ใช่แค่ `kubectl apply` คืนค่าสำเร็จ `KubeConfig.loadFromDefault()` ของ `@kubernetes/client-node` resolve credential แบบเดียวกันไม่ว่าจะรัน script บนเครื่อง laptop ของวิศวกร (ผ่าน `KUBECONFIG` หรือ `~/.kube/config`) หรือรันอยู่ใน cluster เองในฐานะ CI job หรือ Job Pod (ผ่าน ServiceAccount token ที่ mount ไว้) ไม่ต้องเขียน logic แยกกรณีเลย
+
+```typescript
+import * as k8s from '@kubernetes/client-node';
+
+const kc = new k8s.KubeConfig();
+// Resolves KUBECONFIG env var, then ~/.kube/config, then in-cluster ServiceAccount
+kc.loadFromDefault();
+
+const appsApi = kc.makeApiClient(k8s.AppsV1Api);
+
+async function verifyRollout(name: string, namespace: string, timeoutMs = 120_000): Promise<void> {
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    const dep = await appsApi.readNamespacedDeployment({ name, namespace });
+
+    const desired = dep.spec?.replicas ?? 0;
+    const ready = dep.status?.readyReplicas ?? 0;
+    const updated = dep.status?.updatedReplicas ?? 0;
+
+    console.log(`${namespace}/${name}: ${ready}/${desired} ready, ${updated}/${desired} updated`);
+
+    if (ready === desired && updated === desired) {
+      console.log('rollout complete');
+      return;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
+
+  throw new Error(`rollout of ${namespace}/${name} did not complete within ${timeoutMs}ms`);
+}
+
+await verifyRollout('orders-api', 'default');
+```
+
+นี่คือกรณีที่ programmatic client ชนะ shell script ที่ห่อ `kubectl` อยู่ตรง ๆ ผลลัพธ์ป้อนตรงเข้าการตัดสิน pass/fail ของ pipeline ได้เลย เข้าถึง `status.readyReplicas` กับ `status.updatedReplicas` แบบมี type แทนที่จะต้อง parse text output จาก CLI
+
+<Mermaid title="Deployment ที่พร้อม production: probe, requests/limits, PodDisruptionBudget, RBAC และ NetworkPolicy ครอบคลุมช่องโหว่คนละแบบ" code={productionChecklistDiagram} />
+
+export const productionChecklistDiagram = `flowchart TB
+  dep["Deployment: orders-api (3 replicas, spread across nodes)"]
+  dep --> probes["Readiness + liveness probes"]
+  dep --> resources["requests/limits (QoS)"]
+  dep --> pdb["PodDisruptionBudget (minAvailable: 2)"]
+  dep --> rbac["RBAC: least-privilege ServiceAccount"]
+  dep --> netpol["Default-deny NetworkPolicy + explicit allows"]
+  dep --> hpa["HorizontalPodAutoscaler (bounded min/max)"]
+  ns["Namespace"] --> quota["ResourceQuota / LimitRange"]
+  quota --> dep`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+ความพร้อมขึ้น production คือ checklist ไม่ใช่สวิตช์เดียว **requests/limits** กำหนด QoS และพฤติกรรม scheduling **readiness/liveness probe** แก้คนละ failure mode **PodDisruptionBudget** จำกัด voluntary disruption ตอน node drain กับ upgrade **RBAC** กับ **default-deny NetworkPolicy** จำกัด blast radius **encryption at rest** จริง (ไม่ใช่ base64) ปกป้อง Secret **HorizontalPodAutoscaler** ที่ bound ไว้บวก replica ที่กระจายด้วย anti-affinity ให้ availability จริง และ **ResourceQuota/LimitRange** ปกป้อง namespace ทั้งก้อน `KubeConfig.loadFromDefault()` ใน `@kubernetes/client-node` resolve credential เหมือนกันไม่ว่าจะรันบน laptop หรือใน cluster ซึ่งเป็นเหตุผลที่ทำให้ script verify rollout แบบ programmatic ที่มี type ใช้งานได้จริงใน pipeline
+</Callout>
+
+export const quizProductionChecklist = [
+  {
+    q: 'ทำไม PodDisruptionBudget ถึงสำคัญ ทั้งที่มันหยุด involuntary failure อย่างโหนดล่มกะทันหันไม่ได้',
+    options: [
+      'มันไม่มีประโยชน์จริง ใช้แค่เพื่อ documentation',
+      'มันจำกัดว่า voluntary disruption อย่าง node drain ตอน cluster upgrade จะเอา replica ออกพร้อมกันได้กี่ตัว',
+      'มันแทนที่ความจำเป็นของการมีหลาย replica ได้ทั้งหมด',
+      'มัน restart โหนดที่ล่มให้อัตโนมัติ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม workload เดียวถึงต้องมีทั้ง readiness และ liveness probe',
+    options: [
+      'มันทำงานเหมือนกัน มีทั้งคู่ก็ซ้ำซ้อน',
+      'readiness probe ควบคุมว่า Pod จะรับ traffic หรือไม่ ส่วน liveness probe ควบคุมว่า kubelet จะ restart container หรือไม่ แต่ละตัวแก้คนละ failure mode',
+      'liveness probe จำเป็นแค่กับ StatefulSet เท่านั้น',
+      'readiness probe เลิกใช้แล้วให้ใช้ liveness probe แทน',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม base64 encoding เพียงอย่างเดียวถึงไม่พอสำหรับป้องกัน Kubernetes Secret',
+    options: [
+      'base64 คือรูปแบบ encryption ที่แข็งแรงในตัวเองอยู่แล้ว',
+      'base64 ถอดกลับได้ง่ายมาก การป้องกันจริงต้องอาศัย etcd encryption at rest หรือ external secret manager',
+      'Secret ไม่สามารถ encode ด้วย base64 ได้เลย',
+      'base64 encoding เป็นแค่ format สำหรับแสดงผล ไม่เกี่ยวกับ security',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'KubeConfig.loadFromDefault() resolve ไปเป็นอะไรตอนรัน script ใน cluster เทียบกับบน laptop ของ developer',
+    options: [
+      'มัน fail เสมอเวลารันใน cluster และทำงานได้แค่บน laptop เท่านั้น',
+      'ใน cluster มันใช้ ServiceAccount token ที่ mount ไว้ บน laptop มัน fallback ไปที่ KUBECONFIG หรือ ~/.kube/config โดยไม่ต้องแยก logic เลย',
+      'ต้องใช้ method ชื่อคนละตัวกันแล้วแต่ environment',
+      'มันทำงานได้ก็ต่อเมื่อตั้ง environment variable KUBECONFIG เองในทั้งสอง environment',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/production-checklist-and-the-kubernetes-api-client" questions={quizProductionChecklist} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/production-checklist-and-the-kubernetes-api-client" />

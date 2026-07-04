@@ -1,0 +1,32 @@
+---
+title: 'Kubernetes — From Zero to Hero'
+description: 'คอร์ส Kubernetes แบบ zero-to-hero เน้น developer — architecture และ control plane, workloads, networking, storage และ config, scheduling และ scaling, observability และ security และการรัน Kubernetes บน production'
+sidebar:
+  order: 1
+---
+
+import Callout from '../../../../components/Callout.astro';
+
+**Kubernetes** คือ container orchestrator แบบ declarative คุณอธิบาย state ที่ต้องการ — จำนวน replica, image ไหน, เปิด port อะไร — แล้ว control loop จะทำงานต่อเนื่องเพื่อดัน state จริงของ cluster เข้าหา state นั้น คอร์สนี้เขียนขึ้น**สำหรับ developer** — คนที่ deploy workload ขึ้น cluster, debug ว่าทำไม Pod ไม่ยอมขึ้น และต้องทำให้ Kubernetes ทำงานถูกต้องบน production
+
+ทุก manifest ในคอร์สนี้ใช้ API group ที่ stable ซึ่งคุณจะเจอใน cluster จริง — `apps/v1` สำหรับ Deployment/StatefulSet/DaemonSet, `batch/v1` สำหรับ Job/CronJob, `networking.k8s.io/v1` สำหรับ Ingress/NetworkPolicy, `autoscaling/v2` สำหรับ HorizontalPodAutoscaler และ `policy/v1` สำหรับ PodDisruptionBudget `kubectl` และ YAML เหมือนกันทุกภาษา ตัวอย่าง CLI และ manifest ทุกอันจึงไม่ผูกกับภาษาโปรแกรม ส่วนบทเรียนที่มี programmatic API client จะใช้ **TypeScript** ด้วย **`@kubernetes/client-node`** ซึ่งเป็น JavaScript client ที่เป็นทางการ
+
+## สิ่งที่คอร์สนี้ครอบคลุม
+
+| Module | คุณจะได้เรียน |
+| --- | --- |
+| **Foundations & Architecture** | ทำไมต้อง orchestration, control plane และ node component, kubectl, declarative YAML, การรัน local cluster |
+| **Workloads** | Pod, Deployment และ rolling update, StatefulSet และ DaemonSet, Job และ CronJob |
+| **Networking** | Service และ kube-proxy, cluster DNS, Ingress และ Gateway API, NetworkPolicy |
+| **Storage & Configuration** | Volume, PersistentVolume/Claim และ StorageClass, ConfigMap และ Secret, namespace และ quota |
+| **Scheduling & Scaling** | requests/limits และ scheduler, affinity/taint/toleration, HorizontalPodAutoscaler, disruption budget |
+| **Observability & Security** | probe, log และ metric, RBAC และ ServiceAccount, Pod Security Standards |
+| **Production & Ecosystem** | Helm, Operator และ CRD, GitOps และ production checklist พร้อม API client |
+
+## วิธีอ่าน
+
+แต่ละบทเริ่มด้วยไอเดียหลักในหนึ่งประโยค แสดง `kubectl` command และ YAML manifest จริง มีไดอะแกรมของกลไกที่เกี่ยวข้อง และปิดท้ายด้วย takeaway หนึ่งบรรทัดพร้อม quiz สั้น ๆ อ่านเรียงจากบนลงล่าง — module หลัง ๆ จะอ้างอิงคำศัพท์เรื่อง Pod, control loop และ label/selector จากบทแรก ๆ เหล่านี้
+
+<Callout title="The one-line takeaway">
+Kubernetes เป็น orchestrator แบบ **declarative และ self-healing** คุณอธิบาย desired state เป็น YAML แล้ว control loop จะ reconcile cluster เข้าหา state นั้นต่อเนื่อง คอร์สนี้สอน Kubernetes จากมุมมอง developer — object, guarantee และพฤติกรรมบน production — เริ่มจาก control plane เอง
+</Callout>

@@ -1,0 +1,151 @@
+---
+title: 'Volumes and Volume Types'
+description: 'How Kubernetes gives containers a directory that outlives a restart, and the volume types you will actually reach for.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A **Volume** is a directory accessible to the containers in a Pod, and its lifecycle is tied to the **Pod**, not to any single container inside it.
+
+## Why a container's own filesystem is not enough
+
+Every container gets its own writable layer, but that layer is thrown away the moment the container restarts — a crash, an image update, or a liveness-probe failure wipes it clean. That is fine for stateless application code, but it breaks anything that needs to survive a restart or be shared between containers in the same Pod. A Volume solves both problems: it is declared once at the Pod level, and it keeps existing for as long as the Pod exists, independent of how many times an individual container inside that Pod restarts.
+
+```bash
+# The container restarts, but the Pod (and its volumes) does not disappear
+kubectl get pod log-processor -o jsonpath='{.status.containerStatuses[*].restartCount}'
+```
+
+## Common volume types
+
+- **`emptyDir`** — an empty directory created when the Pod starts. It is scratch space: good for caches, or for sharing files between a main container and a sidecar. It is deleted permanently when the Pod is removed, not just when a container restarts.
+- **`hostPath`** — mounts a path from the underlying node's filesystem straight into the Pod. It is powerful, but risky: it ties the Pod to whatever data happens to live on that specific node, and it can expose sensitive parts of the node's filesystem to a container. Use it sparingly, and only when you actually need node-local access (log collectors, node-level agents).
+- **`configMap` / `secret` volumes** — project the key-value data from a ConfigMap or Secret into the Pod as files, one file per key. Covered in depth in the next lesson on ConfigMaps and Secrets.
+- **Projected volumes** — combine several sources (ConfigMap, Secret, downwardAPI, serviceAccountToken) into a single mounted directory, so a container only needs one mount point to see data that actually comes from multiple objects.
+
+Here is a Pod where two containers share one `emptyDir` volume — a common pattern for a main application container paired with a log-shipping sidecar:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: log-processor
+spec:
+  volumes:
+    - name: shared-logs
+      emptyDir: {}
+  containers:
+    - name: app
+      image: my-app:1.0
+      volumeMounts:
+        - name: shared-logs
+          mountPath: /var/log/app
+    - name: log-shipper
+      image: fluent-bit:2.2
+      volumeMounts:
+        - name: shared-logs
+          mountPath: /var/log/app
+          readOnly: true
+```
+
+And a `hostPath` example, mounting a node's `/proc` directory read-only into a monitoring agent:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: node-exporter
+spec:
+  volumes:
+    - name: proc
+      hostPath:
+        path: /proc
+        type: Directory
+  containers:
+    - name: node-exporter
+      image: prom/node-exporter:v1.7.0
+      volumeMounts:
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+```
+
+## Declaring a volume is always a two-step process
+
+Naming a volume is not enough to use it. Every Pod-level volume needs two matching pieces:
+
+1. `spec.volumes[]` — declares the volume and where its data comes from (`emptyDir`, `hostPath`, `configMap`, `persistentVolumeClaim`, and so on). This is Pod-scoped.
+2. Each container's `spec.containers[].volumeMounts[]` — mounts that already-declared volume into that specific container's filesystem, at a chosen `mountPath`.
+
+A volume declared in `spec.volumes` but never referenced in a container's `volumeMounts` does nothing for that container — it simply is not mounted there. This is also how two containers in the same Pod can share data: both list the same volume `name` in their own `volumeMounts`, pointing at the one shared directory declared once in `spec.volumes`.
+
+```bash
+# Confirm both containers see the same file through the shared emptyDir
+kubectl exec log-processor -c log-shipper -- ls /var/log/app
+```
+
+<Mermaid title="Two containers in one Pod sharing a single emptyDir volume" code={emptyDirDiagram} />
+
+export const emptyDirDiagram = `flowchart LR
+  subgraph pod["Pod: log-processor"]
+    a["Container: app"] -->|writes| vol[("emptyDir volume: shared-logs")]
+    vol -->|reads| b["Container: log-shipper"]
+  end`;
+
+<Callout title="The one-line takeaway">
+A **Volume** lives and dies with the **Pod**, not with any one container inside it, which is what lets data survive a container restart and be shared between containers. **`emptyDir`** is Pod-lifetime scratch space wiped when the Pod is deleted; **`hostPath`** reaches into the node's own filesystem and should be used sparingly because it is both node-specific and a security risk; **`configMap`/`secret`** volumes project config data as files; and **projected** volumes merge multiple sources into one mount. Using any volume always takes two declarations: `spec.volumes` to define it, and a container's `volumeMounts` to actually mount it.
+</Callout>
+
+export const quizVolumes = [
+  {
+    q: 'What happens to the data in an emptyDir volume when the Pod that owns it is deleted',
+    options: [
+      'It is copied to the node for later recovery',
+      'It is deleted permanently, along with the rest of the Pod',
+      'It is automatically converted into a PersistentVolume',
+      'It survives, because emptyDir data always lives at the cluster level',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why is hostPath considered risky to use',
+    options: [
+      'It is deprecated and no longer works in current Kubernetes versions',
+      'It only works with StatefulSets',
+      'It ties the Pod to whatever data lives on one specific node and can expose sensitive parts of the node filesystem',
+      'It requires a StorageClass to be configured first',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'Why does mounting a volume into a container require both spec.volumes and volumeMounts',
+    options: [
+      'spec.volumes declares the volume at the Pod level, while each container volumeMounts entry mounts that already-declared volume into that specific container filesystem',
+      'volumeMounts is the only field that matters, spec.volumes is optional legacy syntax',
+      'spec.volumes is only used for PersistentVolumeClaims, never for emptyDir',
+      'Kubernetes requires duplicate declarations purely for validation purposes and both fields must be identical',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'Which volume type is designed to combine multiple sources, such as a ConfigMap and a Secret, into one mounted directory',
+    options: [
+      'hostPath',
+      'emptyDir',
+      'A projected volume',
+      'A PersistentVolumeClaim',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="storage-and-config/volumes-and-volume-types" questions={quizVolumes} />
+
+<ProgressTracker client:visible id="storage-and-config/volumes-and-volume-types" />

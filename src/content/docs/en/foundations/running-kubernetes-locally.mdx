@@ -1,0 +1,124 @@
+---
+title: 'Running Kubernetes Locally'
+description: 'How to spin up a local cluster with kind, run your first Pod, and understand the built-in namespaces.'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+You do not need a data center to learn Kubernetes — tools like kind, minikube, and k3d give you a real, multi-node-capable cluster running entirely on your own machine.
+
+## Local cluster options
+
+Three tools cover almost all local Kubernetes development and learning:
+
+- **kind** (Kubernetes IN Docker) runs each cluster "node" as a Docker container. It is fast to create and destroy, which makes it a great fit for CI pipelines and for following along with a course like this one.
+- **minikube** runs a single- or multi-node cluster inside a VM or container driver of your choice, and ships with an ecosystem of addons (dashboard, ingress, metrics) enabled with one command each.
+- **k3d** runs **k3s** — a lightweight, certified Kubernetes distribution — inside Docker containers, similar in spirit to kind but built around k3s's smaller footprint.
+
+All three exist to make local development and learning fast and disposable. None of them is meant for production — production clusters are built with tools like kubeadm, or provisioned by a managed cloud service, on real or dedicated virtual machines with proper networking, storage, and high availability.
+
+## Your first cluster and your first Pod
+
+Create a local cluster and take a look at it:
+
+```bash
+kind create cluster
+kubectl cluster-info
+kubectl get nodes
+```
+
+`kubectl cluster-info` confirms you can reach the API server and shows where core services are running; `kubectl get nodes` lists the node(s) in the cluster and their `Ready` status — the first thing to check whenever something seems wrong.
+
+With a cluster up, run a Pod and reach it from your laptop:
+
+```bash
+kubectl run nginx --image=nginx
+kubectl get pods
+kubectl port-forward pod/nginx 8080:80
+```
+
+`kubectl run` is a quick imperative way to create a single Pod running one container, useful for smoke-testing an image. `kubectl port-forward` opens a tunnel from a local port on your machine to a port inside the Pod, so `http://localhost:8080` reaches nginx running inside the cluster without needing a Service or Ingress at all — handy for the earliest stages of debugging or trying something out.
+
+## Namespaces: dividing up a cluster
+
+A namespace is a way to divide a single cluster into separate scopes for names, access, and resource limits. Every cluster ships with a few built in:
+
+- `default` — where objects land if you do not specify a namespace.
+- `kube-system` — reserved for components managed by the control plane itself, such as CoreDNS and kube-proxy's own Pods; you generally look here, not touch here.
+- `kube-public` — readable by all users (including unauthenticated ones), used for cluster information that should be publicly visible.
+
+List them, and create your own for a project:
+
+```bash
+kubectl get namespaces
+kubectl create namespace my-app
+```
+
+<Mermaid title="A local kind cluster running entirely inside Docker on your laptop" code={runningLocallyDiagram} />
+
+export const runningLocallyDiagram = `flowchart TB
+  laptop["Your laptop"] --> docker["Docker"]
+  subgraph cluster["kind cluster"]
+    cp["control-plane node (container)"]
+    w1["worker node (container)"]
+    w2["worker node (container)"]
+  end
+  docker --> cluster`;
+
+<Callout title="The one-line takeaway">
+**kind**, **minikube**, and **k3d** each give you a real, disposable Kubernetes cluster for local development and learning — never for production — and a few commands are enough to get moving: `kind create cluster` to create one, `kubectl get nodes` to check it is healthy, `kubectl run` plus `kubectl port-forward` to launch and reach a first Pod, and `kubectl create namespace` to carve out your own space alongside the built-in `default`, `kube-system`, and `kube-public` namespaces.
+</Callout>
+
+export const quizRunningLocally = [
+  {
+    q: 'What are kind, minikube, and k3d primarily used for?',
+    options: [
+      'Running production-grade, highly available Kubernetes clusters across regions',
+      'Running local Kubernetes clusters for development and learning, not production',
+      'Replacing kubectl with a different command-line tool',
+      'Managing billing for managed Kubernetes services',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which command tells you whether your cluster nodes are healthy and ready?',
+    options: [
+      'kubectl get nodes',
+      'kubectl get pods',
+      'docker ps',
+      'kubectl config view',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'What is the kube-system namespace used for?',
+    options: [
+      'A namespace reserved for your own application Pods',
+      'The namespace holding components managed by the control plane itself, such as CoreDNS and kube-proxy',
+      'A namespace only used for running automated tests',
+      'A deprecated namespace kept only for backward compatibility',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which command creates a new namespace of your own?',
+    options: [
+      'kubectl apply namespace my-app',
+      'kubectl run namespace my-app',
+      'kubectl create namespace my-app',
+      'kubectl config namespace my-app',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="foundations/running-kubernetes-locally" questions={quizRunningLocally} />
+
+<ProgressTracker client:visible id="foundations/running-kubernetes-locally" />

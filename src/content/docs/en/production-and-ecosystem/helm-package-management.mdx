@@ -1,0 +1,164 @@
+---
+title: 'Helm and Package Management'
+description: 'How Helm packages Kubernetes manifests into versioned, parameterized Charts and manages them as tracked Releases.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+**Helm** is the package manager for Kubernetes: it turns a directory of templated manifests into a versioned, parameterized **Chart** that gets installed as a tracked **Release**.
+
+## The problem: raw YAML does not parameterize or version well
+
+A handful of Deployment, Service, and ConfigMap YAML files works fine for one environment. It falls apart the moment there is more than one: dev, staging, and prod need different replica counts, different resource limits, different image tags, and different hostnames, but the underlying shape of the manifests is identical. Copy-pasting the YAML three times and hand-editing each copy means every future change has to be applied three times, correctly, in sync. There is also no built-in notion of "this set of 12 manifests is one versioned unit" — `kubectl apply` treats each file independently, with no shared history and no easy way to package the whole set for someone else to install.
+
+**Helm** solves both problems at once. It packages a set of related manifests into a single unit called a **Chart**, replaces hardcoded values with template placeholders, and tracks every install of that Chart as a **Release** with its own version history.
+
+## Anatomy of a Chart
+
+A Chart is a directory with three key pieces:
+
+```text
+mychart/
+├── Chart.yaml        # name, version, and other chart metadata
+├── values.yaml        # default configuration values
+└── templates/
+    ├── deployment.yaml
+    ├── service.yaml
+    └── configmap.yaml
+```
+
+`Chart.yaml` holds metadata (name, version, description). `values.yaml` holds the default configuration. Everything under `templates/` is a Kubernetes manifest written with Go template syntax, where `{{ .Values.xxx }}` pulls a value in from `values.yaml` at render time:
+
+```yaml
+# templates/deployment.yaml (excerpt)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-web
+spec:
+  replicas: {{ .Values.replicaCount }}
+  template:
+    spec:
+      containers:
+        - name: web
+          image: '{{ .Values.image.repository }}:{{ .Values.image.tag }}'
+```
+
+```yaml
+# values.yaml
+replicaCount: 2
+image:
+  repository: myregistry/web
+  tag: '1.4.0'
+```
+
+`helm template` (renders locally without installing) or `helm install` fills in those placeholders and produces plain Kubernetes YAML — Helm never invents a new deployment mechanism, it just generates the manifests `kubectl` would apply anyway.
+
+## Supplying environment-specific configuration
+
+The same Chart deploys to dev, staging, and prod by overriding `values.yaml` at install time, either with a dedicated override file or individual `--set` flags:
+
+```bash
+# Render the manifests without installing, to sanity-check the output
+helm template myapp ./mychart -f values-prod.yaml
+
+# Install into prod using a prod-specific values file
+helm install myapp ./mychart -f values-prod.yaml
+
+# Override a single value on the command line instead
+helm install myapp ./mychart --set replicaCount=5
+```
+
+```yaml
+# values-prod.yaml
+replicaCount: 5
+image:
+  tag: '1.4.0'
+```
+
+The Chart's templates never change between environments — only the values fed into them do.
+
+## Releases and lifecycle commands
+
+Every `helm install` creates a **Release**: one named, tracked instance of a Chart running in the cluster. Helm keeps a revision history for each Release, so upgrades and rollbacks operate on the whole set of resources the Chart manages, not on one Deployment at a time — conceptually the same idea as `kubectl rollout history` for a single Deployment, just scoped to everything a Chart installed together.
+
+```bash
+# Upgrade an existing Release to a new chart version or new values
+helm upgrade myapp ./mychart -f values-prod.yaml
+
+# Roll an entire Release back to a previous revision
+helm rollback myapp 2
+
+# See the revision history for a Release
+helm history myapp
+
+# Remove a Release and the resources it created
+helm uninstall myapp
+```
+
+<Mermaid title="A Chart's values and templates render into manifests, applied to the cluster as a tracked Release" code={helmFlowDiagram} />
+
+export const helmFlowDiagram = `flowchart LR
+  values["values.yaml (defaults)"] --> render["helm install / helm template"]
+  overrides["values-prod.yaml or --set"] --> render
+  templates["templates/ (Go-templated manifests)"] --> render
+  render --> manifests["Rendered Kubernetes manifests"]
+  manifests --> cluster["Applied to cluster as Release myapp, revision N"]`;
+
+<Callout title="The one-line takeaway">
+A **Chart** packages templated Kubernetes manifests plus a `values.yaml` of defaults into one versioned, shareable unit; a **Release** is one named, tracked install of a Chart in a cluster, created with `helm install` and configured per environment via override values files or `--set`; `helm upgrade` and `helm rollback` operate on that whole tracked revision history, the same rollout idea `kubectl rollout` applies to a single Deployment, scaled up to everything a Chart manages together.
+</Callout>
+
+export const quizHelm = [
+  {
+    q: 'What is the difference between a Helm Chart and a Helm Release',
+    options: [
+      'They are the same thing, just different names for a Kubernetes manifest',
+      'A Chart is the packaged template plus default values, a Release is one named, tracked instance of that Chart installed in a cluster',
+      'A Chart only exists after it has been installed as a Release',
+      'A Release is the source files and a Chart is the running Pods',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How is environment-specific configuration typically supplied to a Chart',
+    options: [
+      'By maintaining a fully separate copy of the templates for every environment',
+      'By editing the Chart templates directly for each environment',
+      'Through an override values file passed with -f, or individual --set flags, at install or upgrade time',
+      'Environment differences are not supported by Helm',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'How do helm upgrade and helm rollback relate to kubectl rollout for a single Deployment',
+    options: [
+      'They are unrelated concepts from different tools',
+      'They apply the same revision-history rollout idea, but scoped to the whole set of resources a Chart manages as one Release instead of one Deployment',
+      'helm rollback only works if kubectl rollout has never been used on the same resources',
+      'helm upgrade replaces kubectl rollout entirely and cannot be used together with it',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does helm template do differently from helm install',
+    options: [
+      'It renders the Chart into plain Kubernetes manifests locally without installing anything to the cluster',
+      'It installs the Chart but skips creating a Release record',
+      'It only works on Charts that have no values.yaml',
+      'It is identical to helm install in every respect',
+    ],
+    answer: 0,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/helm-package-management" questions={quizHelm} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/helm-package-management" />

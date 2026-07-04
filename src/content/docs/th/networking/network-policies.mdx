@@ -1,0 +1,170 @@
+---
+title: 'Network Policy'
+description: 'วิธีที่ NetworkPolicy จำกัด network แบบแบนราบที่ทุก Pod คุยกันได้หมดโดย default และทำไมการบังคับใช้ถึงขึ้นอยู่กับ CNI plugin'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+โดย default ทุก Pod ใน cluster คุยกับ Pod อื่นได้หมด และ **NetworkPolicy** คือสิ่งที่ให้คุณจำกัดให้เหลือแค่ traffic ที่อนุญาตไว้อย่างชัดเจนเท่านั้น
+
+## ค่า default: network แบบแบนราบและเปิดหมด
+
+ตั้งแต่แกะกล่องมา networking ของ Kubernetes ไม่มี isolation เลย Pod ไหนก็ส่ง traffic ไปหา Pod อื่นได้หมด ไม่ว่าจะอยู่ namespace ไหน และแล้วแต่วิธี expose Service Pod ก็มักถูกเข้าถึงจากนอก cluster ได้ด้วย ไม่มี default-deny อยู่ที่ไหนเลย เรื่องนี้เข้าใจง่ายแต่หมายความว่า Pod ที่ถูก compromise หรือ config ผิดสามารถเข้าถึงส่วนอื่นของ cluster ได้มากกว่าที่มันควรต้องการเยอะ
+
+## NetworkPolicy: เลือก Pod ก่อน แล้วค่อยอนุญาต traffic
+
+**NetworkPolicy** (API group `networking.k8s.io/v1`) เลือกกลุ่ม Pod ด้วย `podSelector` แล้วกำหนด rule `ingress` และ/หรือ `egress` ที่อนุญาตให้เฉพาะ Pod พวกนั้น
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-api
+  namespace: shop
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+```
+
+policy นี้มีผลแค่กับ Pod ที่ label `app: api` ใน namespace `shop` และอนุญาต inbound traffic แค่จาก Pod ที่ label `app: frontend` เท่านั้น บน TCP port 8080 เท่านั้น อย่างอื่นทั้งหมดที่ยิงเข้า Pod พวกนี้ถูก deny โดยปริยายทันทีที่มีอย่างน้อยหนึ่ง policy เลือก Pod เหล่านั้น
+
+```bash
+kubectl get networkpolicy -n shop
+kubectl describe networkpolicy allow-frontend-to-api -n shop
+```
+
+## NetworkPolicy จะทำงานก็ต่อเมื่อ CNI บังคับใช้มันจริง
+
+นี่คือข้อควรระวังที่สำคัญที่สุด `NetworkPolicy` object เฉย ๆ ไม่มีผลอะไรเลยถ้า **CNI plugin** ของ cluster ไม่ได้ implement การบังคับใช้ NetworkPolicy จริง Kubernetes รับและเก็บ object นี้ได้เสมอ `kubectl apply` จะสำเร็จ แต่ถ้า CNI ไม่บังคับใช้ policy traffic จริงก็ไม่เปลี่ยนอะไรเลย ต้องเช็คก่อนเสมอว่า CNI ที่ติดตั้งอยู่รองรับ NetworkPolicy ก่อนจะพึ่งมันเพื่อทำ isolation
+
+## รูปแบบ default-deny
+
+จุดที่คนสับสนกันบ่อย Pod ที่ไม่มี NetworkPolicy ตัวไหนเลือกมันเลยจะยังคงเปิดเต็มที่ (allow-all) สำหรับทิศทาง traffic นั้น isolation เป็นแบบ opt-in ต่อ Pod ไม่ใช่ทั้ง cluster ถ้าจะปิด namespace หนึ่งให้แน่นหนา ต้องสร้าง policy ที่เลือก Pod ทุกตัวแต่ไม่อนุญาตอะไรเลยโดยตั้งใจ
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: shop
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress: []
+```
+
+`podSelector: {}` match ทุก Pod ใน namespace และ `ingress: []` ที่ว่างเปล่าไม่อนุญาตอะไรเข้ามาเลย พอ policy นี้มีอยู่ ทุก Pod ใน `shop` จะถูก isolate ด้าน ingress โดย default แล้วคุณค่อยเพิ่ม NetworkPolicy object อื่นเข้าไปเพื่ออนุญาต traffic ที่ต้องการจริง ๆ แบบเจาะจง เช่นตัวอย่าง `allow-frontend-to-api` ด้านบน
+
+## รวม podSelector กับ namespaceSelector เข้าด้วยกัน
+
+การใส่ทั้ง `podSelector` และ `namespaceSelector` ไว้ใน entry `from` *เดียวกัน* จะจำกัด rule ให้แคบลงเหลือแค่ Pod เจาะจงใน namespace เจาะจงเท่านั้น ไม่ใช่ "Pod ไหนก็ได้ใน namespace นี้" หรือ "label นี้ที่ไหนก็ได้ในทั้ง cluster"
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-scrape
+  namespace: shop
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app: prometheus
+      ports:
+        - protocol: TCP
+          port: 9090
+```
+
+rule นั้นอนุญาต traffic เฉพาะจาก Pod ที่ label `app: prometheus` และรันอยู่ใน namespace `monitoring` เท่านั้น เป็น rule ควบคุมการเข้าถึงข้าม namespace ที่เจาะจงมาก
+
+<Mermaid title="Network แบบแบนราบที่ทุก Pod คุยกันได้หมดโดย default เทียบกับหลังใช้ NetworkPolicy จำกัด path ที่อนุญาต" code={networkPolicyDiagram} />
+
+export const networkPolicyDiagram = `flowchart LR
+  subgraph before["Before: default flat network"]
+    a1["Pod A"] --- a2["Pod B"]
+    a2 --- a3["Pod C"]
+    a1 --- a3
+  end
+  subgraph after["After: NetworkPolicy applied"]
+    b1["frontend"] -->|"allowed"| b2["api"]
+    b3["random Pod"] -.->|"blocked"| b2
+  end`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+networking ของ Kubernetes แบนราบโดย default ทุก Pod คุยกับ Pod อื่นได้หมด และ Pod ที่ไม่มี NetworkPolicy ตัวไหนเลือกมันก็ยังคงเปิดเต็มที่ **NetworkPolicy** (`networking.k8s.io/v1`) เลือก Pod ด้วย `podSelector` และกำหนด rule `ingress`/`egress` ที่อนุญาต แต่มันมีผลก็ต่อเมื่อ **CNI plugin** ของ cluster บังคับใช้ NetworkPolicy จริง `podSelector: {}` คู่กับ `ingress: []` ที่ว่างเปล่าคือรูปแบบ **default-deny** มาตรฐาน และการรวม `namespaceSelector` กับ `podSelector` ไว้ใน rule เดียวจะจำกัด traffic ให้เหลือแค่ Pod เจาะจงใน namespace เจาะจง
+</Callout>
+
+export const quizNetworkPolicies = [
+  {
+    q: 'ถ้าไม่มี NetworkPolicy object ถูกสร้างเลยสักตัว Pod ใน cluster คุยกันยังไงโดย default',
+    options: [
+      'ไม่มี Pod ไหนเข้าถึง Pod อื่นได้เลย',
+      'ทุก Pod เข้าถึง Pod อื่นได้หมด ไม่มี isolation ระหว่าง namespace หรือ workload',
+      'Pod ใน namespace เดียวกันเท่านั้นที่เข้าถึงกันได้',
+      'Pod ที่มี label เดียวกันเท่านั้นที่เข้าถึงกันได้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'อะไรที่จำเป็นเพื่อให้ NetworkPolicy object จำกัด traffic ได้จริง',
+    options: [
+      'ไม่ต้องมีอะไรเพิ่ม NetworkPolicy object ถูกบังคับใช้โดย API server เองอยู่แล้วเสมอ',
+      'CNI plugin ของ cluster ต้อง implement การบังคับใช้ NetworkPolicy ไม่งั้น object นั้นไม่มีผลอะไรเลย',
+      'ต้องมี LoadBalancer Service อยู่ใน namespace เดียวกัน',
+      'Pod ต้องเป็นส่วนหนึ่งของ StatefulSet',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'จะสื่อความหมาย deny-all-ingress ให้กลุ่ม Pod ด้วย NetworkPolicy ยังไง',
+    options: [
+      'ไม่ต้องสร้าง NetworkPolicy เลย',
+      'สร้าง NetworkPolicy ที่ podSelector match Pod เหล่านั้น มี policyTypes รวม Ingress และมี ingress: [] ว่างเปล่า',
+      'ตั้ง replicas: 0 บน Deployment',
+      'ลบ Service ที่ชี้ไปยัง Pod เหล่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'การรวม namespaceSelector กับ podSelector ไว้ใน NetworkPolicy rule เดียวให้ผลอะไร',
+    options: [
+      'ใช้สองอย่างพร้อมกันใน rule เดียวไม่ได้ ผิด syntax',
+      'อนุญาต traffic จาก Pod ไหนก็ได้ในทั้ง cluster โดยไม่สนใจ namespace',
+      'จำกัด source ที่อนุญาตให้เหลือแค่ Pod เจาะจงที่อยู่ใน namespace เจาะจงด้วย ทำให้ควบคุมการเข้าถึงข้าม namespace ได้แม่นยำ',
+      'ปิดการทำงานของ rule นั้นไปเลยทั้งหมด',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="networking/network-policies" questions={quizNetworkPolicies} />
+
+<ProgressTracker client:visible id="networking/network-policies" />

@@ -1,0 +1,183 @@
+---
+title: 'PersistentVolume, Claim และ StorageClass'
+description: 'storage ของ Kubernetes อยู่รอดตอน Pod ถูกย้ายไปคนละ node ได้ยังไง'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**PersistentVolumeClaim** คือ request ขอ storage ที่ Pod เอาไป mount ใช้ และมันจะ bind กับ **PersistentVolume** ซึ่งเป็น storage ระดับ cluster ที่อยู่รอดข้าม Pod และตาม Pod ไปได้ข้าม node
+
+## ช่องว่างที่ emptyDir กับ hostPath ปิดไม่ได้
+
+`emptyDir` ตายไปพร้อม Pod ส่วน `hostPath` ผูกข้อมูลไว้กับ node เฉพาะตัว ทั้งสองแบบอยู่ไม่รอดถ้า Pod ถูก scheduler ย้ายไปรันบน hardware คนละตัว ซึ่ง scheduler มีสิทธิ์ทำแบบนั้นได้ตลอดเวลา workload แบบ stateful จริง ๆ (database, message queue หรืออะไรก็ตามที่ข้อมูลสำคัญ) ต้องการ storage ที่อยู่แยกอิสระจาก Pod หรือ node ตัวใดตัวหนึ่ง และให้ Pod ที่ถูกย้ายไปที่ใหม่ต่อกลับเข้าไปใช้ได้อีก
+
+## PersistentVolume กับ PersistentVolumeClaim
+
+**PersistentVolume (PV)** คือ storage resource ระดับ cluster แนวคิดคล้าย Node ที่แทน compute capacity แต่ PV แทน storage capacity แทน admin ของ cluster provision PV แบบ static ล่วงหน้าได้ หรือจะให้ถูกสร้างแบบ dynamic ก็ได้ (อธิบายด้านล่าง)
+
+**PersistentVolumeClaim (PVC)** คือ request ที่ user หรือ application ยื่นขอ "ขอ storage ขนาดเท่านี้ ด้วย access mode แบบนี้" Kubernetes จะ bind PVC เข้ากับ PV ที่ตรงกับ request นั้น ที่สำคัญคือ **Pod reference แค่ PVC ไม่เคย reference PV ตรง ๆ** Pod ไม่ต้องรู้หรือสนใจว่ามันไป bind กับ PV ตัวไหนจริง ๆ
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-manual-10gi
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: manual
+  hostPath:
+    path: /mnt/data
+```
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-claim
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: manual
+```
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: db
+spec:
+  containers:
+    - name: postgres
+      image: postgres:16
+      volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: data-claim
+```
+
+## Access mode
+
+PV ประกาศว่ารองรับ access mode ไหนบ้าง ส่วน PVC ก็ขอ mode ที่ต้องการ
+
+- **`ReadWriteOnce` (RWO)** — mount แบบ read-write ได้ แต่แค่ Pod บน node เดียวในเวลาเดียวกันเท่านั้น
+- **`ReadOnlyMany` (ROX)** — mount แบบ read-only ได้จากหลาย node พร้อมกัน
+- **`ReadWriteMany` (RWX)** — mount แบบ read-write ได้จากหลาย node พร้อมกัน (มีแค่บาง storage backend ที่รองรับ)
+- **`ReadWriteOncePod` (RWOP)** — mode ใหม่กว่าและเข้มกว่า volume ถูกจำกัดให้ใช้ได้แค่ **Pod เดียว** ทั้ง cluster ไม่ใช่แค่จำกัดที่ node เดียว ในขณะที่ `ReadWriteOnce` ธรรมดายังเปิดให้หลาย Pod share volume กันได้ถ้าอยู่ node เดียวกัน `ReadWriteOncePod` มาปิดช่องว่างนี้เวลาต้องการ single-writer guarantee จริง ๆ
+
+## Dynamic provisioning ด้วย StorageClass
+
+การ provision PV มือทีละตัวไม่ scale **StorageClass** อธิบาย storage class หนึ่งประเภท พร้อม provisioner ที่สร้าง storage นั้นได้ตามต้องการ พอ PVC reference StorageClass แทนที่จะ reference PV ที่มีอยู่แล้ว driver แบบ **CSI (Container Storage Interface)** จะ provision PV ที่ตรงกันให้อัตโนมัติ admin ไม่ต้องมานั่งสร้างล่วงหน้าเลย
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+```
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dynamic-claim
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: fast-ssd
+  resources:
+    requests:
+      storage: 20Gi
+```
+
+```bash
+# Watch a PVC bind to a dynamically provisioned PV
+kubectl get pvc dynamic-claim -w
+```
+
+## Reclaim policy ตัดสินชะตากรรมหลัง PVC หายไป
+
+**reclaim policy** กำหนดว่า storage เบื้องหลังจะเป็นยังไงหลัง PVC ของมันถูกลบ
+
+- **`Delete`** — PV และ storage เบื้องหลัง (disk จริง) ถูกลบไปพร้อม PVC เป็นค่า default ของ StorageClass แบบ dynamic provisioning ส่วนใหญ่
+- **`Retain`** — PV และข้อมูลยังอยู่ต่อหลัง PVC ถูกลบ admin เลยกู้คืนหรือเคลียร์ข้อมูลเองได้ก่อนที่ storage เบื้องหลังจะถูกปล่อยจริง ๆ
+
+<Mermaid title="Dynamic provisioning: PVC สั่งให้ StorageClass กับ CSI driver สร้าง PV ใหม่" code={pvcDiagram} />
+
+export const pvcDiagram = `flowchart LR
+  pod["Pod"] -->|mounts| pvc["PVC: dynamic-claim"]
+  pvc -->|references| sc["StorageClass: fast-ssd"]
+  sc -->|CSI driver provisions| pv["New PersistentVolume"]
+  pv --> disk[("Underlying disk, e.g. an EBS volume")]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**PersistentVolume** คือ storage ระดับ cluster **PersistentVolumeClaim** คือ request ขอ storage ที่ bind กับ PV และ **Pod reference แค่ PVC เท่านั้น** **access mode** (`ReadWriteOnce`, `ReadOnlyMany`, `ReadWriteMany` และแบบเข้มกว่าอย่าง `ReadWriteOncePod`) บอกว่ากี่ node หรือกี่ Pod mount volume พร้อมกันได้ **StorageClass** ทำให้การสร้าง PV ใหม่เป็นอัตโนมัติผ่าน **CSI driver** แทนที่ admin จะต้อง provision มือเอง **reclaim policy** ตัดสินว่าลบ PVC แล้ว storage เบื้องหลังจะถูกลบไปด้วย (`Delete`) หรือถูกเก็บไว้ให้จัดการมือ (`Retain`)
+</Callout>
+
+export const quizPvPvc = [
+  {
+    q: 'ตอน Pod ต้องการ persistent storage มันไป reference อะไรใน spec.volumes',
+    options: [
+      'PersistentVolume ตรง ๆ โดยระบุชื่อ',
+      'PersistentVolumeClaim ซึ่ง bind กับ PersistentVolume ไว้แล้ว',
+      'StorageClass ตรง ๆ',
+      'ชื่อของ CSI driver',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'StorageClass ช่วยให้คุณไม่ต้องทำอะไร',
+    options: [
+      'ตั้ง access mode บน PersistentVolumeClaim',
+      'เขียน Pod spec ที่ mount volume',
+      'provision PersistentVolume ด้วยมือล่วงหน้า เพราะ CSI driver สร้างให้ตามต้องการแทน',
+      'ลบ PersistentVolumeClaim',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'ReadWriteOncePod จำกัดอะไรที่ ReadWriteOnce ธรรมดาไม่จำกัด',
+    options: [
+      'จำกัดให้ใช้ได้แค่ node เดียว เหมือน ReadWriteOnce',
+      'จำกัดให้ใช้ได้แค่ Pod เดียวทั้ง cluster ในขณะที่ ReadWriteOnce จำกัดแค่ node เดียวเท่านั้น',
+      'ทำให้ volume เป็น read-only',
+      'เปิดให้หลาย node เขียนพร้อมกันได้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ความต่างเชิงปฏิบัติระหว่าง reclaim policy แบบ Delete กับ Retain คืออะไร',
+    options: [
+      'พฤติกรรมเหมือนกันทุกอย่าง ต่างแค่ label',
+      'Delete เก็บ PersistentVolumeClaim ไว้ใช้ต่อ Retain ลบมันทิ้ง',
+      'Delete ลบ storage เบื้องหลังตอน PVC ถูกลบ ส่วน Retain เก็บ storage ไว้ให้กู้คืนหรือเคลียร์เองด้วยมือ',
+      'Retain สร้าง backup ให้อัตโนมัติ Delete ไม่สร้าง',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="storage-and-config/persistent-volumes-claims-and-storage-classes" questions={quizPvPvc} />
+
+<ProgressTracker client:visible id="storage-and-config/persistent-volumes-claims-and-storage-classes" />

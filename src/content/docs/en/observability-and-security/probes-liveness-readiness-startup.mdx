@@ -1,0 +1,156 @@
+---
+title: 'Probes: Liveness, Readiness, and Startup'
+description: 'How liveness, readiness, and startup probes let Kubernetes detect a broken container and keep traffic away from one that is not ready.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Three different probes ask three different questions — is it alive, is it ready for traffic, and has it finished starting up — and Kubernetes reacts differently to each answer.
+
+## Liveness vs readiness: restart vs remove-from-Service
+
+A **liveness probe** answers "is this container still working?" If it fails enough times in a row, the kubelet kills the container and lets `restartPolicy` decide what happens next (normally, it gets restarted). This is for containers that are still running but stuck — deadlocked, wedged, unable to make progress — where a restart is the fix.
+
+A **readiness probe** answers a completely different question: "is this container ready to serve traffic *right now*?" A failing readiness probe does **not** restart anything. Instead, the Pod is removed from the Service's Endpoints/EndpointSlice, so the Service simply stops routing traffic to it. The container keeps running untouched, and as soon as the probe starts succeeding again, the Pod is added back.
+
+This distinction is what makes rolling updates and slow-warm-up applications work correctly:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: web
+spec:
+  containers:
+    - name: web
+      image: web-app:1.4.0
+      ports:
+        - containerPort: 8080
+      livenessProbe:
+        httpGet:
+          path: /healthz
+          port: 8080
+        initialDelaySeconds: 10
+        periodSeconds: 5
+        timeoutSeconds: 3
+        failureThreshold: 3
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 8080
+        periodSeconds: 5
+        failureThreshold: 1
+```
+
+A common real-world misconfiguration is skipping the readiness probe entirely. With no readiness probe, Kubernetes considers a container ready the instant it starts — even if the application inside is still loading a config file, warming a cache, or opening database connections. During a rollout, that means live traffic gets routed straight into a container that cannot actually handle it yet, which shows up as a burst of errors right after every deployment.
+
+## Startup probe: giving slow-starting containers room to boot
+
+Some containers — legacy JVM apps, anything doing a heavy migration or cache preload on boot — can take minutes to become responsive. A short `initialDelaySeconds` on the liveness probe is not enough headroom, but a long one delays detecting a *real* hang once the app is finally up.
+
+A **startup probe** solves this. While the startup probe has not yet succeeded, the liveness and readiness probes are disabled entirely — so a slow-booting container cannot be killed by an impatient liveness probe. Once the startup probe succeeds once, it stops running permanently, and liveness/readiness take over for the rest of the container's life.
+
+```yaml
+    startupProbe:
+      httpGet:
+        path: /healthz
+        port: 8080
+      failureThreshold: 30
+      periodSeconds: 10
+```
+
+With `failureThreshold: 30` and `periodSeconds: 10`, this container gets up to 300 seconds to become healthy before the kubelet gives up and restarts it.
+
+```bash
+# Watch probe-driven restarts and readiness state
+kubectl get pods -w
+kubectl describe pod web | grep -A5 -E 'Liveness|Readiness|Startup'
+```
+
+## Probe mechanisms
+
+Every probe type (liveness, readiness, startup) can use one of these check mechanisms:
+
+- **`httpGet`** — send an HTTP GET request; any status code from 200 up to but not including 400 counts as success.
+- **`tcpSocket`** — try to open a TCP connection to a port; a successful connection counts as success.
+- **`exec`** — run a command inside the container; exit code `0` counts as success.
+- **`grpc`** — call the container's gRPC health-checking service (the container must implement the standard gRPC health protocol).
+
+```yaml
+      readinessProbe:
+        grpc:
+          port: 5000
+```
+
+Tuning fields apply across mechanisms: `initialDelaySeconds` (wait before the first check), `periodSeconds` (how often to check), `timeoutSeconds` (how long to wait for a response), `failureThreshold` (consecutive failures before acting), and `successThreshold` (consecutive successes needed to flip back to healthy — must be `1` for liveness and startup probes).
+
+<Mermaid title="A container's lifecycle: startup probe gates liveness and readiness, which then run continuously" code={probeLifecycleDiagram} />
+
+export const probeLifecycleDiagram = `flowchart LR
+  boot["Container starts"] --> sp{"startupProbe\\nsucceeded?"}
+  sp -- "no, keep trying" --> sp
+  sp -- "yes" --> live["livenessProbe\\nruns continuously"]
+  sp -- "yes" --> ready["readinessProbe\\nruns continuously"]
+  live -- "fails" --> restart["kubelet restarts container"]
+  ready -- "fails" --> remove["Pod removed from Service Endpoints"]
+  ready -- "succeeds again" --> add["Pod added back to Endpoints"]`;
+
+<Callout title="The one-line takeaway">
+A **liveness probe** failing gets the container **restarted**; a **readiness probe** failing gets the Pod **removed from the Service's Endpoints** without touching the container; a **startup probe** holds off both liveness and readiness checks until a slow-booting container finishes starting. Probes can use **httpGet**, **tcpSocket**, **exec**, or **grpc**, tuned with `initialDelaySeconds`, `periodSeconds`, `timeoutSeconds`, `failureThreshold`, and `successThreshold`. Skipping the readiness probe means traffic hits a container the instant it starts, a common cause of post-rollout errors.
+</Callout>
+
+export const quizProbes = [
+  {
+    q: 'What happens when a liveness probe fails repeatedly, past its failureThreshold?',
+    options: [
+      'The Pod is removed from the Service Endpoints only',
+      'Nothing, liveness probes are informational only',
+      'The kubelet restarts the container, subject to restartPolicy',
+      'The whole Pod is deleted and never recreated',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'What happens when a readiness probe fails?',
+    options: [
+      'The container is restarted immediately',
+      'The Pod is removed from the Service Endpoints/EndpointSlice so traffic stops routing to it, but the container keeps running',
+      'The Node is cordoned',
+      'The startup probe is triggered again',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the purpose of a startup probe?',
+    options: [
+      'To replace the need for a readiness probe entirely',
+      'To give slow-starting containers time to boot by disabling liveness and readiness checks until it succeeds',
+      'To check disk space before the container starts',
+      'To restart the container on a fixed schedule',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the practical risk of running a Pod with no readiness probe configured at all?',
+    options: [
+      'The Pod will never start',
+      'The liveness probe will be disabled automatically',
+      'Kubernetes considers the container ready the instant it starts, so live traffic can hit it before the application inside is actually ready, especially during rollouts',
+      'The Pod will be scheduled on a random node',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="observability-and-security/probes-liveness-readiness-startup" questions={quizProbes} />
+
+<ProgressTracker client:visible id="observability-and-security/probes-liveness-readiness-startup" />

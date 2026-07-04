@@ -1,0 +1,168 @@
+---
+title: 'Deployments and ReplicaSets'
+description: 'How ReplicaSets keep Pods running and how Deployments manage rolling updates, rollbacks, and scaling on top of them.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A **ReplicaSet** keeps a fixed number of Pods matching a label selector running at all times, and a **Deployment** manages ReplicaSets for you to provide declarative, versioned rolling updates and rollback history on top.
+
+## ReplicaSets: a fixed count of matching Pods
+
+A ReplicaSet's job is narrow: given a Pod template and a label selector, it makes sure exactly `replicas` Pods matching that selector exist. If a Pod matching the selector disappears, the ReplicaSet creates a replacement; if there are too many, it deletes the extras. A ReplicaSet will even **adopt** existing Pods it did not create, as long as their labels match its selector.
+
+```yaml
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: web-rs
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: myregistry/web:1.0.0
+          ports:
+            - containerPort: 8080
+```
+
+In everyday use you do not write ReplicaSets like this yourself — you create a Deployment, and the Deployment creates and owns the ReplicaSet for you.
+
+## Deployments: rolling updates on top of ReplicaSets
+
+A **Deployment** wraps a ReplicaSet with a rollout strategy, a revision history, and rollback support. When you change the Pod template in a Deployment (a new image tag, an updated env var), the Deployment creates a **new** ReplicaSet with that template and gradually shifts replicas from the old ReplicaSet to the new one.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: myregistry/web:1.1.0
+          ports:
+            - containerPort: 8080
+```
+
+The ownership chain is always **Deployment → ReplicaSet → Pod**: the Deployment owns one or more ReplicaSets (the current one, plus old ones kept for rollback history), and each ReplicaSet owns its Pods.
+
+<Mermaid title="A Deployment shifts replicas from an old ReplicaSet to a new one during a rollout" code={deploymentsDiagram} />
+
+export const deploymentsDiagram = `flowchart LR
+  dep["Deployment web"] --> rsOld["ReplicaSet web-abc123 (old): 3 -> 0"]
+  dep --> rsNew["ReplicaSet web-def456 (new): 0 -> 3"]
+  rsOld --> p1["Pod (terminating)"]
+  rsNew --> p2["Pod (running)"]
+  rsNew --> p3["Pod (running)"]
+  rsNew --> p4["Pod (running)"]`;
+
+## Rollout strategy: RollingUpdate vs Recreate
+
+`maxUnavailable` caps how many of the desired replicas can be unavailable at once during the rollout, and `maxSurge` caps how many extra Pods above the desired count are allowed to exist temporarily while new ones come up. Together they tune the trade-off between rollout speed and available capacity — the values above allow one Pod down and one extra Pod at a time for a Deployment of 3 replicas.
+
+The alternative strategy is `Recreate`, which terminates every old Pod before creating any new one:
+
+```yaml
+spec:
+  strategy:
+    type: Recreate
+```
+
+`Recreate` causes a brief outage, so it is reserved for cases where the old and new versions genuinely cannot run side by side — for example, an application that cannot tolerate two schema versions hitting the same database at once.
+
+## Operating a rollout
+
+```bash
+# Trigger a rollout by changing the Pod template (e.g. a new image), then watch it
+kubectl set image deployment/web web=myregistry/web:1.2.0
+kubectl rollout status deployment/web
+
+# See every revision this Deployment has kept
+kubectl rollout history deployment/web
+
+# Roll back to the previous revision
+kubectl rollout undo deployment/web
+
+# Scale independently of a rollout
+kubectl scale deployment/web --replicas=5
+```
+
+<Callout title="The one-line takeaway">
+A **ReplicaSet** keeps a fixed count of Pods matching a selector running; a **Deployment** manages ReplicaSets for you, following the chain **Deployment → ReplicaSet → Pod**, and adds declarative rolling updates (tuned with `maxUnavailable`/`maxSurge`, or the downtime-accepting `Recreate` strategy) plus a revision history you can inspect with `kubectl rollout history` and undo with `kubectl rollout undo`.
+</Callout>
+
+export const quizDeployments = [
+  {
+    q: 'In normal use, which object do you edit directly to change what is running: the Deployment or the ReplicaSet?',
+    options: [
+      'The ReplicaSet directly, the Deployment is read-only',
+      'The Deployment, it creates and manages ReplicaSets and Pods for you',
+      'The Pods directly, controllers are optional',
+      'ReplicaSets manage Deployments, not the other way around',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'During a RollingUpdate, what do maxUnavailable and maxSurge each control?',
+    options: [
+      'maxUnavailable caps how many replicas can be down at once; maxSurge caps how many extra Pods above the desired count can exist during the rollout',
+      'maxUnavailable sets the total Pod count; maxSurge sets the container port',
+      'Both control how many nodes the Deployment can use',
+      'maxSurge deletes old Pods immediately regardless of readiness',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'How do you roll back a Deployment to its previous working revision?',
+    options: [
+      'Delete the Deployment and recreate it from scratch',
+      'Run kubectl rollout undo deployment/<name>',
+      'Scale the Deployment to zero replicas permanently',
+      'Edit the ReplicaSet selector',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why would you choose the Recreate strategy instead of RollingUpdate?',
+    options: [
+      'It is faster and causes zero downtime',
+      'When old and new versions of the app cannot safely run side by side, accepting downtime to avoid mixing versions',
+      'It surges extra Pods to avoid any downtime',
+      'It is required for every Deployment by default',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="workloads/deployments-and-replicasets" questions={quizDeployments} />
+
+<ProgressTracker client:visible id="workloads/deployments-and-replicasets" />

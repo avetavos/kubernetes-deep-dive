@@ -1,0 +1,154 @@
+---
+title: 'Namespace และ Resource Quota'
+description: 'แบ่ง cluster เดียวให้หลายทีมใช้ โดยไม่ได้แถม network isolation มาให้ฟรี ๆ'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**Namespace** แบ่ง object และชื่อของ cluster เดียวให้หลาย user, ทีม หรือโปรเจกต์ใช้ร่วมกัน แต่มันไม่ได้แบ่ง network ให้ด้วย ต้องใช้ NetworkPolicy ถึงจะทำได้
+
+## Namespace scope อะไรจริง ๆ
+
+Namespace scope **ชื่อ** ของ object `Deployment web` ใน namespace `team-a` กับ `Deployment web` ใน namespace `team-b` เป็นคนละ object กันโดยสิ้นเชิง แค่บังเอิญชื่อเหมือนกัน Namespace ยังเป็นหน่วยที่ **RBAC** (จะพูดถึงใน module ถัดไป) มักถูก scope ไว้ ทำให้สิทธิ์ของแต่ละทีมจำกัดอยู่แค่ namespace ที่ทีมนั้นดูแล ไม่ใช่ทั้ง cluster
+
+สิ่งที่ Namespace **ไม่ได้** ให้คือ network isolation โดย default Pod ใน `team-a` ยังส่ง traffic ไปหา Pod ใน `team-b` ได้อยู่ดี Namespace เป็นขอบเขตเรื่องชื่อและการจัดระเบียบ ไม่ใช่ขอบเขตเรื่อง network ถ้าอยากบล็อก traffic นั้นต้องใช้ **NetworkPolicy** ซึ่งอยู่ใน module Networking
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-a
+```
+
+```bash
+kubectl create namespace team-a
+kubectl config set-context --current --namespace=team-a
+```
+
+## ไม่ใช่ทุก object จะอยู่ใน namespace
+
+บาง object เป็น **cluster-scoped** คืออยู่นอก namespace ไหนเลย เพราะมันอธิบายแนวคิดระดับ cluster ไม่ใช่สิ่งที่ทีมใดทีมหนึ่งเป็นเจ้าของ **Node**, **PersistentVolume** และ **ClusterRole** ล้วนเป็น cluster-scoped ส่วน object ที่ใช้กันบ่อย ๆ อย่าง Pod, Deployment, Service, ConfigMap, PersistentVolumeClaim เป็น namespaced
+
+```bash
+# List objects that live outside any namespace
+kubectl api-resources --namespaced=false
+```
+
+## ResourceQuota: จำกัดการใช้รวมของทั้ง namespace
+
+**ResourceQuota** จำกัดการใช้ resource รวมทั้งหมดของ namespace หนึ่งตัว คือ CPU กับ memory requests/limits รวมของทุก Pod ใน namespace นั้น และ/หรือจำนวน object รวม เช่น จำนวน Pod, Service หรือ PersistentVolumeClaim สูงสุด
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-a-quota
+  namespace: team-a
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+    pods: "50"
+    persistentvolumeclaims: "10"
+```
+
+## LimitRange: กำหนดขอบเขตของ Pod และ container แต่ละตัว
+
+ResourceQuota จำกัดทั้ง namespace รวมกัน แต่ไม่ได้พูดถึง Pod ตัวใดตัวหนึ่งเลย ถ้าไม่มีขอบเขตระดับ object เดียว Pod ที่ไม่ถูกจำกัดตัวเดียวสามารถขอ CPU กับ memory มากพอจะกิน ResourceQuota ทั้ง namespace ไปคนเดียว ทำให้ Pod อื่นในทีมเดียวกันขาดแคลนไปด้วย **LimitRange** ปิดช่องว่างนี้ด้วยการตั้งค่า default, ขั้นต่ำ และขั้นสูงของ requests/limits สำหรับ Pod และ container แต่ละตัวที่ถูกสร้างใน namespace นั้น
+
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: team-a-limits
+  namespace: team-a
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 250m
+        memory: 256Mi
+      max:
+        cpu: "2"
+        memory: 2Gi
+      min:
+        cpu: 100m
+        memory: 128Mi
+```
+
+<Mermaid title="สอง namespace แต่ละอันถูกจำกัดด้วย ResourceQuota และ LimitRange ของตัวเอง" code={namespaceQuotaDiagram} />
+
+export const namespaceQuotaDiagram = `flowchart LR
+  subgraph cluster["Cluster"]
+    subgraph nsa["Namespace: team-a"]
+      qa["ResourceQuota"] --- la["LimitRange"]
+      pa1["Pod"] --- pa2["Pod"]
+    end
+    subgraph nsb["Namespace: team-b"]
+      qb["ResourceQuota"] --- lb["LimitRange"]
+      pb1["Pod"] --- pb2["Pod"]
+    end
+  end`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**Namespace** scope ชื่อของ object และมักเป็นขอบเขตที่ RBAC ถูก apply แต่มันไม่ได้ให้ **network isolation** ด้วยตัวมันเอง ต้องพึ่ง NetworkPolicy บาง object อย่าง **Node**, **PersistentVolume** และ **ClusterRole** เป็น **cluster-scoped** อยู่นอก namespace ใด ๆ ในขณะที่ object ที่ใช้บ่อยส่วนใหญ่เป็น namespaced **ResourceQuota** จำกัด CPU/memory รวมและจำนวน object ของทั้ง namespace ส่วน **LimitRange** กำหนดค่า default, ขั้นต่ำ และขั้นสูงของ Pod และ container แต่ละตัว ถ้าไม่มี LimitRange Pod ที่ไม่ถูกจำกัดตัวเดียวอาจกิน quota ทั้ง namespace ไปคนเดียวได้
+</Callout>
+
+export const quizNamespaceQuota = [
+  {
+    q: 'โดย default namespace ไม่ได้ให้อะไรระหว่าง Pod ที่อยู่คนละ namespace',
+    options: [
+      'ชื่อ object ที่ไม่ซ้ำกัน',
+      'network isolation — Pod ใน namespace ต่างกันยังเชื่อมถึงกันได้ ถ้าไม่มี NetworkPolicy บล็อกไว้',
+      'ขอบเขตของสิทธิ์ RBAC',
+      'วิธีจัดระเบียบ object ตามทีม',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'object ไหนต่อไปนี้เป็น cluster-scoped ไม่ใช่ namespaced',
+    options: [
+      'Deployment',
+      'ConfigMap',
+      'Node',
+      'PersistentVolumeClaim',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'ResourceQuota คุมอะไรที่ LimitRange ไม่ได้คุม',
+    options: [
+      'CPU request default ของ container ตัวเดียว',
+      'การใช้ resource รวมและจำนวน object รวมของทั้ง namespace',
+      'memory limit ขั้นต่ำของ Pod ตัวเดียว',
+      'CPU limit ขั้นสูงของ container ตัวเดียว',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม namespace ถึงต้องมี LimitRange เพิ่มจาก ResourceQuota',
+    options: [
+      'LimitRange แทนที่ ResourceQuota ได้เลยไม่ต้องมีทั้งคู่',
+      'ถ้าไม่มี LimitRange Pod ที่ไม่ถูกจำกัดตัวเดียวอาจขอ resource มากพอจะกิน ResourceQuota ทั้ง namespace ไปคนเดียว',
+      'LimitRange เป็นเงื่อนไขบังคับก่อนจะสร้าง Pod ใด ๆ ใน namespace ได้',
+      'LimitRange ทำให้เกิด network isolation ระหว่าง namespace',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="storage-and-config/namespaces-and-resource-quotas" questions={quizNamespaceQuota} />
+
+<ProgressTracker client:visible id="storage-and-config/namespaces-and-resource-quotas" />

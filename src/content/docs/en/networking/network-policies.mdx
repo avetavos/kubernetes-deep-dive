@@ -1,0 +1,170 @@
+---
+title: 'Network Policies'
+description: 'How NetworkPolicy restricts the default flat, all-to-all Pod network, and why enforcement depends on the CNI plugin.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+By default every Pod in a cluster can talk to every other Pod, and a **NetworkPolicy** is what lets you restrict that to only the traffic you explicitly allow.
+
+## The default: a flat, open network
+
+Out of the box, Kubernetes networking has no isolation at all. Any Pod can send traffic to any other Pod, regardless of namespace, and — depending on how Services are exposed — Pods can often be reached from outside the cluster too. There is no default-deny anywhere. This is simple to reason about but means a compromised or misconfigured Pod can reach far more of the cluster than it should ever need to.
+
+## NetworkPolicy: selecting Pods, then allowing traffic
+
+A **NetworkPolicy** (API group `networking.k8s.io/v1`) selects a set of Pods with a `podSelector`, then defines the `ingress` and/or `egress` rules allowed for exactly those Pods:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-api
+  namespace: shop
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+```
+
+This policy applies only to Pods labeled `app: api` in the `shop` namespace, and it allows inbound traffic only from Pods labeled `app: frontend`, only on TCP port 8080. Everything else to those Pods is implicitly denied once at least one policy selects them.
+
+```bash
+kubectl get networkpolicy -n shop
+kubectl describe networkpolicy allow-frontend-to-api -n shop
+```
+
+## NetworkPolicy only works if the CNI enforces it
+
+This is the single most important caveat: a `NetworkPolicy` object is inert unless the cluster's **CNI plugin** actually implements NetworkPolicy enforcement. Kubernetes accepts and stores the object either way — `kubectl apply` will succeed — but if the CNI does not enforce policies, nothing actually changes about the traffic. Always confirm the installed CNI supports NetworkPolicy before relying on it for isolation.
+
+## The default-deny pattern
+
+A common point of confusion: Pods that are not selected by **any** NetworkPolicy remain completely open (allow-all) for that traffic direction. Isolation is opt-in per Pod, not cluster-wide. To lock a namespace down, you deliberately create a policy that selects all Pods but allows nothing:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: shop
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress: []
+```
+
+`podSelector: {}` matches every Pod in the namespace, and an empty `ingress: []` list allows nothing in. Once this exists, every Pod in `shop` is ingress-isolated by default, and you then add further NetworkPolicy objects to selectively allow the traffic you actually want — such as the `allow-frontend-to-api` example above.
+
+## Combining podSelector and namespaceSelector
+
+Putting both a `podSelector` and a `namespaceSelector` in the *same* `from` entry narrows the rule to specific Pods in specific namespaces, rather than "any Pod in this namespace" or "this label anywhere in the cluster":
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-scrape
+  namespace: shop
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app: prometheus
+      ports:
+        - protocol: TCP
+          port: 9090
+```
+
+That allows traffic only from Pods labeled `app: prometheus` that are running specifically inside the `monitoring` namespace — a precise, cross-namespace access rule.
+
+<Mermaid title="Default flat all-to-all Pod network versus after a NetworkPolicy restricts allowed paths" code={networkPolicyDiagram} />
+
+export const networkPolicyDiagram = `flowchart LR
+  subgraph before["Before: default flat network"]
+    a1["Pod A"] --- a2["Pod B"]
+    a2 --- a3["Pod C"]
+    a1 --- a3
+  end
+  subgraph after["After: NetworkPolicy applied"]
+    b1["frontend"] -->|"allowed"| b2["api"]
+    b3["random Pod"] -.->|"blocked"| b2
+  end`;
+
+<Callout title="The one-line takeaway">
+Kubernetes networking is flat by default: every Pod can reach every other Pod, and Pods with no NetworkPolicy selecting them stay fully open. A **NetworkPolicy** (`networking.k8s.io/v1`) selects Pods via `podSelector` and defines allowed `ingress`/`egress` rules, but it only takes effect if the cluster's **CNI plugin** enforces NetworkPolicy at all. A `podSelector: {}` with an empty `ingress: []` is the standard **default-deny** pattern, and combining `namespaceSelector` with `podSelector` in one rule restricts traffic to specific Pods in specific namespaces.
+</Callout>
+
+export const quizNetworkPolicies = [
+  {
+    q: 'With no NetworkPolicy objects created at all, how do Pods in a cluster communicate by default',
+    options: [
+      'No Pod can reach any other Pod',
+      'Every Pod can reach every other Pod, with no isolation between namespaces or workloads',
+      'Only Pods in the same namespace can reach each other',
+      'Only Pods with the same labels can reach each other',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is required for a NetworkPolicy object to actually restrict traffic',
+    options: [
+      'Nothing extra, NetworkPolicy objects are always enforced by the API server itself',
+      'The cluster CNI plugin must implement NetworkPolicy enforcement; otherwise the object has no effect',
+      'A LoadBalancer Service must exist in the same namespace',
+      'The Pods must be part of a StatefulSet',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How do you express deny-all-ingress for a set of Pods with NetworkPolicy',
+    options: [
+      'Do not create any NetworkPolicy at all',
+      'A NetworkPolicy with a podSelector matching those Pods, policyTypes including Ingress, and an empty ingress: [] list',
+      'Set replicas: 0 on the Deployment',
+      'Delete the Service pointing at those Pods',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does combining namespaceSelector and podSelector in a single NetworkPolicy rule achieve',
+    options: [
+      'It is invalid to use both in the same rule',
+      'It allows traffic from any Pod in the cluster regardless of namespace',
+      'It restricts the allowed source to specific Pods that are also in specific namespaces, enabling precise cross-namespace access control',
+      'It disables the rule entirely',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="networking/network-policies" questions={quizNetworkPolicies} />
+
+<ProgressTracker client:visible id="networking/network-policies" />

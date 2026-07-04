@@ -1,0 +1,77 @@
+:root { --sl-color-accent: #326CE5; --sl-color-accent-low: #0a1f4d; --sl-color-accent-high: #b9d3ff; }
+
+.tsgo { display: grid; gap: 1rem; grid-template-columns: 1fr; margin: 1rem 0; }
+.tsgo__col header { display:flex; justify-content:space-between; align-items:center; font-weight:600; font-size:.85rem; padding:.25rem .5rem; background:var(--sl-color-gray-6); border-radius:6px 6px 0 0; }
+.tsgo__col pre { margin:0; border-radius:0 0 6px 6px; white-space:pre; overflow:auto; }
+.tsgo__copy, .pg__run { cursor:pointer; font-size:.75rem; border:1px solid var(--sl-color-gray-5); border-radius:4px; padding:.1rem .5rem; background:var(--sl-color-bg); color:inherit; }
+.pg__bar { display:flex; gap:.5rem; margin-bottom:.25rem; }
+.pg pre { white-space:pre; overflow:auto; }
+.pg__hint { font-size:.8rem; opacity:.7; margin:.25rem 0; }
+.pg__out { border-left:3px solid #339933; } .pg__err { border-left:3px solid var(--sl-color-red); color:var(--sl-color-red-high); }
+.quiz__q { border:1px solid var(--sl-color-gray-5); border-radius:6px; margin:.5rem 0; padding:.25rem .75rem; }
+.quiz label { display:block; padding:.15rem .25rem; cursor:pointer; } .quiz label.ok { color:var(--sl-color-green-high); font-weight:600; } .quiz label.bad { color:var(--sl-color-red-high); }
+.quiz__score { font-weight:700; }
+.pt { margin:2rem 0; padding:.5rem 1rem; border-radius:6px; border:1px solid var(--sl-color-accent); background:var(--sl-color-bg); cursor:pointer; color:inherit; }
+.pt--done { background:var(--sl-color-accent); color:#001; }
+/* inline code chips inside the React → Astro callout: dark text on light chip */
+.diff :not(pre) > code { background-color:#eceff4; color:#24292f; }
+.dp { margin:1rem 0; border:1px solid var(--sl-color-gray-5); border-radius:8px; overflow:hidden; }
+.dp__bar { display:flex; justify-content:space-between; align-items:center; gap:.5rem; padding:.35rem .6rem; background:var(--sl-color-gray-6); font-size:.8rem; }
+.dp__label { font-weight:600; opacity:.8; }
+.dp__open { font-size:.78rem; white-space:nowrap; }
+.dp__code { margin:0; border:0; border-radius:0; white-space:pre; overflow:auto; }
+.nr { margin:1rem 0; border:1px solid var(--sl-color-gray-5); border-radius:8px; overflow:hidden; }
+.nr__bar { display:flex; justify-content:space-between; align-items:center; gap:.5rem; padding:.35rem .6rem; background:var(--sl-color-gray-6); font-size:.8rem; }
+.nr__label { font-weight:600; opacity:.8; }
+.nr__actions { display:flex; gap:.4rem; }
+.nr__run, .nr__open { cursor:pointer; font-size:.78rem; border:1px solid var(--sl-color-accent); border-radius:4px; padding:.15rem .6rem; background:var(--sl-color-accent); color:#fff; white-space:nowrap; }
+.nr__open { background:transparent; color:var(--sl-color-accent); }
+.nr__code { width:100%; min-height:150px; font-family:ui-monospace,monospace; font-size:.85rem; padding:.5rem; border:0; border-top:1px solid var(--sl-color-gray-5); background:var(--sl-color-bg); color:var(--sl-color-text); resize:vertical; }
+.nr__out { width:100%; min-height:90px; border:0; border-top:1px solid var(--sl-color-gray-5); background:#fff; }
+.nr__hint { margin:0; padding:.4rem .6rem; font-size:.78rem; opacity:.75; border-top:1px solid var(--sl-color-gray-5); }
+
+/* Mermaid */
+.mermaid-figure { margin: 1.5rem 0; }
+.mermaid { display: flex; justify-content: center; overflow-x: auto; background: transparent; border: 0; padding: 0; }
+.mermaid svg { max-width: 100%; height: auto; }
+.mermaid-cap { text-align: center; font-size: .85rem; color: var(--sl-color-gray-3); margin-top: .4rem; }
+.readmode-toggle { position: fixed; right: 1rem; bottom: 1rem; z-index: 100; font-size: .8rem; font-weight: 600; cursor: pointer; padding: .45rem .8rem; border-radius: 999px; border: 1px solid var(--sl-color-gray-5); background: var(--sl-color-bg-nav, var(--sl-color-black)); color: var(--sl-color-text); box-shadow: 0 2px 8px rgba(0,0,0,.25); }
+.readmode-toggle:hover { border-color: var(--sl-color-accent); color: var(--sl-color-accent-high); }
+html.read-mode .sidebar, html.read-mode .sidebar-pane, html.read-mode .right-sidebar-container, html.read-mode .right-sidebar, html.read-mode starlight-toc, html.read-mode mobile-starlight-toc { display: none !important; }
+html.read-mode .main-frame { padding-inline-start: 0 !important; padding-top: 0 !important; }
+html.read-mode .main-pane { width: 100%; }
+html.read-mode .sl-container, html.read-mode .sl-markdown-content { max-width: 50rem; margin-inline: auto; }
+
+/* inline code chips inside the .callout dark box: dark text on a light chip for contrast */
+.callout :not(pre) > code { background: var(--sl-color-accent-high); color: var(--sl-color-accent-low); border: 0; padding: .05rem .35rem; border-radius: 5px; font-weight: 600; }
+
+/* Runner: cancel Starlight flow margin on all runner internals (bar, buttons, textarea, output) so nothing shifts */
+.sl-markdown-content .nr * { margin-top: 0; }
+
+/* ---- Collapsible sidebar (whole-sidebar toggle) ---- */
+.sidebar-collapse-toggle { display: none; }
+@media (min-width: 50rem) {
+  .sidebar-collapse-toggle {
+    position: fixed; top: 50%; left: var(--sl-sidebar-width, 18.75rem);
+    transform: translate(-50%, -50%); z-index: 90;
+    width: 1.85rem; height: 1.85rem; padding: 0; border-radius: 999px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1.1rem; line-height: 1; cursor: pointer;
+    border: 1px solid var(--sl-color-gray-5);
+    background: var(--sl-color-bg-nav, var(--sl-color-bg));
+    color: var(--sl-color-text);
+    box-shadow: 0 2px 10px rgba(0,0,0,.28);
+    transition: left .16s ease, color .16s ease, border-color .16s ease;
+  }
+  .sidebar-collapse-toggle:hover { border-color: var(--sl-color-accent); color: var(--sl-color-accent-high); }
+  html.sidebar-collapsed .sidebar-collapse-toggle { left: 0.6rem; transform: translateY(-50%); }
+  html.sidebar-collapsed .sidebar,
+  html.sidebar-collapsed .sidebar-pane { display: none !important; }
+  html.sidebar-collapsed .main-frame { padding-inline-start: 0 !important; }
+}
+html.read-mode .sidebar-collapse-toggle { display: none !important; }
+
+/* PWA-IPAD-TOC-FIX */
+@media (min-width: 50rem) {
+  mobile-starlight-toc { display: none !important; }
+}

@@ -1,0 +1,183 @@
+---
+title: 'PersistentVolumes, Claims, and StorageClasses'
+description: 'How Kubernetes storage survives a Pod being rescheduled onto a completely different node.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A **PersistentVolumeClaim** is a request for storage that a Pod mounts, and it binds to a **PersistentVolume** — a piece of cluster storage that can outlive the Pod and follow it across nodes.
+
+## The gap emptyDir and hostPath cannot close
+
+`emptyDir` dies with the Pod, and `hostPath` ties data to one specific node — neither survives a Pod being rescheduled onto different hardware, which is exactly what the scheduler is free to do at any time. Real stateful workloads (databases, message queues, anything with data that matters) need storage that exists independently of any single Pod or node, and that a rescheduled Pod can reattach to wherever it lands.
+
+## PersistentVolume and PersistentVolumeClaim
+
+A **PersistentVolume (PV)** is a cluster-level storage resource — conceptually similar to how a Node represents compute capacity, a PV represents a chunk of storage capacity. A cluster administrator can provision PVs statically ahead of time, or they can be created dynamically (more on that below).
+
+A **PersistentVolumeClaim (PVC)** is a request made by a user or application: "I need this much storage, with this access mode." Kubernetes binds the PVC to a PV that satisfies the request. Crucially, **Pods reference the PVC, never the PV directly** — the Pod does not need to know or care which physical PV it ended up bound to.
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-manual-10gi
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: manual
+  hostPath:
+    path: /mnt/data
+```
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-claim
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: manual
+```
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: db
+spec:
+  containers:
+    - name: postgres
+      image: postgres:16
+      volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: data-claim
+```
+
+## Access modes
+
+A PV declares which access modes it supports, and a PVC requests one it needs:
+
+- **`ReadWriteOnce` (RWO)** — the volume can be mounted read-write, but only by Pods running on a single node at a time.
+- **`ReadOnlyMany` (ROX)** — the volume can be mounted read-only by many nodes at once.
+- **`ReadWriteMany` (RWX)** — the volume can be mounted read-write by many nodes at once (only some storage backends support this).
+- **`ReadWriteOncePod` (RWOP)** — a newer, stricter mode: the volume is restricted to a single **Pod** across the whole cluster, not just a single node. Plain `ReadWriteOnce` still allows multiple Pods to share the volume as long as they land on the same node; `ReadWriteOncePod` closes that gap when you need a true single-writer guarantee.
+
+## Dynamic provisioning with a StorageClass
+
+Hand-provisioning PVs does not scale. A **StorageClass** describes a class of storage and a provisioner capable of creating it on demand — when a PVC references a StorageClass instead of an existing PV, a **CSI (Container Storage Interface)** driver automatically provisions a matching PV for it. No administrator has to pre-create anything.
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+```
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dynamic-claim
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: fast-ssd
+  resources:
+    requests:
+      storage: 20Gi
+```
+
+```bash
+# Watch a PVC bind to a dynamically provisioned PV
+kubectl get pvc dynamic-claim -w
+```
+
+## Reclaim policy: what happens after the PVC is gone
+
+The **reclaim policy** decides the fate of the underlying storage once its PVC is deleted:
+
+- **`Delete`** — the PV and its underlying storage (the actual disk) are deleted along with the PVC. This is the default for most dynamically provisioned StorageClasses.
+- **`Retain`** — the PV and its data are kept around after the PVC is deleted, so an administrator can manually recover or clean up the data before the underlying storage is released.
+
+<Mermaid title="Dynamic provisioning: a PVC triggers a StorageClass and CSI driver to create a new PV" code={pvcDiagram} />
+
+export const pvcDiagram = `flowchart LR
+  pod["Pod"] -->|mounts| pvc["PVC: dynamic-claim"]
+  pvc -->|references| sc["StorageClass: fast-ssd"]
+  sc -->|CSI driver provisions| pv["New PersistentVolume"]
+  pv --> disk[("Underlying disk, e.g. an EBS volume")]`;
+
+<Callout title="The one-line takeaway">
+A **PersistentVolume** is cluster storage, a **PersistentVolumeClaim** is a request for storage that binds to a PV, and **Pods only ever reference the PVC**. **Access modes** (`ReadWriteOnce`, `ReadOnlyMany`, `ReadWriteMany`, and the stricter single-Pod `ReadWriteOncePod`) describe how many nodes or Pods can mount a volume at once. A **StorageClass** automates creation of new PVs on demand through a **CSI driver**, instead of an administrator provisioning them by hand. The **reclaim policy** decides whether deleting a PVC also deletes the underlying storage (`Delete`) or preserves it for manual handling (`Retain`).
+</Callout>
+
+export const quizPvPvc = [
+  {
+    q: 'When a Pod needs persistent storage, what does it reference in its spec.volumes',
+    options: [
+      'The PersistentVolume directly, by name',
+      'The PersistentVolumeClaim, which is already bound to a PersistentVolume',
+      'The StorageClass directly',
+      'The CSI driver name',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does a StorageClass let you avoid doing',
+    options: [
+      'Setting an access mode on a PersistentVolumeClaim',
+      'Writing a Pod spec that mounts a volume',
+      'Hand-provisioning PersistentVolumes ahead of time, since a CSI driver creates them on demand instead',
+      'Deleting a PersistentVolumeClaim',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'What does the ReadWriteOncePod access mode restrict that plain ReadWriteOnce does not',
+    options: [
+      'It restricts the volume to a single node, the same as ReadWriteOnce',
+      'It restricts the volume to a single Pod across the whole cluster, whereas ReadWriteOnce only limits mounting to a single node',
+      'It makes the volume read-only',
+      'It allows many nodes to write at once',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the practical difference between a Delete and a Retain reclaim policy',
+    options: [
+      'They behave identically, only the label differs',
+      'Delete keeps the PersistentVolumeClaim around for reuse, Retain deletes it',
+      'Delete removes the underlying storage when the PVC is deleted, Retain keeps the storage around for manual recovery or cleanup',
+      'Retain automatically creates a backup, Delete does not',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="storage-and-config/persistent-volumes-claims-and-storage-classes" questions={quizPvPvc} />
+
+<ProgressTracker client:visible id="storage-and-config/persistent-volumes-claims-and-storage-classes" />

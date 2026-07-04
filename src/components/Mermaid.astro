@@ -1,0 +1,7 @@
+---
+const { code, title } = Astro.props;
+---
+<figure class="mermaid-figure">
+  <pre class="mermaid">{code}</pre>
+  {title && <figcaption class="mermaid-cap">{title}</figcaption>}
+</figure>

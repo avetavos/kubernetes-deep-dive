@@ -1,0 +1,122 @@
+---
+title: 'Kubernetes คืออะไร'
+description: 'ทำไมต้องมี container orchestration และ Kubernetes reconcile desired state ให้กลายเป็น actual state ได้อย่างไร'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียหลักในหนึ่งประโยค
+
+Kubernetes คือ container orchestrator ที่คอยรักษา actual state ของ cluster ให้ตรงกับ state ที่คุณ declare ไว้ โดยทำงานต่อเนื่องอัตโนมัติ
+
+## ปัญหา container ไม่ scale ให้เองอัตโนมัติ
+
+คำสั่ง `docker run` เดี่ยว ๆ ทำงานได้ดีบน laptop หรือ server เครื่องเดียว ปัญหาจะเริ่มขึ้นทันทีที่คุณต้องใช้มากกว่าหนึ่งเครื่อง หรือมากกว่าหนึ่ง container หรือต้องการความทนทานใด ๆ เลย ถ้า process ข้างใน container crash จะไม่มีอะไร restart มันให้ นอกจากคุณจะสังเกตเห็นแล้วลงมือทำเอง ถ้าอยากรัน web server 5 ตัวอยู่หลัง address เดียวกัน คุณต้องต่อสายให้เองทั้งหมด ถ้าอยากเปลี่ยน image version ใหม่โดยไม่มี downtime คุณต้องเขียน script ควบคุมลำดับการหยุด container เก่าแล้วเริ่ม container ใหม่ ให้ถูกลำดับ ถูกเครื่อง
+
+```bash
+docker run -d --name web nginx
+# if this container's process dies, nothing brings it back automatically —
+# you have to notice, then run `docker run` again by hand
+# and there is no built-in way to run five of these behind one address
+```
+
+ทั้งหมดนี้ไม่ใช่ข้อบกพร่องของ Docker — หน้าที่ของ container runtime คือรัน container ไม่ใช่ตัดสินใจว่าควรมีกี่ตัว อยู่ที่ไหน หรือทำอะไรเมื่อมันตาย orchestration เป็นปัญหาคนละชั้น คือเมื่อมีเครื่องหลายเครื่องกับ workload หลายชุด ต้องคอยรักษาจำนวน instance ที่ healthy ให้ถูกต้อง กระจายไปยังเครื่องที่เหมาะสม เรียกหาได้ด้วยชื่อ และอัปเดตได้อย่างปลอดภัย นี่คือปัญหาที่ Kubernetes ถูกสร้างขึ้นมาแก้
+
+## Declarative desired state และ reconciliation loop
+
+Kubernetes เกิดจากประสบการณ์ภายในของ Google ในการรัน container ที่สเกลใหญ่มาก ด้วยระบบชื่อ Borg และตอนนี้เป็นโครงการระดับ graduated ของ Cloud Native Computing Foundation (CNCF) เป็น open source ไม่ผูกกับ vendor ใดวันหนึ่ง และดูแลโดยชุมชนขนาดใหญ่ ไม่ใช่บริษัทเดียว
+
+ไอเดียหลักที่คุณจะเห็นซ้ำตลอดคอร์สนี้ในทุก module คือ คุณไม่ได้บอก Kubernetes ว่าต้องทำอะไรทีละขั้นตอน แต่คุณ **declare desired state** — "ฉันอยากได้ replica 3 ตัวของ container image นี้ ฟังที่ port นี้" — แล้ว background process ชุดหนึ่งที่เรียกว่า **controller** จะคอยเฝ้าดู cluster ต่อเนื่องและลงมือทำทุกอย่างที่จำเป็นเพื่อให้ actual state ตรงกับที่คุณ declare ไว้ นี่คือ **reconciliation loop** และมันทำงานตลอดเวลา ไม่ใช่แค่ครั้งเดียวตอนสร้าง ถ้า Pod ตาย controller จะสังเกตเห็นว่า actual state เบี่ยงเบนไปจาก desired state แล้วสร้าง Pod ใหม่มาแทน ถ้าคุณแก้ replica count ที่ต้องการ controller จะเห็นความต่างแล้วสร้างหรือลบ Pod ให้ตรงกัน
+
+เทียบกับเป้าหมายเดียวกัน "รัน nginx รักษา replica 3 ตัวให้ healthy" ที่เขียนแบบ declarative เป็น Kubernetes Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27
+          ports:
+            - containerPort: 80
+```
+
+คุณส่ง manifest นี้ให้ cluster แค่ครั้งเดียว จากนั้นถ้า replica ตัวไหน crash ถูก evict หรือ node ที่มันอยู่หายไป controller จะสร้าง Pod ใหม่ขึ้นมาให้จำนวนกลับเป็น 3 โดยคุณไม่ต้องทำอะไรเพิ่ม การ roll out image ใหม่ก็ declarative เหมือนกัน แค่เปลี่ยน `image: nginx:1.27` เป็น tag ใหม่แล้ว apply ซ้ำ Deployment controller จะทยอยแทนที่ Pod ให้เองทีละส่วน
+
+## Cluster ประกอบด้วย control plane และ node
+
+Kubernetes cluster มีเครื่องสองแบบ **control plane** คือสมองของ cluster เก็บ desired state ตัดสินใจเรื่อง scheduling และรัน controller ที่ขับเคลื่อน reconciliation — บทถัดไปจะลงลึกถึง component ของมัน ส่วน **node** คือ worker คือเครื่อง (physical หรือ virtual) ที่รัน container ของคุณจริง ๆ โดยห่อหุ้มอยู่ใน unit ที่เล็กที่สุดที่ deploy ได้ของ Kubernetes เรียกว่า **Pod**
+
+<Mermaid title="Desired state flows in, actual state converges toward it" code={whatIsK8sDiagram} />
+
+export const whatIsK8sDiagram = `flowchart LR
+  you["You declare desired state (YAML)"] --> api["API server stores it"]
+  api --> ctrl["Controllers watch & reconcile"]
+  ctrl --> actual["Actual cluster state converges"]`;
+
+<Callout title="The one-line takeaway">
+Kubernetes เป็น **container orchestrator** ที่มาจากประสบการณ์ Borg ของ Google และตอนนี้เป็น **CNCF graduated project** มันแก้ปัญหาที่ `docker run` เฉย ๆ ทิ้งให้คุณจัดการเอง ไม่ว่าจะเป็นการ restart container ที่ล้ม การ scale out การ discover service และการ roll out update ด้วยการให้คุณ **declare desired state** แล้วปล่อยให้ **controller** รัน **reconciliation loop** ต่อเนื่องเพื่อดัน actual state ของ cluster ให้ตรงกับมัน ผ่าน **control plane** ที่ตัดสินใจ และ **node** ชุดหนึ่งที่รันงานจริง
+</Callout>
+
+export const quizWhatIsK8s = [
+  {
+    q: 'What problem does a container orchestrator solve that plain docker run does not?',
+    options: [
+      'It builds smaller container images',
+      'It automatically keeps the right number of healthy instances running across many hosts and reacts to failures',
+      'It encrypts container image layers',
+      'It replaces the need for a container runtime entirely',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does declarative mean in the Kubernetes context?',
+    options: [
+      'You write a step-by-step script of commands to reach the desired state',
+      'You describe the desired end state and the system figures out how to reach and maintain it',
+      'You must configure every node by hand over SSH',
+      'You can only use a graphical dashboard, never YAML',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'In one sentence, what does a reconciliation (control) loop do?',
+    options: [
+      'It runs once when the cluster is created and never again',
+      'It deletes all Pods on a fixed schedule',
+      'It continuously compares actual cluster state to desired state and takes action to converge them',
+      'It replaces etcd with a relational database',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'A Kubernetes cluster is made up of which two parts?',
+    options: [
+      'A frontend service and a backend database',
+      'A control plane and a set of nodes',
+      'A master database and a slave database',
+      'An Ingress and an Egress controller',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="foundations/what-is-kubernetes" questions={quizWhatIsK8s} />
+
+<ProgressTracker client:visible id="foundations/what-is-kubernetes" />

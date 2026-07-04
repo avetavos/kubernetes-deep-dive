@@ -1,0 +1,125 @@
+---
+title: 'kubectl and Declarative YAML'
+description: 'How to talk to a cluster with kubectl, the four fields every manifest has, and how labels and selectors glue objects together.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+`kubectl` is how you send desired state to a cluster and inspect what it is doing, and almost everything you send it is a YAML manifest built from the same four top-level fields.
+
+## kubectl basics: contexts, namespaces, and verbs
+
+Your kubeconfig can hold credentials for several clusters at once, grouped into **contexts**; switch which one your commands target with:
+
+```bash
+kubectl config use-context my-cluster
+kubectl get pods -n my-namespace
+```
+
+The `-n` (or `--namespace`) flag scopes a command to one namespace — leaving it off targets whatever namespace your current context defaults to, usually `default`. Beyond that, a small set of verbs covers most of daily kubectl usage:
+
+```bash
+kubectl get pods
+kubectl describe pod web-7d9f8c6b7-abcde
+kubectl logs web-7d9f8c6b7-abcde
+kubectl exec -it web-7d9f8c6b7-abcde -- sh
+```
+
+`get` lists objects, `describe` shows detailed status and recent events for one object (the first place to look when something is wrong), `logs` streams a container's stdout/stderr, and `exec` runs a command inside a running container — handy for a quick shell to poke around.
+
+## Every manifest has four top-level fields
+
+Whatever kind of object you are creating — Pod, Deployment, Service, anything — its YAML has the same shape:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: web
+spec:
+  containers:
+    - name: web
+      image: nginx:1.27
+      ports:
+        - containerPort: 80
+```
+
+`apiVersion` and `kind` say which API group and object type you mean. `metadata` carries identity and bookkeeping — `name`, optional `namespace`, and the `labels` and `annotations` you attach yourself. `spec` is the desired state you author — everything above is `spec` for a Pod. Kubernetes adds a fifth field on its own, `status`, once the object exists: that one you never write, only read, since it reflects observed reality rather than what you asked for.
+
+## apply vs create, and labels as the gluing mechanism
+
+`kubectl apply -f file.yaml` is declarative: it diffs your file against the object's last-applied configuration (tracked in an annotation) and patches only what changed, creating the object if it does not exist yet. That makes it safe to re-run the same command over and over, which is exactly what you want in scripts and CI. `kubectl create -f file.yaml` is imperative instead — it creates the object once and errors out if it already exists. This course uses `apply` throughout.
+
+```bash
+kubectl apply -f pod.yaml
+kubectl create -f pod.yaml
+```
+
+Labels are arbitrary key-value pairs you attach to objects, like `app: web` in the Pod above. On their own they do nothing — their power comes from **selectors**, which other objects use to find the Pods labeled a certain way. A Service with `selector: { app: web }` routes traffic to every Pod carrying that label; a Deployment's ReplicaSet uses a `matchLabels` selector to know which Pods are "its" Pods to keep at the desired replica count. This label-and-selector pattern is the fundamental way objects in Kubernetes find each other, and you will see it again in nearly every later module.
+
+<Mermaid title="A declarative apply flows through the API server into etcd" code={kubectlYamlDiagram} />
+
+export const kubectlYamlDiagram = `flowchart LR
+  cmd["kubectl apply -f pod.yaml"] --> api["kube-apiserver"]
+  api --> etcd["etcd"]
+  api --> ctrl["Controllers notice the change and react"]`;
+
+<Callout title="The one-line takeaway">
+`kubectl` sends **manifests** — YAML built from the same four top-level fields, `apiVersion`, `kind`, `metadata`, and `spec` — to the cluster, scoped by **context** and **namespace**; `kubectl apply` is the **declarative**, idempotent, re-runnable way to do that (diffing against last-applied configuration), unlike the imperative `kubectl create`; and **labels** paired with **selectors** are how Services, ReplicaSets, and everything else in Kubernetes finds the Pods it should manage.
+</Callout>
+
+export const quizKubectlYaml = [
+  {
+    q: 'What happens differently between kubectl apply and kubectl create when the target object already exists?',
+    options: [
+      'apply diffs against the last-applied configuration and patches only what changed; create errors because the object already exists',
+      'create always overwrites the object silently while apply always refuses',
+      'They behave identically in every situation',
+      'apply only works on Pods while create works on every object kind',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'What does a label selector actually do?',
+    options: [
+      'It encrypts traffic between Pods',
+      'It lets one object, such as a Service or ReplicaSet, find the set of Pods matching given key-value labels so it can route to or manage them',
+      'It sets CPU and memory requests and limits for a Pod',
+      'It pins a Pod to run on a specific node',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which four top-level fields does every Kubernetes object manifest have?',
+    options: [
+      'name, image, port, replicas',
+      'header, body, footer, status',
+      'apiVersion, kind, metadata, spec',
+      'cluster, namespace, context, kind',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'Which field on a live Kubernetes object is managed by the system and never something you author yourself?',
+    options: [
+      'spec',
+      'metadata',
+      'status',
+      'apiVersion',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="foundations/kubectl-and-declarative-yaml" questions={quizKubectlYaml} />
+
+<ProgressTracker client:visible id="foundations/kubectl-and-declarative-yaml" />

@@ -1,0 +1,60 @@
+---
+title: Kubernetes — From Zero to Hero
+description: เชี่ยวชาญ Kubernetes ตั้งแต่พื้นฐาน — architecture และ control plane, workloads (Pod, Deployment, StatefulSet, Job), networking (Service, Ingress, NetworkPolicy), storage และ config, scheduling และ autoscaling, observability และ security (RBAC, Pod Security Standards) และการรัน Kubernetes บน production ด้วย Helm, Operator และ GitOps
+template: splash
+hero:
+  tagline: คอร์สแบบ standalone เน้น developer ว่าด้วย Kubernetes ตั้งแต่ control plane และ declarative model ไปจนถึง Pod, Service, storage, autoscaling, RBAC และการขึ้น production ด้วย Helm และ GitOps สอนผ่าน manifest จริง kubectl และไดอะแกรม
+  actions:
+    - text: เริ่มที่นี่
+      link: /kubernetes/th/foundations/
+      icon: right-arrow
+      variant: primary
+    - text: ข้ามไปที่ Workloads
+      link: /kubernetes/th/workloads/pods-the-atomic-unit/
+      icon: open-book
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## สิ่งที่คุณจะได้เรียน
+
+<CardGrid>
+  <Card title="Foundations & Architecture" icon="rocket">
+    ทำไมต้อง orchestration, control plane และ node component, kubectl, declarative YAML และการรัน local cluster ตัวแรก [เริ่ม →](/kubernetes/th/foundations/)
+  </Card>
+  <Card title="Workloads" icon="seti:html">
+    Pod, Deployment และ rolling update, StatefulSet และ DaemonSet และงาน batch ด้วย Job กับ CronJob [deploy →](/kubernetes/th/workloads/pods-the-atomic-unit/)
+  </Card>
+  <Card title="Networking" icon="random">
+    Service และ kube-proxy, cluster DNS, Ingress และ Gateway API และการล็อก traffic ด้วย NetworkPolicy [เชื่อมต่อ →](/kubernetes/th/networking/services-clusterip-nodeport-loadbalancer/)
+  </Card>
+  <Card title="Storage & Configuration" icon="seti:config">
+    Volume, PersistentVolume/Claim และ StorageClass, ConfigMap และ Secret และ namespace กับ resource quota [ตั้งค่า →](/kubernetes/th/storage-and-config/volumes-and-volume-types/)
+  </Card>
+  <Card title="Scheduling & Scaling" icon="seti:plan">
+    requests/limits และ scheduler, affinity/taint/toleration, HorizontalPodAutoscaler และ disruption budget [scale →](/kubernetes/th/scheduling-and-scaling/the-scheduler-and-resource-requests/)
+  </Card>
+  <Card title="Observability & Security" icon="approve-check">
+    liveness/readiness/startup probe, log และ metric, RBAC กับ ServiceAccount และ Pod Security Standards [ป้องกัน →](/kubernetes/th/observability-and-security/probes-liveness-readiness-startup/)
+  </Card>
+  <Card title="Production & Ecosystem" icon="puzzle">
+    การแพ็กด้วย Helm, การขยาย API ด้วย Operator และ CRD, GitOps และ production checklist พร้อม TypeScript API client [ขึ้น production →](/kubernetes/th/production-and-ecosystem/helm-package-management/)
+  </Card>
+</CardGrid>
+
+## คอร์สนี้ทำงานยังไง
+
+<CardGrid>
+  <Card title="เข้าใจ model ก่อน แล้วค่อยดู manifest" icon="rocket">
+    ทุกหัวข้อเริ่มจาก model — reconciliation loop, Pod, Service, scheduler — พอเข้าใจแล้วพฤติกรรมของ Kubernetes จะกลายเป็นกลไกที่คุณเข้าใจ ไม่ใช่ YAML ที่ copy-paste ตามกัน
+  </Card>
+  <Card title="verify กับ API group ปัจจุบัน" icon="random">
+    เขียนบน API group ที่ stable และใช้งานจริงใน production ทุกวันนี้ — `apps/v1`, `batch/v1`, `networking.k8s.io/v1`, `autoscaling/v2`, `policy/v1` — และตรวจสอบกับ official docs ผ่าน context7
+  </Card>
+  <Card title="เน้น guarantee ไม่ใช่แค่ YAML" icon="approve-check">
+    ไม่ใช่แค่ "นี่คือ Deployment" แต่เป็น "rolling update การันตีอะไรจริง ๆ และตรงไหนที่ readiness probe หรือ PodDisruptionBudget ที่ขาดไปยังทำให้พังได้" คุณจะ reason เรื่อง cluster ได้อย่างมั่นใจ
+  </Card>
+  <Card title="ไดอะแกรมที่อธิบายได้" icon="puzzle">
+    control plane, reconciliation loop, การ route ของ Service และ scheduling pipeline เป็นไดอะแกรม Mermaid ที่รองรับธีม สองภาษา (English / ไทย) พร้อมบันทึกความคืบหน้า quiz
+  </Card>
+</CardGrid>

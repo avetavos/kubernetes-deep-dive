@@ -1,0 +1,122 @@
+---
+title: 'What Is Kubernetes?'
+description: 'Why container orchestration exists and how Kubernetes reconciles desired state into actual state.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Kubernetes is a container orchestrator that keeps a cluster's actual state matching the state you declared, automatically and continuously.
+
+## The problem: containers don't scale themselves
+
+A single `docker run` command works great on one laptop or one server. The trouble starts the moment you need more than one host, or more than one container, or any resilience at all. If the process inside a container crashes, nothing restarts it unless you notice and act. If you want to run five copies of a web server behind a single address, you have to wire that up yourself. If you want to roll out a new image version without downtime, you have to script the sequence of stopping old containers and starting new ones, in the right order, on the right hosts.
+
+```bash
+docker run -d --name web nginx
+# if this container's process dies, nothing brings it back automatically —
+# you have to notice, then run `docker run` again by hand
+# and there is no built-in way to run five of these behind one address
+```
+
+None of that is a criticism of Docker — a container runtime's job is to run containers, not to decide how many should exist, where they should live, or what to do when one dies. Orchestration is a separate problem: given a fleet of machines and a set of workloads, keep the right number of healthy instances running, spread across the right hosts, reachable by name, and able to be updated safely. That is the problem Kubernetes was built to solve.
+
+## Declarative desired state and the reconciliation loop
+
+Kubernetes was born out of Google's internal experience running containers at massive scale with a system called Borg, and it is now a graduated project of the Cloud Native Computing Foundation (CNCF) — open source, vendor-neutral, and run by a large community rather than a single company.
+
+The central idea, and the one you will see repeated throughout this course in every module, is this: you do not tell Kubernetes *how* to do something step by step. You **declare the desired state** — "I want three replicas of this container image, listening on this port" — and a set of background processes called **controllers** continuously watch the cluster and take whatever actions are needed to make the actual state match what you declared. This is the **reconciliation loop**, and it runs forever, not just once at creation time. If a Pod dies, a controller notices the actual state has drifted from the desired state and creates a replacement. If you edit the desired replica count, a controller notices the difference and creates or removes Pods to match.
+
+Compare the same "run nginx, keep three replicas healthy" goal expressed declaratively as a Kubernetes Deployment:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27
+          ports:
+            - containerPort: 80
+```
+
+You send this manifest to the cluster once. From then on, if a replica crashes, gets evicted, or the node it was on disappears, a controller creates a new Pod to bring the count back to three — with no further action from you. Rolling out a new image is just as declarative: change `image: nginx:1.27` to a newer tag and re-apply; the Deployment controller replaces Pods gradually, on its own.
+
+## Clusters: control plane and nodes
+
+A Kubernetes cluster has two kinds of machines. The **control plane** is the brain of the cluster — it stores the desired state, makes scheduling decisions, and runs the controllers that drive reconciliation; the next lesson goes into its components in depth. The **nodes** are the workers — the machines (physical or virtual) that actually run your containers, packaged inside Kubernetes's smallest deployable unit, the **Pod**.
+
+<Mermaid title="Desired state flows in, actual state converges toward it" code={whatIsK8sDiagram} />
+
+export const whatIsK8sDiagram = `flowchart LR
+  you["You declare desired state (YAML)"] --> api["API server stores it"]
+  api --> ctrl["Controllers watch & reconcile"]
+  ctrl --> actual["Actual cluster state converges"]`;
+
+<Callout title="The one-line takeaway">
+Kubernetes is a **container orchestrator**, informed by Google's Borg experience and now a **CNCF graduated project**, that solves the problems plain `docker run` leaves to you — restarting failed containers, scaling out, discovering services, and rolling out updates — by having you **declare desired state** and letting **controllers** run a continuous **reconciliation loop** that drives the cluster's actual state to match it, across a **control plane** that decides and a set of **nodes** that run the work.
+</Callout>
+
+export const quizWhatIsK8s = [
+  {
+    q: 'What problem does a container orchestrator solve that plain docker run does not?',
+    options: [
+      'It builds smaller container images',
+      'It automatically keeps the right number of healthy instances running across many hosts and reacts to failures',
+      'It encrypts container image layers',
+      'It replaces the need for a container runtime entirely',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does declarative mean in the Kubernetes context?',
+    options: [
+      'You write a step-by-step script of commands to reach the desired state',
+      'You describe the desired end state and the system figures out how to reach and maintain it',
+      'You must configure every node by hand over SSH',
+      'You can only use a graphical dashboard, never YAML',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'In one sentence, what does a reconciliation (control) loop do?',
+    options: [
+      'It runs once when the cluster is created and never again',
+      'It deletes all Pods on a fixed schedule',
+      'It continuously compares actual cluster state to desired state and takes action to converge them',
+      'It replaces etcd with a relational database',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'A Kubernetes cluster is made up of which two parts?',
+    options: [
+      'A frontend service and a backend database',
+      'A control plane and a set of nodes',
+      'A master database and a slave database',
+      'An Ingress and an Egress controller',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="foundations/what-is-kubernetes" questions={quizWhatIsK8s} />
+
+<ProgressTracker client:visible id="foundations/what-is-kubernetes" />

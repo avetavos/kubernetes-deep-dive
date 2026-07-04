@@ -1,0 +1,150 @@
+---
+title: 'Jobs and CronJobs'
+description: 'Running Pods to completion with Jobs, and scheduling them on a cron schedule with CronJobs.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A **Job** runs one or more Pods until a task finishes successfully rather than keeping them running forever, and a **CronJob** creates Jobs automatically on a cron-formatted schedule.
+
+## Jobs: run to completion, not forever
+
+A Deployment's Pods are meant to run indefinitely; a Job's Pods are meant to **finish**. A Job tracks successful completions and retries failures up to a limit, instead of restarting a Pod forever the way a long-running controller would.
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: report-backfill
+spec:
+  completions: 5
+  parallelism: 2
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: backfill
+          image: myregistry/report-backfill:1.0.0
+          args: ['--month=2026-06']
+```
+
+`completions: 5` means the Job is not done until 5 Pods have exited successfully; `parallelism: 2` caps how many of those Pods run at once; `backoffLimit: 3` is how many failed attempts the Job tolerates before it gives up and marks itself `Failed`; `activeDeadlineSeconds: 600` is an overall wall-clock timeout for the whole Job, after which it is terminated regardless of completions. Notice `restartPolicy: OnFailure` — a Job's Pod template must use `OnFailure` or `Never`, never `Always`, because a Job's entire point is to stop once the work is done.
+
+```bash
+# Watch completions accumulate, then check the Job's final status
+kubectl get job report-backfill --watch
+kubectl describe job report-backfill
+
+# Logs from a finished Job's Pods
+kubectl logs -l job-name=report-backfill --tail=100
+```
+
+## CronJobs: scheduling Jobs
+
+A **CronJob** does not run Pods directly — it creates a **Job** on a schedule, and that Job creates the Pods, exactly as if you had submitted the Job by hand at that moment.
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly-report
+spec:
+  schedule: '0 2 * * *'
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: report
+              image: myregistry/nightly-report:1.0.0
+```
+
+`schedule: '0 2 * * *'` runs at 02:00 every day, in standard cron syntax. `concurrencyPolicy` decides what happens if a previous run is still going when the next one is due: `Allow` (the default) runs them side by side, `Forbid` skips the new run entirely, and `Replace` cancels the still-running Job and starts the new one in its place. `startingDeadlineSeconds` bounds how late a missed run is still allowed to start. `successfulJobsHistoryLimit` and `failedJobsHistoryLimit` control how many old Job objects the CronJob keeps around for inspection before garbage-collecting them.
+
+<Mermaid title="A CronJob creates a Job on its schedule; the Job creates Pods that run to completion" code={jobsDiagram} />
+
+export const jobsDiagram = `flowchart LR
+  cj["CronJob nightly-report (schedule: 0 2 * * *)"] -->|creates| j["Job nightly-report-29102026"]
+  j -->|creates| p1["Pod (runs to completion)"]
+  j -->|creates| p2["Pod (runs to completion)"]
+  p1 --> done["Succeeded, Pods stop"]
+  p2 --> done`;
+
+## Operating Jobs and CronJobs
+
+```bash
+# List CronJobs and the Jobs they have created
+kubectl get cronjob nightly-report
+kubectl get jobs --selector=job-name
+
+# Trigger one ad-hoc run right now, without waiting for the schedule
+kubectl create job nightly-report-manual --from=cronjob/nightly-report
+```
+
+Because a CronJob's schedule can fire many times, `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` matter in practice: without them old Job and Pod objects would accumulate forever every night.
+
+<Callout title="The one-line takeaway">
+A **Job** runs Pods to completion instead of forever — `completions` sets how many successes are needed, `parallelism` how many run at once, `backoffLimit` how many failures it tolerates, and its Pod template must use `restartPolicy: OnFailure` or `Never`; a **CronJob** creates Jobs on a `schedule`, with `concurrencyPolicy` (`Allow`/`Forbid`/`Replace`) governing overlapping runs and `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` bounding how much history is kept.
+</Callout>
+
+export const quizJobs = [
+  {
+    q: 'How does a Job\'s workload model differ from a Deployment\'s?',
+    options: [
+      'A Job runs Pods to completion for a finite task; a Deployment keeps Pods running indefinitely',
+      'They are identical, Job is just an older name for Deployment',
+      'A Job never creates Pods, only a Deployment does',
+      'A Job requires a headless Service, a Deployment does not',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'What does backoffLimit control on a Job?',
+    options: [
+      'The number of Pod replicas the Job creates',
+      'How many times the Job retries a failing Pod before marking the whole Job as failed',
+      'The delay before the schedule starts',
+      'The maximum runtime of the whole Job',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which restartPolicy values are valid for a Job\'s Pod template?',
+    options: [
+      'Always, since Jobs must keep restarting forever',
+      'OnFailure or Never, a Job runs to completion so Always is not allowed',
+      'Only Never, OnFailure is not supported by Job',
+      'Any value, restartPolicy is ignored by Job',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does concurrencyPolicy: Forbid do on a CronJob?',
+    options: [
+      'It runs every scheduled Job concurrently regardless of previous runs',
+      'It skips a new scheduled run if the previous Job created by this CronJob is still running',
+      'It forbids the CronJob from ever creating a Job',
+      'It deletes old Jobs immediately after they finish',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="workloads/jobs-and-cronjobs" questions={quizJobs} />
+
+<ProgressTracker client:visible id="workloads/jobs-and-cronjobs" />

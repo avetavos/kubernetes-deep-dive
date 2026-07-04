@@ -1,0 +1,188 @@
+---
+title: 'StatefulSets and DaemonSets'
+description: 'Stable per-Pod identity and storage with StatefulSets, and one-Pod-per-node coverage with DaemonSets.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A **StatefulSet** gives each of its Pods a stable, unique identity and its own persistent storage across rescheduling, while a **DaemonSet** guarantees exactly one matching Pod runs on every node — two controllers that solve "identity" and "coverage" instead of the plain replica count a Deployment gives you.
+
+## StatefulSets: stable identity and per-Pod storage
+
+Where a Deployment's Pods are interchangeable, a StatefulSet's Pods get predictable **ordinal names** — `db-0`, `db-1`, `db-2` — and each ordinal keeps its **own** PersistentVolumeClaim, created from `volumeClaimTemplates`, across restarts and rescheduling. `db-1` always comes back with the same volume it had before, on whatever node it lands on. A StatefulSet also requires a **headless Service** (`clusterIP: None`) so that each Pod gets its own stable DNS name, instead of the Service load-balancing across all of them.
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+  labels:
+    app: db
+spec:
+  clusterIP: None
+  selector:
+    app: db
+  ports:
+    - port: 5432
+      name: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+spec:
+  serviceName: db
+  replicas: 3
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      containers:
+        - name: postgres
+          image: myregistry/postgres:16
+          ports:
+            - containerPort: 5432
+              name: postgres
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ['ReadWriteOnce']
+        resources:
+          requests:
+            storage: 10Gi
+```
+
+This is the shape you reach for whenever members need a stable peer identity: databases, and any distributed system where node 0 is special or peers must find each other by a fixed name rather than by whichever Pods happen to exist right now.
+
+```bash
+# Pods come up in order: db-0, then db-1, then db-2
+kubectl get pods -l app=db -o wide
+
+# Each Pod has its own stable DNS name via the headless Service
+kubectl run -it --rm debug --image=busybox:1.36 --restart=Never -- \
+  nslookup db-0.db.default.svc.cluster.local
+
+# Scaling and deletion are ordered too: highest ordinal first
+kubectl scale statefulset/db --replicas=2
+```
+
+Deployment, scaling, and deletion of a StatefulSet's Pods all happen **one at a time, in order** — `db-1` will not start until `db-0` is running and ready, and scaling down removes the highest ordinal first. That ordering is what makes it safe to depend on "the previous member is already up" in a distributed system's bootstrap logic.
+
+## DaemonSets: one Pod on every node
+
+A **DaemonSet** does not take a `replicas` count at all — instead it schedules exactly one matching Pod onto every node in the cluster (or a subset, if you scope it with a node selector or affinity rule). As nodes join the cluster, the DaemonSet controller automatically schedules its Pod onto them; as nodes leave, their Pod goes with them. This is the shape for node-level agents: log collectors, monitoring and metrics agents, and network plugins.
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-log-agent
+spec:
+  selector:
+    matchLabels:
+      app: node-log-agent
+  template:
+    metadata:
+      labels:
+        app: node-log-agent
+    spec:
+      containers:
+        - name: log-agent
+          image: myregistry/log-agent:3.0.0
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+```
+
+```bash
+# One Pod per matching node -- the count follows the cluster, not a replicas field
+kubectl get pods -l app=node-log-agent -o wide
+```
+
+<Mermaid title="StatefulSet: ordered Pods with their own storage. DaemonSet: one Pod per node" code={statefulDaemonDiagram} />
+
+export const statefulDaemonDiagram = `flowchart TB
+  subgraph ss["StatefulSet db (ordered identity)"]
+    w0["db-0"] --- s0[("data-db-0")]
+    w1["db-1"] --- s1[("data-db-1")]
+    w2["db-2"] --- s2[("data-db-2")]
+  end
+  subgraph ds["DaemonSet node-log-agent (one per node)"]
+    n1["Node 1"] --> a1["log-agent"]
+    n2["Node 2"] --> a2["log-agent"]
+    n3["Node 3"] --> a3["log-agent"]
+  end`;
+
+## Three controllers, three different concerns
+
+A Deployment does not care which node a replica lands on, and its Pods are interchangeable by design. A StatefulSet cares about **stable identity per ordinal** — same name, same storage, every time. A DaemonSet cares about **node coverage** — one Pod per node, a count you never set yourself because it is derived from the cluster's node count.
+
+<Callout title="The one-line takeaway">
+A **StatefulSet** gives Pods stable ordinal names (`db-0`, `db-1`, ...), a stable per-Pod PersistentVolumeClaim via `volumeClaimTemplates`, ordered rollout/scaling/deletion, and requires a **headless Service** for per-Pod DNS; a **DaemonSet** schedules exactly one matching Pod onto every node (new nodes get it automatically) with no `replicas` field to set. Deployment = interchangeable replicas, StatefulSet = per-ordinal identity, DaemonSet = one-per-node coverage.
+</Callout>
+
+export const quizStatefulDaemon = [
+  {
+    q: 'What stable identity does a StatefulSet give its Pods that a Deployment does not?',
+    options: [
+      'A fixed CPU limit for every Pod',
+      'Predictable ordinal names (db-0, db-1, ...) and a stable per-Pod PersistentVolumeClaim across rescheduling',
+      'A guaranteed public IP address',
+      'Immunity to eviction by the scheduler',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does a StatefulSet require a headless Service (clusterIP: None)?',
+    options: [
+      'It does not, a headless Service is optional decoration',
+      'To give each Pod its own stable per-Pod DNS name instead of load-balancing traffic across all of them',
+      'To disable networking for the StatefulSet Pods entirely',
+      'To assign the exact same IP address to every Pod',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why use a DaemonSet for a log-collection agent instead of a Deployment?',
+    options: [
+      'DaemonSets are always cheaper to run than Deployments',
+      'A DaemonSet guarantees exactly one agent Pod per matching node, including nodes added later, which is what a node-level agent needs',
+      'Deployments cannot run more than one replica',
+      'DaemonSets can only run inside the default namespace',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does a Deployment intentionally NOT guarantee, unlike a StatefulSet?',
+    options: [
+      'Which specific node or stable identity a given replica Pod has, replicas are interchangeable',
+      'The container image being used',
+      'The number of replicas',
+      'The label selector matching its Pods',
+    ],
+    answer: 0,
+  },
+];
+
+<Quiz client:visible id="workloads/statefulsets-and-daemonsets" questions={quizStatefulDaemon} />
+
+<ProgressTracker client:visible id="workloads/statefulsets-and-daemonsets" />

@@ -1,0 +1,131 @@
+---
+title: 'The Scheduler and Resource Requests'
+description: 'How requests and limits control scheduling and runtime enforcement, how QoS classes decide eviction order, and how the scheduler filters, scores, and binds a Pod to a Node.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+The scheduler places a Pod onto a Node that has enough free capacity to cover its **requests**, while **limits** cap how much of a resource the Pod can actually use once it is running.
+
+## Requests set the floor, limits set the ceiling
+
+Every container in a Pod can declare `resources.requests` and `resources.limits` for CPU and memory, and the two numbers do completely different jobs.
+
+- **`requests`** is the guaranteed minimum a container needs. The scheduler only considers a Node a candidate if that Node has enough *unreserved* capacity to cover every container's requests — it never looks at limits when deciding where a Pod can go.
+- **`limits`** is the hard ceiling enforced at runtime, after the Pod is already running. CPU is a compressible resource, so usage above the CPU limit is **throttled**, not killed. Memory is not compressible, so a container that exceeds its memory limit gets **OOMKilled** and restarted.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: payments-worker
+spec:
+  containers:
+    - name: worker
+      image: payments-worker:1.4.0
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "256Mi"
+        limits:
+          cpu: "500m"
+          memory: "256Mi"
+```
+
+```bash
+# See which node a Pod landed on, and check the node's spare capacity
+kubectl get pod payments-worker -o jsonpath='{.spec.nodeName}{"\n"}'
+kubectl describe node <node-name> | grep -A5 "Allocated resources"
+```
+
+Because the scheduler reasons only about requests, a Pod with no requests set is effectively invisible to capacity planning — it can be scheduled anywhere, and it can also starve neighbors that did the right thing and declared theirs.
+
+## QoS classes decide who gets evicted first
+
+Kubernetes derives a **Quality of Service (QoS) class** for every Pod automatically from its requests and limits — you never set this field yourself.
+
+- **Guaranteed** — every container has `requests` equal to `limits`, for both CPU and memory.
+- **Burstable** — at least one container has requests set, but they differ from limits, or only some resources have both set.
+- **BestEffort** — no container has any requests or limits set at all.
+
+```bash
+# QoS class is computed and reported on the Pod status
+kubectl get pod payments-worker -o jsonpath='{.status.qosClass}{"\n"}'
+```
+
+QoS class only matters once a Node runs low on a resource. When the kubelet needs to reclaim memory under pressure, it evicts **BestEffort** Pods first, then **Burstable** Pods, and only reaches for **Guaranteed** Pods as an absolute last resort. This is one of the few places where setting requests and limits carefully has a direct, visible effect on which of your workloads survive a noisy neighbor.
+
+## How the scheduler picks a Node: filter, score, bind
+
+For every unscheduled Pod, the scheduler runs a two-phase decision before it commits:
+
+1. **Filtering** — throw out every Node that flatly cannot run this Pod: not enough free CPU/memory to cover the requests, a taint the Pod does not tolerate, or an affinity/anti-affinity rule that rules it out. What is left is the set of *feasible* Nodes.
+2. **Scoring** — rank the feasible Nodes by a set of scoring plugins (spread across zones, bin-pack density, and more) and pick the highest-scoring one.
+
+Once a Node wins, the scheduler **binds** the Pod to it by writing `spec.nodeName`, and the kubelet on that Node takes over and starts the containers.
+
+<Mermaid title="A Pod's requests and limits flowing through the scheduler's filter, score, and bind steps" code={schedulerPipelineDiagram} />
+
+export const schedulerPipelineDiagram = `flowchart LR
+  pod["Pod spec\\n(requests + limits)"] --> filter["Filter:\\nwhich Nodes CAN run it"]
+  filter --> score["Score:\\nrank the feasible Nodes"]
+  score --> bind["Bind:\\nPod assigned to winning Node"]
+  bind --> node["Node"]`;
+
+<Callout title="The one-line takeaway">
+**`requests`** is the guaranteed minimum the scheduler reserves capacity for, and **`limits`** is the hard ceiling enforced at runtime — CPU over the limit is **throttled**, memory over the limit gets the container **OOMKilled**. Kubernetes derives a **QoS class** (**Guaranteed**, **Burstable**, or **BestEffort**) automatically from those values, and it decides eviction order under resource pressure, BestEffort first and Guaranteed last. The scheduler itself works in two phases: **filtering** down to feasible Nodes, then **scoring** them to pick the best fit, before it **binds** the Pod in place.
+</Callout>
+
+export const quizScheduler = [
+  {
+    q: 'What is the scheduler actually reasoning about when it decides where a Pod can run?',
+    options: [
+      'The requests of the Pod against the free, unreserved capacity of each Node',
+      'The limits of the Pod against the total capacity of each Node',
+      'The image size of the Pod containers',
+      'The number of labels attached to the Pod',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'A container exceeds its memory limit. What happens?',
+    options: [
+      'The container is throttled, the same as CPU',
+      'Nothing, memory limits are advisory',
+      'The container is OOMKilled and restarted',
+      'The Pod is rescheduled to another Node automatically',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'Under memory pressure on a Node, which QoS class is evicted first?',
+    options: [
+      'Guaranteed',
+      'Burstable',
+      'BestEffort',
+      'They are all evicted at the same time',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'What are the two main phases the scheduler runs before binding a Pod to a Node?',
+    options: [
+      'Scoring, then filtering',
+      'Filtering, then scoring',
+      'Logging, then binding',
+      'Binding, then filtering',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="scheduling-and-scaling/the-scheduler-and-resource-requests" questions={quizScheduler} />
+
+<ProgressTracker client:visible id="scheduling-and-scaling/the-scheduler-and-resource-requests" />

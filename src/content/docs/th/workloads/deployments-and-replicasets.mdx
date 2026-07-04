@@ -1,0 +1,168 @@
+---
+title: 'Deployment และ ReplicaSet'
+description: 'ReplicaSet ทำให้ Pod รันอยู่ตามจำนวนที่กำหนด และ Deployment จัดการ rolling update, rollback และ scaling ให้อัตโนมัติ'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**ReplicaSet** ทำให้จำนวน Pod ที่ตรงกับ label selector คงที่ตามที่กำหนดอยู่ตลอดเวลา ส่วน **Deployment** จัดการ ReplicaSet ให้คุณ เพื่อทำ rolling update แบบ declarative ที่มี version และมี rollback history ให้ด้วย
+
+## ReplicaSet: จำนวน Pod ที่ตรงเงื่อนไขคงที่
+
+หน้าที่ของ ReplicaSet แคบมาก คือรับ Pod template กับ label selector มา แล้วทำให้มี Pod ที่ตรงกับ selector นั้นอยู่พอดี `replicas` ตัวเสมอ ถ้า Pod ที่ตรง selector หายไป ReplicaSet จะ create ตัวใหม่มาแทน ถ้ามีเกินก็จะลบส่วนเกินทิ้ง ReplicaSet ยังสามารถ **adopt** Pod ที่มีอยู่แล้วซึ่งมันไม่ได้ create เองได้ด้วย ตราบใดที่ label ของ Pod นั้นตรงกับ selector
+
+```yaml
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: web-rs
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: myregistry/web:1.0.0
+          ports:
+            - containerPort: 8080
+```
+
+ในการใช้งานจริงคุณแทบไม่เขียน ReplicaSet ตรง ๆ แบบนี้เอง แต่จะ create Deployment แล้ว Deployment จะ create และเป็นเจ้าของ ReplicaSet ให้แทน
+
+## Deployment: rolling update ที่อยู่บน ReplicaSet
+
+**Deployment** ห่อ ReplicaSet ไว้พร้อม rollout strategy, revision history และการ rollback เมื่อคุณเปลี่ยน Pod template ใน Deployment (image tag ใหม่ หรือแก้ env var) Deployment จะ create ReplicaSet **ใหม่** ที่ใช้ template นั้น แล้วค่อย ๆ ย้าย replica จาก ReplicaSet เก่าไปยังตัวใหม่
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: myregistry/web:1.1.0
+          ports:
+            - containerPort: 8080
+```
+
+chain ความเป็นเจ้าของจะเป็น **Deployment → ReplicaSet → Pod** เสมอ Deployment เป็นเจ้าของ ReplicaSet หนึ่งตัวหรือมากกว่านั้น (ตัวปัจจุบัน บวกกับตัวเก่าที่เก็บไว้เพื่อ rollback history) และ ReplicaSet แต่ละตัวก็เป็นเจ้าของ Pod ของมันเอง
+
+<Mermaid title="A Deployment shifts replicas from an old ReplicaSet to a new one during a rollout" code={deploymentsDiagram} />
+
+export const deploymentsDiagram = `flowchart LR
+  dep["Deployment web"] --> rsOld["ReplicaSet web-abc123 (old): 3 -> 0"]
+  dep --> rsNew["ReplicaSet web-def456 (new): 0 -> 3"]
+  rsOld --> p1["Pod (terminating)"]
+  rsNew --> p2["Pod (running)"]
+  rsNew --> p3["Pod (running)"]
+  rsNew --> p4["Pod (running)"]`;
+
+## Rollout strategy: RollingUpdate เทียบกับ Recreate
+
+`maxUnavailable` จำกัดว่า replica ที่ต้องการมีได้กี่ตัวที่ unavailable พร้อมกันระหว่าง rollout และ `maxSurge` จำกัดว่ายอม Pod เกินจากจำนวนที่ต้องการได้กี่ตัวชั่วคราวระหว่างที่ตัวใหม่กำลังขึ้น สองค่านี้รวมกันปรับ trade-off ระหว่างความเร็วของ rollout กับ capacity ที่ใช้งานได้ ค่าด้านบนยอมให้ Pod ดับได้หนึ่งตัวและมี Pod เกินได้หนึ่งตัวพร้อมกัน สำหรับ Deployment ที่มี 3 replica
+
+อีก strategy หนึ่งคือ `Recreate` ซึ่ง terminate Pod เก่าทุกตัวก่อนที่จะ create ตัวใหม่ตัวไหนเลย
+
+```yaml
+spec:
+  strategy:
+    type: Recreate
+```
+
+`Recreate` ทำให้เกิด outage สั้น ๆ จึงสงวนไว้ใช้กับกรณีที่ version เก่ากับใหม่รันคู่กันจริง ๆ ไม่ได้ เช่น application ที่ทนไม่ได้ถ้ามี schema สอง version ยิง database เดียวกันพร้อมกัน
+
+## จัดการ rollout
+
+```bash
+# Trigger a rollout by changing the Pod template (e.g. a new image), then watch it
+kubectl set image deployment/web web=myregistry/web:1.2.0
+kubectl rollout status deployment/web
+
+# See every revision this Deployment has kept
+kubectl rollout history deployment/web
+
+# Roll back to the previous revision
+kubectl rollout undo deployment/web
+
+# Scale independently of a rollout
+kubectl scale deployment/web --replicas=5
+```
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**ReplicaSet** ทำให้จำนวน Pod ที่ตรงกับ selector คงที่ **Deployment** จัดการ ReplicaSet ให้คุณตาม chain **Deployment → ReplicaSet → Pod** และเพิ่ม rolling update แบบ declarative (ปรับด้วย `maxUnavailable`/`maxSurge` หรือ strategy `Recreate` ที่ยอมรับ downtime) พร้อม revision history ที่ดูได้ด้วย `kubectl rollout history` และ undo ได้ด้วย `kubectl rollout undo`
+</Callout>
+
+export const quizDeployments = [
+  {
+    q: 'ใช้งานปกติ คุณแก้ object ไหนตรง ๆ เพื่อเปลี่ยนสิ่งที่กำลังรันอยู่ ระหว่าง Deployment กับ ReplicaSet',
+    options: [
+      'ReplicaSet ตรง ๆ ส่วน Deployment เป็น read-only',
+      'Deployment มันจะ create และจัดการ ReplicaSet กับ Pod ให้คุณเอง',
+      'Pod ตรง ๆ controller เป็นทางเลือกเฉย ๆ',
+      'ReplicaSet เป็นคนจัดการ Deployment ไม่ใช่ทางกลับกัน',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ระหว่าง RollingUpdate maxUnavailable กับ maxSurge แต่ละตัวคุมอะไร',
+    options: [
+      'maxUnavailable จำกัดจำนวน replica ที่ดับพร้อมกันได้ maxSurge จำกัดจำนวน Pod เกินจากที่ต้องการที่มีได้ระหว่าง rollout',
+      'maxUnavailable กำหนดจำนวน Pod รวม maxSurge กำหนด container port',
+      'ทั้งสองคุมจำนวน node ที่ Deployment ใช้ได้',
+      'maxSurge ลบ Pod เก่าทันทีโดยไม่สนใจว่า ready หรือยัง',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'จะ rollback Deployment กลับไป revision ก่อนหน้าที่ยังทำงานได้ปกติยังไง',
+    options: [
+      'ลบ Deployment แล้ว create ใหม่ตั้งแต่ต้น',
+      'รัน kubectl rollout undo deployment/<name>',
+      'scale Deployment เหลือ 0 replica แบบถาวร',
+      'แก้ selector ของ ReplicaSet',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมถึงเลือกใช้ strategy Recreate แทน RollingUpdate',
+    options: [
+      'มันเร็วกว่าและไม่มี downtime เลย',
+      'ตอนที่ version เก่ากับใหม่ของ app รันคู่กันไม่ได้จริง ๆ ยอมรับ downtime เพื่อไม่ให้ version ปนกัน',
+      'มันจะ surge Pod เกินเพื่อไม่ให้มี downtime',
+      'ทุก Deployment ต้องใช้ strategy นี้โดย default',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="workloads/deployments-and-replicasets" questions={quizDeployments} />
+
+<ProgressTracker client:visible id="workloads/deployments-and-replicasets" />

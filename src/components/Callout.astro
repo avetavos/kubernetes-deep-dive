@@ -1,0 +1,11 @@
+---
+const { title = "Key point" } = Astro.props;
+---
+<aside class="callout">
+  <p class="callout__label">☸️ {title}</p>
+  <slot />
+</aside>
+<style>
+  .callout { border-left: 4px solid var(--sl-color-accent); background: var(--sl-color-accent-low); color: var(--sl-color-accent-high); padding: 0.75rem 1rem; border-radius: 0 6px 6px 0; margin: 1rem 0; }
+  .callout__label { font-weight: 700; margin: 0 0 .25rem; color: var(--sl-color-accent-high); }
+</style>

@@ -1,0 +1,123 @@
+---
+title: 'Pod Disruption and Cluster Autoscaling'
+description: 'The difference between voluntary and involuntary disruptions, how a PodDisruptionBudget protects availability during drains and scale-downs, and what triggers the Cluster Autoscaler.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A **PodDisruptionBudget** limits how many replicas of a workload can be evicted at once during a **voluntary disruption** — it has no power at all over an **involuntary** one.
+
+## Voluntary versus involuntary disruptions
+
+Not every Pod loss is the same kind of event, and the distinction matters for what you can actually plan around.
+
+- **Voluntary disruptions** are initiated deliberately by an operator or by automation, and can therefore be controlled, delayed, or rate-limited: a `kubectl drain` for a node upgrade, `kubectl cordon` followed by a rolling replacement, or Cluster Autoscaler removing an underutilized Node.
+- **Involuntary disruptions** are things nobody scheduled: a hardware failure, a kernel panic, a Node simply disappearing. There is no budget or setting that can prevent these — by the time they happen, the Node is already gone.
+
+A PodDisruptionBudget only ever applies to the first category.
+
+## PodDisruptionBudget: a floor under voluntary evictions
+
+A **PodDisruptionBudget** (`policy/v1`) declares either `minAvailable` or `maxUnavailable` for a set of Pods selected by label, and any voluntary eviction path — `kubectl drain`, the Eviction API, Cluster Autoscaler scaling down a Node — has to respect it.
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web-app-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: web-app
+```
+
+```bash
+# kubectl drain blocks an eviction that would push availability below the PDB
+kubectl drain node-3 --ignore-daemonsets --delete-emptydir-data
+
+kubectl get pdb web-app-pdb
+```
+
+With `minAvailable: 2` on a Deployment running 3 replicas of `web-app`, a drain can only evict one Pod at a time — it waits for a replacement to become Ready on another Node before it is allowed to evict the next one. If a hardware failure takes out a Node that had two of those three replicas at once, the PDB does nothing to stop it; it was never built to. It protects against operations choosing to remove too much at once, not against the world doing it to you.
+
+## Cluster Autoscaler: adding and removing whole Nodes
+
+Where HPA and VPA operate on Pods, **Cluster Autoscaler** operates one level up, on Nodes:
+
+- It **adds** a Node when Pods are stuck `Pending` because no existing Node has enough free capacity to schedule them.
+- It **removes** a Node when that Node is significantly underutilized and every Pod on it could be rescheduled elsewhere — but it does this by draining the Node first, respecting any PodDisruptionBudgets along the way, exactly like a manual `kubectl drain` would.
+
+```bash
+# Pods stuck here because nothing fits them is the classic trigger for Cluster Autoscaler to add a Node
+kubectl get pods --field-selector=status.phase=Pending
+```
+
+A newer alternative worth knowing about is **Karpenter**, which skips the fixed node-group-template model entirely and provisions right-sized Nodes directly in response to unschedulable Pods, rather than scaling predefined groups up and down.
+
+<Mermaid title="A drain or Cluster Autoscaler scale-down respecting a PodDisruptionBudget before a Node is removed" code={pdbDrainDiagram} />
+
+export const pdbDrainDiagram = `flowchart LR
+  drain["kubectl drain /\\nCluster Autoscaler scale-down"] --> pdb{"PodDisruptionBudget\\nminAvailable satisfied?"}
+  pdb -->|yes| evict["Evict one Pod at a time"]
+  pdb -->|no, would violate| wait["Wait before evicting more"]
+  evict --> empty["Node fully drained"]
+  empty --> remove["Node removed"]`;
+
+<Callout title="The one-line takeaway">
+**Voluntary disruptions** (a drain, a cordon, Cluster Autoscaler scaling down) can be governed by a **PodDisruptionBudget**'s `minAvailable` or `maxUnavailable`, which caps how many replicas can be evicted at once; **involuntary disruptions** (hardware failure, a Node crashing) cannot be prevented or budgeted around at all. **Cluster Autoscaler** adds Nodes when Pods are stuck Pending for lack of capacity, and removes underutilized Nodes by draining them while respecting any PodDisruptionBudgets — **Karpenter** is a newer alternative that provisions right-sized Nodes directly instead of scaling fixed node groups.
+</Callout>
+
+export const quizDisruption = [
+  {
+    q: 'What is the core difference between a voluntary and an involuntary disruption?',
+    options: [
+      'Voluntary disruptions only happen to StatefulSets',
+      'Voluntary disruptions are deliberately initiated and can be controlled or rate-limited; involuntary ones (like hardware failure) cannot be prevented',
+      'Involuntary disruptions are always caused by kubectl drain',
+      'There is no real difference, both are handled by PodDisruptionBudget equally',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does a PodDisruptionBudget minAvailable setting actually protect against?',
+    options: [
+      'It prevents any Pod from ever crashing',
+      'It limits how many replicas can be evicted at once during voluntary disruptions like a drain, but it cannot stop involuntary failures',
+      'It guarantees the cluster never loses a Node',
+      'It increases the resource limits of the protected Pods',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What typically triggers Cluster Autoscaler to add a new Node?',
+    options: [
+      'A Deployment reaching its maxReplicas in an HPA',
+      'A high CPU utilization percentage alone, with no other signal',
+      'Pods stuck Pending because no existing Node has enough free capacity to schedule them',
+      'A PodDisruptionBudget being violated',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'How does Karpenter differ from the traditional Cluster Autoscaler approach?',
+    options: [
+      'It removes the need for PodDisruptionBudgets entirely',
+      'It provisions right-sized Nodes directly in response to unschedulable Pods, instead of scaling fixed node-group templates',
+      'It only works with StatefulSets',
+      'It replaces the HorizontalPodAutoscaler',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="scheduling-and-scaling/pod-disruption-and-cluster-autoscaling" questions={quizDisruption} />
+
+<ProgressTracker client:visible id="scheduling-and-scaling/pod-disruption-and-cluster-autoscaling" />

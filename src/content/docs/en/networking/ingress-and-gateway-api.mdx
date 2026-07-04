@@ -1,0 +1,171 @@
+---
+title: 'Ingress and Gateway API'
+description: 'How Ingress routes HTTP traffic into the cluster, why it needs a controller to do anything, and how Gateway API offers a more expressive successor.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+**Ingress** describes Layer-7 HTTP(S) routing rules for getting external traffic to internal Services, but those rules do nothing until an **Ingress controller** is actually running to implement them.
+
+## Ingress: routing rules, not a router
+
+A LoadBalancer Service works well for one application, but provisioning a separate cloud load balancer per app gets expensive and does not let you route by hostname or URL path. **Ingress** solves this at Layer 7: one entry point that inspects the HTTP request and routes based on host and path.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api-svc
+                port:
+                  number: 80
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-svc
+                port:
+                  number: 80
+```
+
+That manifest expresses two things at once: **host-based routing** (only requests for `shop.example.com` match this rule at all) and **path-based routing** (`/api` goes to one Service, everything else goes to another).
+
+## An Ingress object alone does nothing
+
+This is the part that trips people up: creating an `Ingress` object does not, by itself, cause any traffic to be routed anywhere. Ingress is just a declaration of intent — it requires an **Ingress controller**, a separate piece of software actually running in the cluster (an nginx-based controller, a cloud provider's controller, or others), watching Ingress objects and programming a real proxy or load balancer to match. No controller running means the Ingress resource just sits there, inert.
+
+```bash
+# An Ingress with no controller watching it accomplishes nothing
+kubectl get ingress shop
+kubectl get pods -n ingress-nginx   # this is what actually does the routing
+```
+
+When more than one controller is installed in a cluster, `ingressClassName` (backed by an `IngressClass` object) tells Kubernetes which controller should implement a given `Ingress`:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx
+spec:
+  controller: k8s.io/ingress-nginx
+```
+
+## Gateway API: a more expressive successor
+
+**Gateway API** is a newer, role-oriented model for the same problem, built from three resources instead of one:
+
+- **GatewayClass** — the implementation, analogous to `IngressClass` (provided by a controller vendor).
+- **Gateway** — a listener: an actual point of entry (protocol, port, hostname), typically owned by the platform/infrastructure team.
+- **HTTPRoute** (and **GRPCRoute**) — the routing rules attached to a Gateway, typically owned by application teams.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: shop-gateway
+spec:
+  gatewayClassName: example-gateway-class
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: shop-route
+spec:
+  parentRefs:
+    - name: shop-gateway
+  hostnames:
+    - "shop.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      backendRefs:
+        - name: api-svc
+          port: 80
+```
+
+That split matters in practice: a platform team can own and lock down the `Gateway` (which ports and TLS certs are exposed) while individual application teams safely own their own `HTTPRoute` objects without needing access to the shared listener at all. `Gateway`, `GatewayClass`, and `HTTPRoute` (along with `GRPCRoute`) have reached General Availability at `gateway.networking.k8s.io/v1`, and Gateway API is the direction the ecosystem is moving for new, more advanced routing needs — but `Ingress` remains extremely widely deployed, fully supported, and perfectly adequate for straightforward host/path routing. Neither is going away soon.
+
+<Mermaid title="External traffic through an Ingress controller to internal Services and Pods" code={ingressRoutingDiagram} />
+
+export const ingressRoutingDiagram = `flowchart LR
+  ext["External client"] --> ctrl["Ingress controller\\n(e.g. nginx)"]
+  ctrl -->|"host/path rules"| ing["Ingress object"]
+  ing --> svcA["Service: api-svc"] --> podA["Pods"]
+  ing --> svcB["Service: frontend-svc"] --> podB["Pods"]`;
+
+<Callout title="The one-line takeaway">
+**Ingress** declares Layer-7 host and path routing rules, but does nothing without a running **Ingress controller** to implement them, and `IngressClass` picks which controller handles a given Ingress when several are installed. **Gateway API** is the newer, role-oriented successor — `GatewayClass` (implementation), `Gateway` (a listener, usually platform-owned), and `HTTPRoute`/`GRPCRoute` (routing rules, usually app-team-owned) — whose core resources are now GA, while Ingress remains widely used and fully supported.
+</Callout>
+
+export const quizIngressGateway = [
+  {
+    q: 'Why does creating an Ingress object alone not route any traffic',
+    options: [
+      'Ingress objects are deprecated and never worked',
+      'Ingress is only a declaration of routing intent; an Ingress controller must be running in the cluster to actually implement it',
+      'Ingress only works with LoadBalancer Services, never ClusterIP',
+      'Ingress objects require a restart of the API server to take effect',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the difference between host-based and path-based routing in an Ingress rule',
+    options: [
+      'They are the same feature under two names',
+      'Host-based routing matches on the request hostname (e.g. shop.example.com), while path-based routing matches on the URL path (e.g. /api) within a matched host',
+      'Host-based routing only works with Gateway API, not Ingress',
+      'Path-based routing requires a separate LoadBalancer per path',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'In Gateway API, what does an HTTPRoute do',
+    options: [
+      'It defines the implementation/controller for the whole cluster',
+      'It defines routing rules (hostnames, paths, backends) attached to a Gateway, typically owned by application teams',
+      'It replaces the need for a Service entirely',
+      'It is a synonym for GatewayClass',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How do GatewayClass, Gateway, and HTTPRoute relate to each other',
+    options: [
+      'They are three unrelated, independent resources',
+      'GatewayClass is the controller implementation, Gateway is a listener instance of that class, and HTTPRoute attaches routing rules to a Gateway',
+      'HTTPRoute creates a Gateway automatically, which creates a GatewayClass',
+      'GatewayClass and Gateway are the same resource under different API versions',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="networking/ingress-and-gateway-api" questions={quizIngressGateway} />
+
+<ProgressTracker client:visible id="networking/ingress-and-gateway-api" />

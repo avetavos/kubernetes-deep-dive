@@ -1,0 +1,150 @@
+---
+title: 'Pod and Cluster Security'
+description: 'How SecurityContext hardens a container, how Pod Security Admission replaced PodSecurityPolicy, and what else a real security posture needs.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Hardening a Pod is a stack of independent controls — a per-container `securityContext`, a namespace-wide Pod Security Admission level, and cluster-level protections like etcd encryption — none of which substitutes for the others.
+
+## SecurityContext: hardening a container from the inside
+
+`securityContext` can be set at the Pod level (defaults for every container) and per-container (overrides for that one container). The fields that matter most for hardening:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: checkout
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+  containers:
+    - name: checkout
+      image: checkout:2.3.0
+      securityContext:
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        privileged: false
+        capabilities:
+          drop: ["ALL"]
+          add: ["NET_BIND_SERVICE"]
+```
+
+- **`runAsNonRoot`** — refuses to start the container if its image would run as UID 0.
+- **`runAsUser` / `runAsGroup`** — pins the exact UID/GID the container runs as, regardless of what the image's `Dockerfile` specifies.
+- **`readOnlyRootFilesystem`** — mounts the container's root filesystem read-only, so an attacker who gets code execution cannot write a persistent payload to disk.
+- **`allowPrivilegeEscalation: false`** — blocks a process from gaining more privileges than its parent (for example, via setuid binaries).
+- **`privileged: false`** — never grants the container full access to the host's devices and kernel capabilities; a privileged container is effectively equivalent to root on the node itself, so treat it as a last resort, not a default.
+- **`capabilities`** — Linux splits root's power into discrete capabilities. Dropping `ALL` and adding back only what is genuinely required (like `NET_BIND_SERVICE` to bind a port below 1024) is far safer than running as a user with the full default capability set.
+
+```bash
+kubectl get pod checkout -o jsonpath='{.spec.securityContext}'
+kubectl get pod checkout -o jsonpath='{.spec.containers[0].securityContext}'
+```
+
+## Pod Security Admission: enforcing a baseline at the namespace level
+
+**Pod Security Admission** is built into the API server and has been GA since Kubernetes 1.25. It **replaced** the older PodSecurityPolicy, which was removed in 1.25 — PodSecurityPolicy is gone, not merely deprecated, so any cluster running 1.25+ needs Pod Security Admission (or a third-party policy engine) instead.
+
+Pod Security Admission works entirely through namespace labels — no separate policy objects to create and bind:
+
+```bash
+kubectl label --overwrite ns checkout \
+  pod-security.kubernetes.io/enforce=restricted \
+  pod-security.kubernetes.io/warn=restricted \
+  pod-security.kubernetes.io/audit=restricted
+```
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: checkout
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+```
+
+There are three standard Pod Security Standards levels, least to most restrictive:
+
+- **`privileged`** — no restrictions at all; effectively opts out of Pod Security Admission for that namespace.
+- **`baseline`** — blocks the known, most obvious privilege-escalation paths (host namespaces, privileged containers, certain dangerous volume types) while staying broadly compatible with common workloads.
+- **`restricted`** — heavily hardened, requiring things like `runAsNonRoot`, dropped capabilities, and no privilege escalation — it follows current Pod-hardening best practices closely.
+
+Each level has three independent modes: `enforce` actually blocks non-compliant Pods from being admitted, while `audit` and `warn` are non-blocking — they log a violation or show a client-side warning without stopping the Pod. A common rollout pattern is to `enforce` a level the cluster already meets while `warn`/`audit` at a stricter level, to see what would break before tightening `enforce`.
+
+## Beyond Pods: cluster-level and network controls
+
+SecurityContext and Pod Security Admission both operate at the Pod level, but a real security posture needs cluster-level controls too.
+
+Secrets are only base64-encoded by default — that is encoding, not encryption, and anyone with API read access to a Secret (or access to etcd's data files directly) can trivially decode it. The cluster-level control that actually protects Secret data at rest is **etcd encryption at rest**, which the API server applies transparently so Secret data is encrypted before it is written to etcd's storage.
+
+**NetworkPolicy** (covered in the Networking module) is also a core part of the security posture — RBAC and Pod Security Admission control what a Pod's identity can do against the API and how a Pod is configured, but neither one restricts which Pods can talk to which other Pods over the network. That is NetworkPolicy's job, and a complete security story needs all three layers working together.
+
+<Mermaid title="A Pod being admitted or rejected by Pod Security Admission based on its namespace's enforce level" code={podSecurityDiagram} />
+
+export const podSecurityDiagram = `flowchart LR
+  submit["Pod submitted to namespace"] --> check{"Complies with\\nnamespace enforce level?"}
+  ns["Namespace label:\\npod-security.kubernetes.io/enforce"] --> check
+  check -- "yes" --> admitted["Pod admitted"]
+  check -- "no" --> rejected["Pod rejected"]`;
+
+<Callout title="The one-line takeaway">
+A per-container **`securityContext`** hardens how a container actually runs — `runAsNonRoot`, pinned `runAsUser`/`runAsGroup`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, dropped Linux `capabilities`, and never `privileged: true` unless truly required. **Pod Security Admission**, GA since Kubernetes 1.25, enforces a baseline at the namespace level via labels like `pod-security.kubernetes.io/enforce: restricted`, using the **privileged / baseline / restricted** levels (least to most restrictive) with non-blocking `audit`/`warn` variants for gradual rollout — it fully **replaced** PodSecurityPolicy, which was removed in 1.25. Secrets are only base64-encoded, so **etcd encryption at rest** is the cluster-level control that actually protects them, and **NetworkPolicy** rounds out the picture by restricting Pod-to-Pod traffic.
+</Callout>
+
+export const quizPodSecurity = [
+  {
+    q: 'What replaced PodSecurityPolicy, and when?',
+    options: [
+      'NetworkPolicy, in Kubernetes 1.20',
+      'Pod Security Admission, which became GA in Kubernetes 1.25 as PodSecurityPolicy was removed',
+      'RBAC, in Kubernetes 1.18',
+      'Nothing replaced it; PodSecurityPolicy is still the current standard',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What are the three Pod Security Standards levels, ordered from least to most restrictive?',
+    options: [
+      'restricted, baseline, privileged',
+      'baseline, restricted, privileged',
+      'privileged, baseline, restricted',
+      'enforce, audit, warn',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'Which of these does a container-level SecurityContext actually control?',
+    options: [
+      'Which namespace the Pod is created in',
+      'Which Node the Pod is scheduled onto',
+      'Things like runAsNonRoot, readOnlyRootFilesystem, allowPrivilegeEscalation, and dropped Linux capabilities',
+      'Which Service routes traffic to the Pod',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'Why do base64-encoded Secrets still need etcd encryption at rest for real confidentiality?',
+    options: [
+      'Base64 encoding is a strong form of encryption on its own',
+      'Base64 is just an encoding, not encryption, so anyone with read access to the Secret or to etcd\'s data can trivially decode it without etcd encryption at rest',
+      'etcd encryption at rest is required for Secrets to be created at all',
+      'Base64-encoded data cannot be stored in etcd without encryption',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="observability-and-security/pod-and-cluster-security" questions={quizPodSecurity} />
+
+<ProgressTracker client:visible id="observability-and-security/pod-and-cluster-security" />

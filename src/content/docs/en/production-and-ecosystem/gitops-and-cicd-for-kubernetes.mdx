@@ -1,0 +1,122 @@
+---
+title: 'GitOps and CI/CD for Kubernetes'
+description: 'How GitOps makes Git the single source of truth for cluster state, and how that pull-based model differs from a traditional push-based CI/CD pipeline.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+**GitOps** makes a Git repository the single source of truth for a cluster's desired state, with a reconciler running inside the cluster pulling and applying that state instead of a CI job pushing it from outside.
+
+## Push-based CI/CD versus pull-based GitOps
+
+A traditional CI/CD pipeline is **push-based**: a CI job builds an artifact, then runs `kubectl apply` or `helm upgrade` directly against the cluster, using cluster credentials the CI system holds itself. That works, but it means the CI system — often a third-party SaaS product outside your infrastructure boundary — needs standing, and often privileged, access to your cluster.
+
+**GitOps** flips the direction. A reconciler such as Argo CD or Flux runs *inside* the cluster it manages, continuously watching a Git repository that holds the desired manifests or Helm values. When the repository changes, the reconciler pulls the new desired state and applies it itself — the cluster reaches out to Git, Git never reaches into the cluster.
+
+```bash
+# Push-based: CI applies directly, using credentials CI itself holds
+kubectl apply -f manifests/
+helm upgrade myapp ./mychart -f values-prod.yaml
+
+# Pull-based (GitOps): CI's job stops at committing to Git;
+# an in-cluster reconciler (Argo CD / Flux) takes it from there
+git commit -am "bump myapp image tag to 1.5.0"
+git push origin main
+```
+
+## Why the pull-based model earns its keep
+
+Three concrete benefits fall out of moving the apply step inside the cluster:
+
+- **No external system needs cluster-admin credentials.** The CI system's job ends at a `git push`; only the in-cluster reconciler, which you control, ever authenticates against the API server with write access.
+- **Drift detection.** Because the reconciler continuously compares live cluster state against the Git-declared state, a manual out-of-band `kubectl edit` or `kubectl scale` gets noticed — and can be automatically reverted — instead of silently diverging from what Git says should be running.
+- **An inherently auditable history.** Every change to desired state is a Git commit: who changed what, when, and why (via the commit message), all in the same history you already use for code review.
+
+## A realistic pipeline shape
+
+Building and deploying with GitOps splits into two repositories (or two clearly separated stages): one that builds the application, and one that declares what should be running.
+
+```bash
+# Stage 1 — application repo CI: build and publish the image
+docker build -t myregistry/myapp:1.5.0 .
+docker push myregistry/myapp:1.5.0
+
+# Stage 2 — update the manifests/values repo that GitOps watches
+# (a small CI step, or a bot, edits the tag and commits)
+sed -i 's/tag: .*/tag: "1.5.0"/' values-prod.yaml
+git commit -am "myapp: bump image tag to 1.5.0"
+git push origin main
+
+# From here, the GitOps reconciler (not CI) notices the commit and applies it.
+# In a push-based setup, stage 2 would instead run directly against the cluster:
+#   helm upgrade myapp ./mychart -f values-prod.yaml
+```
+
+The CI system never runs `kubectl` or `helm upgrade` against the live cluster in the GitOps flow — its responsibility ends at building the image and committing the new desired state to Git.
+
+<Mermaid title="A manifest change pushed to Git, pulled and applied by an in-cluster GitOps reconciler; CI separately builds and publishes the image" code={gitopsFlowDiagram} />
+
+export const gitopsFlowDiagram = `flowchart LR
+  dev["Developer"] -->|"push manifest / values change"| git["Git repository (desired state)"]
+  ci["CI pipeline"] -->|"build & push image"| registry["Container registry"]
+  git -->|"watched / polled"| reconciler["In-cluster GitOps reconciler (Argo CD / Flux)"]
+  reconciler -->|"apply diff"| cluster["Live cluster state"]
+  cluster -->|"pulls referenced image"| registry`;
+
+<Callout title="The one-line takeaway">
+**GitOps** treats a Git repository as the single source of truth for desired cluster state, with an in-cluster **reconciler** (Argo CD, Flux) continuously pulling and applying that state, rather than a CI job pushing changes with cluster credentials it holds itself; that pull-based model means the CI system never needs cluster-admin access, out-of-band changes are caught through **drift detection**, and the entire deployment history is just **Git history** — a realistic pipeline builds and pushes an image in CI, then commits the updated image tag to the manifests repository for the reconciler to pick up.
+</Callout>
+
+export const quizGitOps = [
+  {
+    q: 'What does it mean in practice for Git to be the single source of truth in a GitOps workflow',
+    options: [
+      'Git stores a backup copy of manifests but the cluster state is authoritative',
+      'The desired state of the cluster is defined entirely by what is committed to a Git repository, and the cluster is reconciled to match it',
+      'Only application source code lives in Git, manifests are applied manually',
+      'Git is used only to trigger a CI pipeline and has no other role',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the key difference between a push-based CI/CD pipeline and a pull-based GitOps model',
+    options: [
+      'Push-based pipelines cannot use containers, pull-based ones can',
+      'In push-based CI/CD a CI job applies changes directly to the cluster with credentials it holds, in pull-based GitOps an in-cluster reconciler pulls desired state from Git and applies it itself',
+      'They are identical, GitOps is just a rebranding of CI/CD',
+      'Pull-based GitOps requires manifests to never be stored in Git',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is one concrete security benefit of the pull-based GitOps model',
+    options: [
+      'It encrypts all container images automatically',
+      'The external CI system never needs standing cluster-admin credentials, since only the in-cluster reconciler applies changes',
+      'It removes the need for RBAC entirely',
+      'It prevents developers from ever making mistakes in manifests',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'In a realistic GitOps pipeline, what does the CI system do after building and pushing a container image',
+    options: [
+      'It runs kubectl apply directly against the production cluster',
+      'It commits the updated image tag to the Git repository that the GitOps reconciler watches, and stops there',
+      'It deletes the previous image from the registry',
+      'It restarts the GitOps reconciler manually',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/gitops-and-cicd-for-kubernetes" questions={quizGitOps} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/gitops-and-cicd-for-kubernetes" />

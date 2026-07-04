@@ -1,0 +1,122 @@
+---
+title: 'GitOps และ CI/CD สำหรับ Kubernetes'
+description: 'วิธีที่ GitOps ทำให้ Git repository เป็น single source of truth ของสถานะ cluster และความต่างของ pull-based model นี้กับ push-based CI/CD pipeline แบบดั้งเดิม'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**GitOps** ทำให้ Git repository เป็น single source of truth ของ desired state ของ cluster โดยมี reconciler ที่รันอยู่ใน cluster คอย pull แล้ว apply state นั้น แทนที่จะให้ CI job push มันจากภายนอก
+
+## Push-based CI/CD เทียบกับ pull-based GitOps
+
+CI/CD pipeline แบบดั้งเดิมเป็น **push-based** CI job build artifact เสร็จแล้วรัน `kubectl apply` หรือ `helm upgrade` ตรงเข้า cluster เลย โดยใช้ credential ของ cluster ที่ตัว CI system เก็บไว้เอง มันทำงานได้ก็จริง แต่หมายความว่า CI system ซึ่งบ่อยครั้งเป็น SaaS ของบุคคลที่สามที่อยู่นอก infrastructure boundary ของเรา ต้องมี access เข้า cluster แบบถาวรและมักเป็น privileged access ด้วย
+
+**GitOps** กลับทิศทางนี้ reconciler อย่าง Argo CD หรือ Flux รันอยู่ *ภายใน* cluster ที่มันจัดการ คอย watch Git repository ที่เก็บ manifest หรือ Helm values ที่ต้องการอยู่ตลอด พอ repository เปลี่ยน reconciler จะ pull desired state ใหม่แล้ว apply เอง cluster เป็นฝ่ายเอื้อมไปหา Git ไม่ใช่ Git เอื้อมเข้ามาใน cluster
+
+```bash
+# Push-based: CI applies directly, using credentials CI itself holds
+kubectl apply -f manifests/
+helm upgrade myapp ./mychart -f values-prod.yaml
+
+# Pull-based (GitOps): CI's job stops at committing to Git;
+# an in-cluster reconciler (Argo CD / Flux) takes it from there
+git commit -am "bump myapp image tag to 1.5.0"
+git push origin main
+```
+
+## ทำไม pull-based model ถึงคุ้มค่า
+
+ย้ายขั้นตอน apply เข้าไปอยู่ใน cluster ได้ประโยชน์จริงสามอย่าง
+
+- **ไม่มี external system ตัวไหนต้องถือ credential ระดับ cluster-admin** งานของ CI system จบแค่ `git push` มีแค่ reconciler ที่อยู่ใน cluster ซึ่งเราคุมเองเท่านั้นที่ authenticate กับ API server ด้วยสิทธิ์เขียน
+- **ตรวจจับ drift ได้** เพราะ reconciler เทียบสถานะจริงของ cluster กับสถานะที่ Git ประกาศไว้อยู่ตลอด การแก้แบบ out-of-band ด้วย `kubectl edit` หรือ `kubectl scale` จะถูกจับได้ และสามารถ revert กลับอัตโนมัติ แทนที่จะเบี่ยงเบนไปจากสิ่งที่ Git บอกไว้แบบเงียบ ๆ
+- **มีประวัติที่ตรวจสอบได้ในตัว** ทุกการเปลี่ยน desired state คือ Git commit หนึ่งอัน ใครเปลี่ยนอะไร เมื่อไหร่ ทำไม (ผ่าน commit message) อยู่ในประวัติเดียวกับที่เราใช้ review code อยู่แล้ว
+
+## รูปแบบ pipeline ที่ใช้งานจริง
+
+การ build กับ deploy แบบ GitOps แยกเป็นสอง repository (หรือสอง stage ที่แยกกันชัดเจน) หนึ่งสำหรับ build แอป อีกหนึ่งสำหรับประกาศว่าควรรันอะไรอยู่
+
+```bash
+# Stage 1 — application repo CI: build and publish the image
+docker build -t myregistry/myapp:1.5.0 .
+docker push myregistry/myapp:1.5.0
+
+# Stage 2 — update the manifests/values repo that GitOps watches
+# (a small CI step, or a bot, edits the tag and commits)
+sed -i 's/tag: .*/tag: "1.5.0"/' values-prod.yaml
+git commit -am "myapp: bump image tag to 1.5.0"
+git push origin main
+
+# From here, the GitOps reconciler (not CI) notices the commit and applies it.
+# In a push-based setup, stage 2 would instead run directly against the cluster:
+#   helm upgrade myapp ./mychart -f values-prod.yaml
+```
+
+ใน flow แบบ GitOps ตัว CI system ไม่เคยรัน `kubectl` หรือ `helm upgrade` เข้า cluster จริงเลย หน้าที่ของมันจบแค่ build image แล้ว commit desired state ใหม่เข้า Git
+
+<Mermaid title="การเปลี่ยน manifest ถูก push เข้า Git แล้วถูก pull มา apply โดย GitOps reconciler ใน cluster ส่วน CI แยก build แล้ว publish image ต่างหาก" code={gitopsFlowDiagram} />
+
+export const gitopsFlowDiagram = `flowchart LR
+  dev["Developer"] -->|"push manifest / values change"| git["Git repository (desired state)"]
+  ci["CI pipeline"] -->|"build & push image"| registry["Container registry"]
+  git -->|"watched / polled"| reconciler["In-cluster GitOps reconciler (Argo CD / Flux)"]
+  reconciler -->|"apply diff"| cluster["Live cluster state"]
+  cluster -->|"pulls referenced image"| registry`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**GitOps** ถือว่า Git repository คือ single source of truth ของ desired state ของ cluster โดยมี **reconciler** ที่อยู่ใน cluster (Argo CD, Flux) คอย pull แล้ว apply state นั้นอยู่ตลอด แทนที่ CI job จะ push การเปลี่ยนแปลงด้วย credential ของ cluster ที่มันถือเอง pull-based model นี้ทำให้ CI system ไม่ต้องมี access ระดับ cluster-admin เลย การเปลี่ยนแบบ out-of-band ถูกจับได้ผ่าน **drift detection** และประวัติ deployment ทั้งหมดก็คือ **Git history** ธรรมดา pipeline ที่ใช้งานจริงคือ build แล้ว push image ใน CI ก่อน จากนั้น commit image tag ใหม่เข้า repository ของ manifest ให้ reconciler ไปหยิบต่อ
+</Callout>
+
+export const quizGitOps = [
+  {
+    q: 'การที่ Git เป็น single source of truth ใน GitOps workflow หมายความว่ายังไงในทางปฏิบัติ',
+    options: [
+      'Git เก็บสำเนาสำรองของ manifest แต่สถานะจริงของ cluster คือตัวที่ถูกต้องที่สุด',
+      'desired state ของ cluster ถูกกำหนดทั้งหมดโดยสิ่งที่ commit เข้า Git repository แล้ว cluster ถูก reconcile ให้ตรงกับมัน',
+      'มีแค่ source code ของแอปเก็บอยู่ใน Git ส่วน manifest ถูก apply ด้วยมือ',
+      'Git ถูกใช้แค่เพื่อ trigger CI pipeline ไม่มีบทบาทอื่น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ความต่างหลักระหว่าง push-based CI/CD pipeline กับ pull-based GitOps model คืออะไร',
+    options: [
+      'push-based pipeline ใช้ container ไม่ได้ แต่ pull-based ใช้ได้',
+      'ใน push-based CI/CD ตัว CI job apply การเปลี่ยนแปลงเข้า cluster ตรง ๆ ด้วย credential ที่มันถือเอง ส่วนใน pull-based GitOps reconciler ที่อยู่ใน cluster จะ pull desired state จาก Git มาแล้ว apply เอง',
+      'มันคือสิ่งเดียวกัน GitOps แค่เปลี่ยนชื่อ CI/CD',
+      'pull-based GitOps ต้องห้ามไม่ให้เก็บ manifest ใน Git',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ประโยชน์ด้าน security ที่เป็นรูปธรรมของ pull-based GitOps model คืออะไร',
+    options: [
+      'มันเข้ารหัส container image ทุกตัวอัตโนมัติ',
+      'external CI system ไม่ต้องถือ credential ระดับ cluster-admin แบบถาวรเลย เพราะมีแค่ reconciler ใน cluster เท่านั้นที่ apply การเปลี่ยนแปลง',
+      'มันตัด RBAC ออกไปได้ทั้งหมด',
+      'มันป้องกันไม่ให้ developer เขียน manifest ผิดพลาดได้เลย',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ใน GitOps pipeline ที่ใช้งานจริง หลังจาก CI build แล้ว push container image เสร็จ มันทำอะไรต่อ',
+    options: [
+      'มันรัน kubectl apply เข้า production cluster ตรง ๆ',
+      'มัน commit image tag ใหม่เข้า Git repository ที่ GitOps reconciler คอย watch อยู่ แล้วหยุดแค่นั้น',
+      'มันลบ image ตัวก่อนหน้าออกจาก registry',
+      'มัน restart GitOps reconciler ด้วยมือ',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/gitops-and-cicd-for-kubernetes" questions={quizGitOps} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/gitops-and-cicd-for-kubernetes" />

@@ -1,0 +1,171 @@
+---
+title: 'Ingress และ Gateway API'
+description: 'วิธีที่ Ingress route HTTP traffic เข้า cluster ทำไมมันต้องพึ่ง controller ถึงจะทำงานได้ และ Gateway API เป็นตัวต่อยอดที่ยืดหยุ่นกว่ายังไง'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**Ingress** อธิบาย rule การ route HTTP(S) แบบ Layer-7 เพื่อพา traffic ภายนอกไปหา Service ภายใน แต่ rule พวกนั้นจะไม่ทำงานเลยจนกว่าจะมี **Ingress controller** รันอยู่จริงเพื่อ implement มัน
+
+## Ingress: rule การ route ไม่ใช่ router
+
+LoadBalancer Service ใช้ได้ดีกับแอปเดียว แต่การ provision cloud load balancer แยกต่อแอปมันแพงและไม่ให้ route ตาม hostname หรือ URL path ได้ **Ingress** แก้ปัญหานี้ที่ Layer 7 จุดเข้าเดียวที่ตรวจ HTTP request แล้ว route ตาม host กับ path
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api-svc
+                port:
+                  number: 80
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-svc
+                port:
+                  number: 80
+```
+
+manifest นั้นแสดงสองอย่างพร้อมกัน **host-based routing** (มีแค่ request ที่ยิงไปหา `shop.example.com` เท่านั้นที่ match rule นี้) และ **path-based routing** (`/api` ไปที่ Service หนึ่ง ที่เหลือทั้งหมดไปอีก Service หนึ่ง)
+
+## Ingress object เดี่ยว ๆ ไม่ทำอะไรเลย
+
+ตรงนี้คือจุดที่คนสับสนกันบ่อย การสร้าง `Ingress` object เฉย ๆ ไม่ทำให้ traffic ถูก route ไปไหนเลยด้วยตัวมันเอง Ingress เป็นแค่การประกาศ intent เท่านั้น มันต้องพึ่ง **Ingress controller** ซึ่งเป็น software แยกต่างหากที่รันอยู่จริงใน cluster (เช่น controller ที่ใช้ nginx, controller ของ cloud provider หรือตัวอื่น ๆ) คอย watch Ingress object แล้วเขียน proxy หรือ load balancer จริงให้ตรงตามนั้น ถ้าไม่มี controller รันอยู่ Ingress resource ก็แค่นอนเฉย ๆ ไม่มีผลอะไร
+
+```bash
+# An Ingress with no controller watching it accomplishes nothing
+kubectl get ingress shop
+kubectl get pods -n ingress-nginx   # this is what actually does the routing
+```
+
+เวลามี controller ติดตั้งมากกว่าหนึ่งตัวใน cluster `ingressClassName` (ที่อิงกับ `IngressClass` object) จะบอก Kubernetes ว่า controller ตัวไหนควร implement `Ingress` ตัวนั้น
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx
+spec:
+  controller: k8s.io/ingress-nginx
+```
+
+## Gateway API: ตัวต่อยอดที่ยืดหยุ่นกว่า
+
+**Gateway API** เป็นโมเดลใหม่กว่าที่แก้ปัญหาเดียวกัน แต่แยก role ชัดเจน สร้างจากสาม resource แทนที่จะเป็นตัวเดียว
+
+- **GatewayClass** implementation คล้าย ๆ กับ `IngressClass` (มาจาก vendor ของ controller)
+- **Gateway** listener จุดเข้าจริง (protocol, port, hostname) ปกติดูแลโดยทีม platform/infrastructure
+- **HTTPRoute** (และ **GRPCRoute**) rule การ route ที่ผูกกับ Gateway ปกติดูแลโดยทีม application
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: shop-gateway
+spec:
+  gatewayClassName: example-gateway-class
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: shop-route
+spec:
+  parentRefs:
+    - name: shop-gateway
+  hostnames:
+    - "shop.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      backendRefs:
+        - name: api-svc
+          port: 80
+```
+
+การแยกแบบนี้มีประโยชน์จริง ทีม platform เป็นเจ้าของและคุม `Gateway` ได้ (ว่าเปิด port ไหน TLS certificate ไหน) ส่วนแต่ละทีม application เป็นเจ้าของ `HTTPRoute` ของตัวเองได้อย่างปลอดภัย โดยไม่ต้องมีสิทธิ์เข้าถึง listener ที่ใช้ร่วมกันเลย `Gateway`, `GatewayClass` และ `HTTPRoute` (พร้อมกับ `GRPCRoute`) เข้าสู่ General Availability แล้วที่ `gateway.networking.k8s.io/v1` และ Gateway API คือทิศทางที่ ecosystem กำลังมุ่งไปสำหรับความต้องการ routing ที่ซับซ้อนขึ้น แต่ `Ingress` ก็ยังถูกใช้กันแพร่หลายมาก ยังได้รับ support เต็มที่ และเหมาะมากพอสำหรับการ route แบบ host/path ตรงไปตรงมา ไม่มีตัวไหนกำลังจะหายไปในเร็ว ๆ นี้
+
+<Mermaid title="Traffic ภายนอกผ่าน Ingress controller ไปยัง Service และ Pod ภายใน" code={ingressRoutingDiagram} />
+
+export const ingressRoutingDiagram = `flowchart LR
+  ext["External client"] --> ctrl["Ingress controller\\n(e.g. nginx)"]
+  ctrl -->|"host/path rules"| ing["Ingress object"]
+  ing --> svcA["Service: api-svc"] --> podA["Pods"]
+  ing --> svcB["Service: frontend-svc"] --> podB["Pods"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**Ingress** ประกาศ rule การ route แบบ Layer-7 ตาม host กับ path แต่ไม่ทำอะไรเลยถ้าไม่มี **Ingress controller** รันอยู่เพื่อ implement มัน และ `IngressClass` เลือกว่า controller ตัวไหนจัดการ Ingress ตัวไหนเวลามีติดตั้งหลายตัว **Gateway API** คือตัวต่อยอดใหม่กว่าที่แยก role ชัดเจน `GatewayClass` (implementation), `Gateway` (listener ปกติดูแลโดย platform), และ `HTTPRoute`/`GRPCRoute` (rule การ route ปกติดูแลโดยทีม application) ซึ่ง resource หลักตอนนี้ GA แล้ว ในขณะที่ Ingress ก็ยังถูกใช้กันแพร่หลายและได้รับ support เต็มที่
+</Callout>
+
+export const quizIngressGateway = [
+  {
+    q: 'ทำไมการสร้าง Ingress object เดี่ยว ๆ ถึงไม่ทำให้ traffic ถูก route',
+    options: [
+      'Ingress object ถูก deprecate ไปแล้ว ไม่เคยทำงานได้เลย',
+      'Ingress เป็นแค่การประกาศ intent เรื่อง routing ต้องมี Ingress controller รันอยู่ใน cluster ถึงจะ implement มันได้จริง',
+      'Ingress ใช้ได้แค่กับ LoadBalancer Service เท่านั้น ไม่ใช่ ClusterIP',
+      'Ingress object ต้อง restart API server ถึงจะมีผล',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'host-based routing กับ path-based routing ใน Ingress rule ต่างกันยังไง',
+    options: [
+      'มันคือฟีเจอร์เดียวกันแค่คนละชื่อ',
+      'host-based routing match ตาม hostname ของ request (เช่น shop.example.com) ส่วน path-based routing match ตาม URL path (เช่น /api) ภายใน host ที่ match แล้ว',
+      'host-based routing ใช้ได้แค่กับ Gateway API เท่านั้น ไม่ใช่ Ingress',
+      'path-based routing ต้องมี LoadBalancer แยกต่อ path',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ใน Gateway API HTTPRoute ทำหน้าที่อะไร',
+    options: [
+      'กำหนด implementation/controller ให้ทั้ง cluster',
+      'กำหนด rule การ route (hostname, path, backend) ที่ผูกกับ Gateway ปกติดูแลโดยทีม application',
+      'มาแทนที่ความจำเป็นของ Service ไปเลย',
+      'เป็นคำเรียกอีกแบบของ GatewayClass',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'GatewayClass, Gateway และ HTTPRoute สัมพันธ์กันยังไง',
+    options: [
+      'เป็นสาม resource ที่ไม่เกี่ยวข้องกันเลย',
+      'GatewayClass คือ controller implementation, Gateway คือ instance ของ listener ใน class นั้น และ HTTPRoute ผูก rule การ route เข้ากับ Gateway',
+      'HTTPRoute สร้าง Gateway ให้อัตโนมัติ ซึ่งสร้าง GatewayClass ต่อ',
+      'GatewayClass กับ Gateway คือ resource เดียวกันแค่คนละ API version',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="networking/ingress-and-gateway-api" questions={quizIngressGateway} />
+
+<ProgressTracker client:visible id="networking/ingress-and-gateway-api" />

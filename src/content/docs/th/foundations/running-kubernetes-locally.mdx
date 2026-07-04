@@ -1,0 +1,124 @@
+---
+title: 'การรัน Kubernetes บนเครื่องตัวเอง'
+description: 'วิธีตั้ง local cluster ด้วย kind รัน Pod แรกของคุณ และทำความเข้าใจ namespace ที่มีมาให้ในตัว'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียหลักในหนึ่งประโยค
+
+คุณไม่จำเป็นต้องมี data center เพื่อเรียน Kubernetes เครื่องมืออย่าง kind, minikube และ k3d ให้คุณได้ cluster จริงที่รองรับหลาย node รันอยู่บนเครื่องของคุณเองทั้งหมด
+
+## ตัวเลือก local cluster
+
+เครื่องมือสามตัวนี้ครอบคลุมการพัฒนาและเรียนรู้ Kubernetes บนเครื่องตัวเองเกือบทั้งหมด
+
+- **kind** (Kubernetes IN Docker) รัน node แต่ละตัวของ cluster เป็น Docker container สร้างและลบเร็ว จึงเหมาะกับ CI pipeline และเหมาะกับการเรียนตามคอร์สแบบนี้
+- **minikube** รัน cluster แบบ single หรือ multi-node ข้างใน VM หรือ container driver ที่คุณเลือก มาพร้อม ecosystem ของ addon (dashboard, ingress, metrics) ที่เปิดใช้ได้ด้วยคำสั่งเดียวต่อตัว
+- **k3d** รัน **k3s** ซึ่งเป็น Kubernetes distribution แบบ lightweight ที่ผ่าน certified อยู่ข้างใน Docker container แนวคิดคล้าย kind แต่สร้างขึ้นรอบ footprint ที่เล็กกว่าของ k3s
+
+ทั้งสามตัวมีไว้เพื่อทำให้การพัฒนาและเรียนรู้บนเครื่องตัวเองเร็วและทิ้งได้ ไม่มีตัวไหนตั้งใจให้ใช้บน production เลย production cluster จะสร้างด้วยเครื่องมืออย่าง kubeadm หรือจัดเตรียมโดย managed cloud service บนเครื่องจริงหรือ virtual machine ที่มี networking, storage และ high availability ที่เหมาะสม
+
+## Cluster แรกและ Pod แรกของคุณ
+
+สร้าง local cluster แล้วดูมันสักหน่อย
+
+```bash
+kind create cluster
+kubectl cluster-info
+kubectl get nodes
+```
+
+`kubectl cluster-info` ยืนยันว่าคุณเข้าถึง API server ได้ และแสดงว่า core service รันอยู่ที่ไหน ส่วน `kubectl get nodes` แสดงรายการ node ใน cluster พร้อมสถานะ `Ready` ของมัน สิ่งแรกที่ควรเช็คทุกครั้งที่รู้สึกว่ามีอะไรผิดปกติ
+
+พอมี cluster แล้ว ให้รัน Pod แล้วเข้าถึงมันจาก laptop ของคุณ
+
+```bash
+kubectl run nginx --image=nginx
+kubectl get pods
+kubectl port-forward pod/nginx 8080:80
+```
+
+`kubectl run` เป็นวิธีแบบ imperative เร็ว ๆ ในการสร้าง Pod เดียวที่รัน container ตัวเดียว มีประโยชน์เวลาจะ smoke-test image สักตัว `kubectl port-forward` เปิด tunnel จาก port บนเครื่องของคุณไปยัง port ข้างใน Pod ทำให้ `http://localhost:8080` เข้าถึง nginx ที่รันอยู่ใน cluster ได้เลยโดยไม่ต้องมี Service หรือ Ingress เลย สะดวกมากสำหรับขั้นตอนแรก ๆ ของการ debug หรือลองอะไรเล่น ๆ
+
+## Namespace คือการแบ่ง cluster
+
+namespace คือวิธีแบ่ง cluster เดียวออกเป็นขอบเขตแยกกันสำหรับชื่อ, การเข้าถึง และ resource limit ทุก cluster มาพร้อม namespace พื้นฐานอยู่แล้วไม่กี่ตัว
+
+- `default` — ที่ที่ object จะไปอยู่ถ้าคุณไม่ระบุ namespace
+- `kube-system` — สงวนไว้สำหรับ component ที่ control plane จัดการเอง เช่น CoreDNS และ Pod ของ kube-proxy เอง ปกติคุณแค่มาดู ไม่ต้องไปแตะ
+- `kube-public` — ผู้ใช้ทุกคนอ่านได้ (รวมถึงคนที่ไม่ authenticate) ใช้เก็บข้อมูล cluster ที่ควรเปิดเผยต่อสาธารณะ
+
+แสดงรายการ namespace แล้วสร้างของคุณเองสำหรับโปรเจกต์
+
+```bash
+kubectl get namespaces
+kubectl create namespace my-app
+```
+
+<Mermaid title="A local kind cluster running entirely inside Docker on your laptop" code={runningLocallyDiagram} />
+
+export const runningLocallyDiagram = `flowchart TB
+  laptop["Your laptop"] --> docker["Docker"]
+  subgraph cluster["kind cluster"]
+    cp["control-plane node (container)"]
+    w1["worker node (container)"]
+    w2["worker node (container)"]
+  end
+  docker --> cluster`;
+
+<Callout title="The one-line takeaway">
+**kind**, **minikube** และ **k3d** แต่ละตัวให้ Kubernetes cluster จริงที่ทิ้งได้สำหรับพัฒนาและเรียนรู้บนเครื่องตัวเอง ไม่ใช่สำหรับ production และแค่ไม่กี่คำสั่งก็เพียงพอให้เริ่มได้ `kind create cluster` เพื่อสร้าง cluster `kubectl get nodes` เพื่อเช็คว่ามัน healthy `kubectl run` คู่กับ `kubectl port-forward` เพื่อรันและเข้าถึง Pod แรก และ `kubectl create namespace` เพื่อแบ่งพื้นที่ของตัวเองนอกเหนือจาก namespace พื้นฐานอย่าง `default`, `kube-system` และ `kube-public`
+</Callout>
+
+export const quizRunningLocally = [
+  {
+    q: 'What are kind, minikube, and k3d primarily used for?',
+    options: [
+      'Running production-grade, highly available Kubernetes clusters across regions',
+      'Running local Kubernetes clusters for development and learning, not production',
+      'Replacing kubectl with a different command-line tool',
+      'Managing billing for managed Kubernetes services',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which command tells you whether your cluster nodes are healthy and ready?',
+    options: [
+      'kubectl get nodes',
+      'kubectl get pods',
+      'docker ps',
+      'kubectl config view',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'What is the kube-system namespace used for?',
+    options: [
+      'A namespace reserved for your own application Pods',
+      'The namespace holding components managed by the control plane itself, such as CoreDNS and kube-proxy',
+      'A namespace only used for running automated tests',
+      'A deprecated namespace kept only for backward compatibility',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which command creates a new namespace of your own?',
+    options: [
+      'kubectl apply namespace my-app',
+      'kubectl run namespace my-app',
+      'kubectl create namespace my-app',
+      'kubectl config namespace my-app',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="foundations/running-kubernetes-locally" questions={quizRunningLocally} />
+
+<ProgressTracker client:visible id="foundations/running-kubernetes-locally" />

@@ -1,0 +1,177 @@
+---
+title: 'Operator และ Custom Resource'
+description: 'วิธีที่ CustomResourceDefinition ต่อขยาย Kubernetes API และวิธีที่ Operator pattern จับคู่มันกับ controller เพื่อ automate ความรู้เชิง operation'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**CustomResourceDefinition** ต่อขยาย Kubernetes API ด้วย object Kind ใหม่ ส่วน **Operator** คือ CRD นั้นจับคู่กับ controller ที่คอย reconcile สถานะจริงให้ตรงกับมันตลอดเวลา
+
+## CustomResourceDefinition: สอน API server ให้รู้จัก Kind ใหม่
+
+**CustomResourceDefinition (CRD)** ลงทะเบียน object Kind ใหม่เข้ากับ Kubernetes API server พอติดตั้งแล้ว instance ของ Kind นั้นจะทำงานเหมือน built-in object ทุกอย่าง `kubectl get`/`kubectl apply` ใช้ได้ตามปกติ มันถูกเก็บใน etcd เหมือนของอื่น ๆ และ watch ผ่าน API ได้เหมือน Pod หรือ Deployment ตัว CRD เองกำหนด schema ของ Kind นั้นด้วย OpenAPI v3 schema ทำให้ API server validate instance ตอนเขียนได้
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: databases.example.com
+spec:
+  group: example.com
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                engine:
+                  type: string
+                  enum: ['postgres', 'mysql']
+                storageGB:
+                  type: integer
+                  minimum: 1
+  scope: Namespaced
+  names:
+    plural: databases
+    singular: database
+    kind: Database
+    shortNames: ['db']
+```
+
+```yaml
+# An instance of the new Kind, just like any other manifest
+apiVersion: example.com/v1
+kind: Database
+metadata:
+  name: orders-db
+spec:
+  engine: postgres
+  storageGB: 20
+```
+
+```bash
+kubectl apply -f orders-db.yaml
+kubectl get databases
+kubectl get db orders-db -o yaml
+```
+
+## CRD เดี่ยว ๆ คือแค่ schema controller ต่างหากที่ทำให้มันเป็น Operator
+
+การ apply object `Database` นั้นไม่ทำอะไรด้วยตัวมันเอง API server แค่เก็บมันลง etcd แล้ว validate โครงสร้าง แต่ไม่มีอะไรไป provision database จริงให้ CRD เพิ่มแค่ schema กับที่เก็บสำหรับ Kind ใหม่ ไม่มี behavior ใด ๆ **Operator pattern** คือ CRD นั้นจับคู่กับ **controller** ที่คอย watch instance ของ custom resource แล้วขับเคลื่อน infrastructure จริงให้ตรงกับสิ่งที่มันอธิบายไว้ ใช้ reconciliation loop แบบเดียวกัน (watch, diff, act) ที่ built-in controller ของ Kubernetes เองใช้กับ Deployment กับ ReplicaSet เพียงแต่เล็งไปที่ความรู้เฉพาะแอปหรือเฉพาะงาน operation แทนที่จะเป็นการ schedule Pod ทั่วไป database Operator อาจ provision database instance จริงตอนที่ resource `Database` ถูกสร้าง ทำ backup เป็นระยะเพราะ resource บอกไว้แบบนั้น และจัดการ failover อัตโนมัติเมื่อ replica ตัวไหนไม่ healthy ถ้าไม่มี controller ตัวนี้ CRD ก็เป็นแค่รูปแบบที่ `kubectl` ยอมรับเท่านั้นเอง
+
+## ทำไมตรงนี้ programmatic client ถึงคุ้มค่าจริง ๆ
+
+ที่อื่นในคอร์สนี้ `kubectl apply` เพียงพออยู่แล้วเพราะมนุษย์รันมันครั้งเดียวแล้ว built-in controller ก็ทำต่อเอง controller ของ Operator ต่างออกไป มันต้องรันต่อเนื่อง ตอบสนองต่อทุก add, update, delete ของ custom resource ตราบเท่าที่ cluster ยังอยู่ นี่คือสถานการณ์ที่คำสั่ง CLI ครั้งเดียวรองรับไม่ได้ แต่ client แบบ programmatic ที่ watch อยู่ตลอดรองรับได้ การใช้ class `Watch` ของ `@kubernetes/client-node` เล็งไปที่ API path ของ custom resource เป็นวิธีที่สมจริงในการสร้าง reconciliation loop ซึ่งเป็นหัวใจของ Operator
+
+```typescript
+import * as k8s from '@kubernetes/client-node';
+
+const kc = new k8s.KubeConfig();
+kc.loadFromDefault();
+
+const watch = new k8s.Watch(kc);
+
+// Path for a namespace-scoped custom resource: /apis/{group}/{version}/namespaces/{namespace}/{plural}
+const path = '/apis/example.com/v1/namespaces/default/databases';
+
+async function reconcile(database: any) {
+  const name = database.metadata?.name;
+  const engine = database.spec?.engine;
+  const storageGB = database.spec?.storageGB;
+  console.log(`reconciling Database ${name}: engine=${engine} storageGB=${storageGB}`);
+  // Real controller: provision or update the actual database instance here
+}
+
+const req = await watch.watch(
+  path,
+  {},
+  (type, apiObj) => {
+    if (type === 'ADDED' || type === 'MODIFIED') {
+      reconcile(apiObj);
+    } else if (type === 'DELETED') {
+      console.log(`Database ${apiObj.metadata?.name} deleted, tearing down real instance`);
+    }
+  },
+  (err) => {
+    console.error('watch ended', err);
+  },
+);
+
+// Later, on shutdown:
+// req.abort();
+```
+
+ทุก event `ADDED` หรือ `MODIFIED` จะรัน reconcile step ใหม่อีกครั้ง ซึ่งเป็นแก่นของ Operator pattern เลย คือคอยเทียบ desired state (custom resource) กับ real state (infrastructure จริง) แล้วแก้ส่วนต่างไปเรื่อย ๆ โดยไม่ต้องให้มนุษย์มารันคำสั่งซ้ำ
+
+<Mermaid title="custom resource ป้อนเข้า watch-diff-act loop ของ Operator ซึ่งขับเคลื่อน database instance จริง" code={operatorLoopDiagram} />
+
+export const operatorLoopDiagram = `flowchart LR
+  cr["Database custom resource (desired state)"] -->|watch| ctrl["Operator controller"]
+  ctrl -->|diff| decide{"Does real state match spec?"}
+  decide -->|no| act["Provision, resize, or repair"]
+  decide -->|yes| noop["Do nothing this cycle"]
+  act --> infra["Real PostgreSQL instance"]
+  infra -->|status| ctrl`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**CustomResourceDefinition** ลงทะเบียน Kind ใหม่เข้ากับ Kubernetes API validate ด้วย **OpenAPI v3 schema** ทำให้สร้าง list และ watch ได้เหมือน built-in object ทุกอย่าง แต่แค่นั้นยังไม่เปลี่ยนอะไรในโลกจริง **Operator pattern** จับคู่ CRD นั้นกับ **controller** ที่รัน watch-diff-act reconciliation loop แบบเดียวกับ built-in controller ของ Kubernetes เอง เล็งไปที่ logic เฉพาะงาน operation และเพราะ controller ตัวนี้ต้องรันต่อเนื่องไม่ใช่ครั้งเดียว นี่คือกรณีที่ชัดที่สุดที่ **programmatic API client แบบ watch** คุ้มค่ากว่า `kubectl apply` แบบครั้งเดียว
+</Callout>
+
+export const quizOperators = [
+  {
+    q: 'CustomResourceDefinition เพิ่มอะไรให้กับ Kubernetes API',
+    options: [
+      'object Kind ใหม่ที่มี schema ของตัวเอง เก็บใน etcd และรองรับ kubectl กับ watch API เหมือน built-in object',
+      'built-in controller ตัวใหม่สำหรับ schedule Pod',
+      'ตัวแทน etcd datastore',
+      'network layer ใหม่สำหรับ Service',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'ทำไม CRD เดี่ยว ๆ ถึงยังไม่ทำให้อะไรกลายเป็น Operator',
+    options: [
+      'CRD validate ด้วย schema ไม่ได้',
+      'CRD เพิ่มแค่ schema กับที่เก็บสำหรับ Kind ใหม่ ไม่มี behavior ใด ๆ ต้องมี controller ที่ reconcile สถานะจริงคู่กันเท่านั้นถึงจะเป็น Operator',
+      'CRD สร้างได้เฉพาะ cluster administrator เท่านั้น',
+      'Operator ต้องใช้ Helm chart ส่วน CRD ไม่รองรับ Helm',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม controller ของ Operator ถึงต้องใช้ programmatic API client แบบ watch แทน kubectl apply ครั้งเดียว',
+    options: [
+      'kubectl apply สร้าง custom resource ไม่ได้เลย',
+      'controller ต้องรันต่อเนื่อง ตอบสนองต่อทุก add, update, delete ของ custom resource ตราบเท่าที่ cluster ยังอยู่ ซึ่งคำสั่งเดียวทำแบบนั้นไม่ได้',
+      'Kubernetes API server บังคับให้ custom resource ทุกตัวต้องใช้ watch-based client',
+      'kubectl apply ไม่รองรับไฟล์ YAML สำหรับ custom resource',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ใน Operator reconciliation loop หลังจาก controller diff desired state กับ real state แล้วจะเกิดอะไรขึ้น',
+    options: [
+      'มันจะลบ custom resource ทุกครั้ง',
+      'ถ้า real state ไม่ตรงกับ spec มันจะ act เพื่อแก้ส่วนต่าง ถ้าตรงแล้วก็ไม่ทำอะไรใน cycle นั้น',
+      'มันจะ restart API server ทันที',
+      'มันรอให้มนุษย์อนุมัติทุกการเปลี่ยนแปลงด้วยมือ',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/operators-and-custom-resources" questions={quizOperators} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/operators-and-custom-resources" />

@@ -1,0 +1,190 @@
+---
+title: 'Logging และ Metrics'
+description: 'kubectl logs กับ metrics-server ให้อะไรเรามาแบบพื้นฐาน และทำไม observability จริง ๆ ต้องมี logging stack แยกต่างหากบวกกับ Prometheus และ Grafana'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+Kubernetes ให้ logging กับ metrics มาแค่พอ debug Pod เดียว ณ ตอนนี้ได้ แต่ไม่มีอะไรที่ aggregate หรือเก็บข้อมูลข้ามทั้ง cluster ให้ นั่นคือ stack แยกที่ต้องเพิ่มเข้าไปเอง
+
+## kubectl logs: หน้าต่างของตอนนี้ ไม่ใช่หนังสือประวัติศาสตร์
+
+`kubectl logs` อ่าน stdout/stderr ของ container ตรงจากโหนดที่มันรันอยู่ เป็นวิธีเร็วที่สุดที่จะดูว่า Pod กำลังทำอะไรอยู่ ณ วินาทีนี้
+
+```bash
+# Stream logs live as they are written
+kubectl logs -f deploy/checkout
+
+# A Pod with more than one container: pick which one
+kubectl logs my-pod -c sidecar
+
+# The container just crashed and restarted: see its last words before it died
+kubectl logs my-pod --previous
+```
+
+`--previous` คือ flag ที่คนมักลืมแล้วดันเป็นตัวที่ต้องใช้ที่สุด เวลา container crash-loop log ของ container ตัว *ปัจจุบัน* จะว่างเปล่าตั้งแต่เริ่ม แต่ `--previous` จะโชว์ log ของ instance ที่เพิ่ง crash ไป ซึ่งปกติก็ตรงจุดที่มี stack trace อยู่พอดี
+
+ข้อจำกัดสำคัญคือ Kubernetes เองไม่ได้ aggregate หรือเก็บ log พวกนี้ให้ ถ้า Pod ถูกลบ log ของมันก็มักหายไปด้วย ไม่มี "ค้นหา log ข้ามทุก Pod ใน cluster" มาให้ในตัว งานนี้เป็นหน้าที่ของ logging stack แยกต่างหาก โดยทั่วไปจะเป็น node-level agent อย่าง **Fluent Bit** (หรือ Fluentd/Vector) ที่คอย tail log file ของทุก container แล้วส่งต่อไปยัง backend อย่าง **Loki** หรือ **Elasticsearch** ที่ค้นหาและเก็บข้อมูลระยะยาวได้
+
+```yaml
+# A minimal illustration: Fluent Bit runs as a DaemonSet so one agent per node
+# tails every container's logs and forwards them to a backend
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+spec:
+  selector:
+    matchLabels:
+      app: fluent-bit
+  template:
+    metadata:
+      labels:
+        app: fluent-bit
+    spec:
+      containers:
+        - name: fluent-bit
+          image: fluent/fluent-bit:3.1
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+```
+
+## metrics-server: พอสำหรับ kubectl top กับ autoscaling แค่นั้น
+
+**metrics-server** เป็น cluster add-on เบา ๆ ที่เก็บ CPU กับ memory usage จากทุก kubelet แล้วเก็บไว้ **ในหน่วยความจำเท่านั้น** ไม่มีประวัติ ไม่มีการ persist ไม่มี alerting มันมีไว้เพื่อขับเคลื่อนแค่สองอย่างนี้
+
+```bash
+kubectl top nodes
+kubectl top pods -n checkout
+```
+
+...และ **HorizontalPodAutoscaler** ที่ poll metrics-server เพื่อตัดสินใจว่าจะ scale Deployment ขึ้นหรือลง
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: checkout
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: checkout
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+metrics-server ไม่ใช่ monitoring solution ชัดเจน ถ้าถามว่า "CPU usage เมื่อสามชั่วโมงก่อนเป็นยังไง" หรือ "แจ้งเตือนตอน memory เกิน 90%" metrics-server ตอบไม่ได้เลย มันรู้แค่ snapshot ปัจจุบันเท่านั้น
+
+## Prometheus + Grafana: stack observability มาตรฐานที่ใช้กันจริง
+
+สำหรับ observability จริง ๆ ที่ต้องมีข้อมูลย้อนหลัง dashboard และ alerting ตัวมาตรฐานที่ใช้กันคือคู่ **Prometheus** กับ **Grafana**
+
+Prometheus ทำงานด้วยการ **scrape** คือดึง metrics เป็นระยะจาก HTTP endpoint `/metrics` ที่ workload เปิดไว้ในรูปแบบ text ของ Prometheus เอง แอปและ sidecar หลายตัวเปิด endpoint นี้เอง ส่วนสำหรับสถานะของ object ระดับ cluster (จำนวน replica ของ Deployment, phase ของ Pod, condition ของ node และอื่น ๆ) Prometheus จะ scrape **kube-state-metrics** ซึ่งเป็น service แยกที่แปลง object ของ Kubernetes API ให้กลายเป็น metrics ของ Prometheus
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: checkout
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9090"
+spec:
+  containers:
+    - name: checkout
+      image: checkout:2.3.0
+      ports:
+        - containerPort: 9090
+```
+
+```bash
+# A workload's own /metrics endpoint, in Prometheus text format
+curl http://checkout-pod:9090/metrics
+```
+
+Prometheus เก็บข้อมูลที่ scrape มาเป็น time series แล้วประเมินตาม alerting rule ที่ตั้งไว้ **Grafana** ทำหน้าที่เป็น visualization layer อยู่ด้านบน คือ query ไปที่ Prometheus แล้ว render ออกมาเป็น dashboard เช่นแนวโน้ม CPU/memory, request latency, error rate และใช้ขับเคลื่อนการแจ้งเตือนด้วย
+
+<Mermaid title="สอง pipeline คู่ขนาน: log ไป log backend และ metrics ไปทั้ง kubectl top/HPA และ Prometheus/Grafana" code={observabilityDiagram} />
+
+export const observabilityDiagram = `flowchart LR
+  subgraph Logs
+    stdout["Pod stdout/stderr"] --> agent["Node-level log agent\\n(Fluent Bit)"]
+    agent --> backend["Log backend\\n(Loki / Elasticsearch)"]
+  end
+  subgraph Metrics
+    cadvisor["kubelet cAdvisor"] --> ms["metrics-server\\n(in-memory)"]
+    ms --> top["kubectl top / HPA"]
+    workload["Workload /metrics\\n+ kube-state-metrics"] --> prom["Prometheus"]
+    prom --> grafana["Grafana dashboards"]
+  end`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+`kubectl logs` (พร้อม `-f`, `--previous`, และ `-c`) ให้หน้าต่างแบบ live ของ stdout/stderr ต่อ Pod แต่ Kubernetes เอง **ไม่** aggregate หรือ persist log ให้ ต้องมี node-level agent อย่าง **Fluent Bit** ส่งต่อไปยัง backend เช่น **Loki** หรือ **Elasticsearch** **metrics-server** เป็นตัวเก็บข้อมูลเบา ๆ ที่เก็บในหน่วยความจำเท่านั้น มีไว้ขับเคลื่อน `kubectl top` กับ **HorizontalPodAutoscaler** เพียงอย่างเดียว ไม่มีประวัติ ไม่มี alerting observability จริง ๆ มาจาก **Prometheus** ที่ scrape endpoint `/metrics` (บวกกับ **kube-state-metrics** สำหรับสถานะของ object ใน cluster) และ **Grafana** สำหรับ dashboard กับ alerting บนข้อมูล time-series นั้น
+</Callout>
+
+export const quizLoggingMetrics = [
+  {
+    q: 'Kubernetes aggregate และ persist log ของ Pod ข้ามทั้ง cluster ให้โดย default หรือไม่',
+    options: [
+      'ใช่ ทุกบรรทัดของ log ถูกเก็บไว้ที่ส่วนกลางถาวรโดยอัตโนมัติ',
+      'ไม่ kubectl logs อ่านตรงจากโหนด และ log มักหายไปเมื่อ Pod ถูกลบ ถ้าไม่ได้ตั้ง logging stack แยกไว้',
+      'อ่านได้เฉพาะ Pod ที่มี container มากกว่าหนึ่งตัวเท่านั้น',
+      'ทำได้เฉพาะ Pod ใน namespace kube-system เท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'metrics-server เหมาะกับงานแบบไหนที่สุด',
+    options: [
+      'dashboard ประวัติระยะยาวและการแจ้งเตือน',
+      'ขับเคลื่อน kubectl top และ HorizontalPodAutoscaler ด้วย metric ปัจจุบันที่เบาและอยู่ในหน่วยความจำ',
+      'aggregate log จากทุกโหนด',
+      'มาแทนที่ Prometheus ทั้งหมดใน production cluster',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'flag ไหนที่โชว์ log ของ container ที่เพิ่ง crash แล้ว restart',
+    options: [
+      '--follow',
+      '--tail',
+      '--previous',
+      '--restart',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'Prometheus กับ Grafana สัมพันธ์กับ metrics-server ยังไง',
+    options: [
+      'เป็นเครื่องมือตัวเดียวกันแค่คนละชื่อ',
+      'Prometheus กับ Grafana ให้ observability ที่มีประวัติ query ได้ และแจ้งเตือนได้ ด้วยการ scrape endpoint /metrics กับ kube-state-metrics ซึ่งไปไกลกว่า metrics-server ที่เก็บแค่ในหน่วยความจำมาก',
+      'Grafana มาแทนที่ kubelet',
+      'ต้องมี Prometheus ถึงจะใช้ kubectl top ได้',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="observability-and-security/logging-and-metrics" questions={quizLoggingMetrics} />
+
+<ProgressTracker client:visible id="observability-and-security/logging-and-metrics" />

@@ -1,0 +1,198 @@
+---
+title: 'Node Affinity, Taint และ Toleration'
+description: 'ความต่างระหว่าง nodeSelector node affinity และ pod affinity/anti-affinity และวิธีที่ taint กับ toleration ผลัก Pod ออกจาก Node เว้นแต่จะอนุญาตชัดเจน'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**Affinity** ดึง Pod เข้าหา Node (หรือ Pod อื่น) บางตัว ส่วน **taint** ผลัก Pod ออกจาก Node เว้นแต่ Pod จะมี **toleration** ที่ match — สองกลไกที่ทำงานคนละทิศทาง และมักถูกใช้ร่วมกัน
+
+## nodeSelector กับ node affinity: match บน label ของ Node
+
+วิธีง่ายสุดในการจำกัดว่า Pod รันที่ไหนคือ `nodeSelector` — match แบบ exact กับ label ของ Node ถ้า Node ไม่มีทุก label ที่ระบุไว้ มันจะไม่ถูกนับเป็นตัวเลือกเลย
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-inference
+spec:
+  nodeSelector:
+    hardware: gpu
+  containers:
+    - name: inference
+      image: inference-server:2.1.0
+```
+
+**Node affinity** ทำงานแบบเดียวกันแต่ใช้ expression ที่ยืดหยุ่นกว่า (`In`, `NotIn`, `Exists` และอื่น ๆ) และที่สำคัญคือเลือกได้ว่ากฎนั้นเข้มงวดแค่ไหน
+
+- **`requiredDuringSchedulingIgnoredDuringExecution`** — ข้อบังคับแบบแข็ง ถ้าไม่มี Node ไหนตรงเงื่อนไข Pod จะค้างอยู่ที่ Pending
+- **`preferredDuringSchedulingIgnoredDuringExecution`** — ความชอบแบบอ่อนพร้อม `weight` scheduler จะเลือก Node ที่ match ก่อน แต่ถ้าจำเป็นก็ยังวาง Pod ที่อื่นได้
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-inference-affinity
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: hardware
+                operator: In
+                values:
+                  - gpu
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 80
+          preference:
+            matchExpressions:
+              - key: topology.kubernetes.io/zone
+                operator: In
+                values:
+                  - us-central1-a
+  containers:
+    - name: inference
+      image: inference-server:2.1.0
+```
+
+ทั้งสอง suffix ลงท้ายด้วย `IgnoredDuringExecution` หมายความว่าเมื่อ Pod รันอยู่แล้ว การเปลี่ยน label ของ Node ภายหลังจะไม่ทำให้ Pod ถูก evict — กฎพวกนี้มีผลแค่ตอนตัดสินใจ schedule ครั้งแรกเท่านั้น
+
+## Pod affinity กับ anti-affinity: schedule โดยอ้างอิง Pod อื่น
+
+Node affinity มองที่ label ของ Node ส่วน **pod affinity** และ **pod anti-affinity** มองที่ label ของ *Pod อื่นที่รันอยู่แล้ว* แทน โดยใช้ `topologyKey` เพื่อนิยามว่า "ใกล้กัน" หมายถึงอะไร (hostname, zone และอื่น ๆ) การใช้ที่พบบ่อยที่สุดคือกระจาย replica ของ app เดียวกันออกจากกันเพื่อความทนทาน
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - web-app
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: web-app
+          image: web-app:3.2.0
+```
+
+กฎ anti-affinity นี้บอก scheduler ว่า "ห้ามวาง Pod ของ `web-app` สองตัวบน host เดียวกัน" — เสีย Node ไปหนึ่งตัวจะไม่มีทางกระทบเกินหนึ่ง replica กรณีตรงข้ามคือ **pod affinity** ซึ่งเอา Pod มาอยู่ใกล้กันแทน เช่น ปัก cache sidecar ไว้บน Node เดียวกับ service ที่อ่านมันเพื่อตัด traffic นั้นออกจาก network ไปเลย
+
+## Taint กับ toleration: Node ที่ผลัก Pod ออก
+
+Affinity คือ Pod เป็นฝ่ายตัดสินใจว่าอยากไปไหน **taint** กลับด้านตรงข้าม — มันถูกตั้งบน **Node** และผลัก Pod ทุกตัวที่ไม่มี **toleration** ที่ match ออกไป
+
+```bash
+# Taint a node so it repels ordinary Pods
+kubectl taint nodes gpu-node-1 hardware=gpu:NoSchedule
+```
+
+taint effect มีสามระดับ เรียงจากอ่อนไปแรง
+
+- **`NoSchedule`** — Pod ใหม่ที่ไม่มี toleration ที่ match จะไม่ถูก schedule ที่นี่ Pod ที่รันอยู่แล้วไม่ถูกแตะ
+- **`PreferNoSchedule`** — เวอร์ชันอ่อน scheduler จะพยายามเลี่ยง Node นี้ แต่ถ้าจำเป็นก็ยังใช้ได้
+- **`NoExecute`** — Pod ใหม่ถูกกันไว้ *และ* Pod ที่รันอยู่บน Node นั้นที่ไม่มี toleration ที่ match จะถูก evict ด้วย
+
+Pod เข้าร่วมได้ด้วยการใส่ `tolerations` ที่ match key, value และ effect ของ taint
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-inference-toleration
+spec:
+  tolerations:
+    - key: hardware
+      operator: Equal
+      value: gpu
+      effect: NoSchedule
+  nodeSelector:
+    hardware: gpu
+  containers:
+    - name: inference
+      image: inference-server:2.1.0
+```
+
+toleration แค่หักล้าง taint เท่านั้น มันไม่ได้ดึง Pod ไปที่นั่น นี่คือเหตุผลที่ node pool เฉพาะสำหรับ GPU มักสร้างจากสองกลไกพร้อมกัน: Node ถูก taint ไว้ให้ Pod ทั่วไปอยู่ห่าง ๆ ส่วน Pod ของ GPU workload ทั้ง tolerate taint นั้นและใช้ `nodeSelector` (หรือ node affinity) เพื่อขอ schedule ไปที่นั่น พร้อมกับ request GPU resource ด้วย
+
+<Mermaid title="A taint repels an ordinary Pod while a Pod with a matching toleration is allowed through" code={taintRepelDiagram} />
+
+export const taintRepelDiagram = `flowchart LR
+  node["Node: gpu-node-1\\n(tainted hardware=gpu:NoSchedule)"]
+  podA["Pod A: no toleration"] -- blocked --> node
+  podB["Pod B: tolerates hardware=gpu"] -- scheduled --> node`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**Node affinity** ดึง Pod เข้าหา Node แบบแข็งด้วย **`requiredDuringSchedulingIgnoredDuringExecution`** หรือแบบอ่อนด้วย **`preferredDuringSchedulingIgnoredDuringExecution`** ส่วน **pod affinity/anti-affinity** ทำแบบเดียวกันแต่อ้างอิง Pod อื่น มักใช้กระจาย replica ออกจากกัน **taint** บน Node ทำงานตรงข้าม — มัน **ผลัก** Pod ออกเว้นแต่จะมี **toleration** ที่ match ด้วย effect **`NoSchedule`**, **`PreferNoSchedule`** และ **`NoExecute`** (ซึ่ง evict Pod ที่รันอยู่แล้วด้วย) node pool เฉพาะทางมักรวมทั้งสองอย่างเข้าด้วยกัน: taint กัน Pod ทั่วไปออก ส่วน affinity บวก toleration ดึง Pod ที่ถูกต้องเข้ามา
+</Callout>
+
+export const quizAffinity = [
+  {
+    q: 'requiredDuringSchedulingIgnoredDuringExecution กับ preferredDuringSchedulingIgnoredDuringExecution ของ node affinity ต่างกันอย่างไร',
+    options: [
+      'ทำงานเหมือนกันทุกอย่าง แค่ syntax ต่างกัน',
+      'required คือข้อบังคับแบบแข็งที่ทำให้ Pod ค้างที่ Pending ถ้าไม่ผ่าน ส่วน preferred คือความชอบแบบอ่อนที่ scheduler พยายามทำตาม',
+      'required ใช้ได้กับ taint เท่านั้น preferred ใช้ได้กับ label เท่านั้น',
+      'preferred เข้มงวดกว่า required',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Node มี taint effect เป็น NoExecute จะเกิดอะไรกับ Pod ที่รันอยู่บน Node นั้นแล้วโดยไม่มี toleration ที่ match',
+    options: [
+      'ไม่มีอะไรเกิดขึ้น NoExecute กันแค่ Pod ใหม่',
+      'มันถูก evict ออกจาก Node',
+      'มันได้ toleration ให้อัตโนมัติ',
+      'taint จะถูกมองข้ามสำหรับ Pod ที่รันอยู่แล้วตลอดไป',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ความต่างด้านทิศทางหลักระหว่าง affinity กับ taint/toleration คืออะไร',
+    options: [
+      'เป็นกลไกเดียวกันแค่ชื่อต่างกัน',
+      'affinity ดึง Pod เข้าหา Node บางตัว ส่วน taint ผลัก Pod ออกจาก Node เว้นแต่จะ tolerate',
+      'affinity ใช้ได้กับ Node เท่านั้น taint ใช้ได้กับ Pod เท่านั้น',
+      'taint ดึง Pod เข้ามา affinity ผลักออก',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'podAntiAffinity ที่ใช้ topologyKey: kubernetes.io/hostname ทำอะไรให้ Deployment โดยทั่วไป',
+    options: [
+      'บังคับให้ replica ทั้งหมดไปอยู่ Node เดียว',
+      'กระจาย replica ไปยัง Node ต่างกัน ทำให้ Node เสียหนึ่งตัวไม่กระทบเกินหนึ่ง replica',
+      'ลบ Pod ที่ซ้ำกันอัตโนมัติ',
+      'ปิดการ schedule ของ Deployment ทั้งหมด',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="scheduling-and-scaling/node-affinity-taints-and-tolerations" questions={quizAffinity} />
+
+<ProgressTracker client:visible id="scheduling-and-scaling/node-affinity-taints-and-tolerations" />

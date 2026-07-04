@@ -1,0 +1,134 @@
+---
+title: 'Service: ClusterIP, NodePort, LoadBalancer'
+description: 'วิธีที่ Service ให้ virtual IP กับ DNS name ที่เสถียรกับ Pod และความต่างในทางปฏิบัติของ ClusterIP, NodePort กับ LoadBalancer'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**Service** ให้กลุ่ม Pod ที่เปลี่ยนไปเรื่อย ๆ มี virtual IP กับ DNS name เดียวที่เสถียร แล้ว load balance traffic ไปยัง Pod ที่ match และ healthy อยู่ในขณะนั้น
+
+## ปัญหา: Pod IP ไม่เสถียร
+
+Pod เป็นของใช้แล้วทิ้ง Deployment ย้าย Pod ที่ crash ไปโหนดอื่น rollout แทนที่ Pod ทุกตัวด้วยตัวใหม่ และ cluster autoscaler เพิ่มลดโหนดไปเรื่อย ๆ เหตุการณ์พวกนี้แต่ละอย่างทำให้ Pod ได้ IP ใหม่ได้ตลอด อะไรก็ตามที่ hardcode Pod IP ไว้จะพังทันทีที่ Pod นั้นถูกแทนที่
+
+**Service** แก้ปัญหานี้ด้วยการยืนอยู่หน้ากลุ่ม Pod มันเลือกสมาชิกด้วย **label selector** และติดตามว่า Pod ไหนพร้อมใช้งานอยู่ผ่าน **Endpoints** object (หรือ **EndpointSlice** ซึ่งเป็นเวอร์ชันใหม่ที่ scale ได้ดีกว่า) พอ Pod เกิดหรือหายไป controller จะอัปเดต Endpoints/EndpointSlice ให้อัตโนมัติ client ไม่ต้องรู้เรื่องนี้เลย
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments
+spec:
+  selector:
+    app: payments
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+```bash
+# See which Pods this Service is currently routing to
+kubectl get endpoints payments
+kubectl get endpointslices -l kubernetes.io/service-name=payments
+```
+
+Pod ตัวไหนก็ตามที่ label ตรงกับ `app: payments` และผ่าน readiness probe จะถูกเพิ่มเข้าลิสต์นี้อัตโนมัติ ลบ Pod ทิ้งมันก็หลุดจากลิสต์ Pod ตัวใหม่ที่ label เดียวกันก็ถูกเพิ่มกลับเข้ามาแทน โดยที่ IP กับ DNS name ของ Service ไม่เปลี่ยนเลย
+
+## Service สามแบบ ต่อยอดกันเป็นชั้น ๆ
+
+`spec.type` กำหนดว่า Service ถูกเข้าถึงยังไง และสามแบบหลักที่ใช้กันบ่อยต่อยอดกันเป็นขั้นบันได แต่ละแบบสร้างบนแบบก่อนหน้า
+
+- **ClusterIP** (ค่า default) virtual IP ที่เข้าถึงได้แค่จากภายใน cluster การสื่อสารระหว่าง Pod ส่วนใหญ่ใช้แบบนี้
+- **NodePort** ทำทุกอย่างที่ ClusterIP ทำ บวกกับเปิด port เดียวกันบนทุกโหนดใน cluster อยู่ในช่วง `30000`-`32767` โดย default ยิงไปที่ `<ip-โหนดไหนก็ได้>:<nodePort>` ก็เข้าถึง Service จากนอก cluster ได้
+- **LoadBalancer** ทำทุกอย่างที่ NodePort ทำ บวกกับให้ cluster ขอ cloud provider provision external load balancer ที่ forward ต่อไปยัง NodePort
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments-public
+spec:
+  type: LoadBalancer
+  selector:
+    app: payments
+  ports:
+    - port: 80
+      targetPort: 8080
+      nodePort: 30080
+```
+
+```bash
+kubectl get svc payments-public
+# EXTERNAL-IP column is populated once the cloud provider finishes provisioning
+```
+
+## kube-proxy คือตัวที่ทำให้ virtual IP ใช้งานได้จริง
+
+ClusterIP ของ Service ไม่ได้มี network interface จริงอยู่ที่ไหนเลย มันเป็นแค่ address เสมือน **kube-proxy** ที่รันอยู่บนทุกโหนดคอย watch API server ดู Service กับ Endpoints/EndpointSlice แล้วเขียน rule ในเครื่อง (ปกติเป็น `iptables` หรือ `IPVS` แล้วแต่ mode ที่ตั้งไว้) เพื่อให้ packet ที่ส่งไปหา virtual IP ถูก rewrite แล้วส่งต่อไปยัง Pod ตัวใดตัวหนึ่งที่อยู่เบื้องหลังโดยอัตโนมัติ นี่คือเหตุผลที่ Service ทำงานเหมือนกันไม่ว่า client Pod จะอยู่โหนดไหน
+
+<Mermaid title="Client เข้าถึง virtual IP ของ Service ผ่าน kube-proxy ไปยัง Pod ที่อยู่เบื้องหลัง" code={serviceRoutingDiagram} />
+
+export const serviceRoutingDiagram = `flowchart LR
+  client["Client Pod"] --> vip["Service virtual IP\\n(ClusterIP)"]
+  vip --> kp["kube-proxy rules\\n(iptables / IPVS)"]
+  kp --> p1["Pod 1"]
+  kp --> p2["Pod 2"]
+  kp --> p3["Pod 3"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**Service** ให้กลุ่ม Pod ที่เกิดดับตลอดเวลามี virtual IP กับ DNS name ที่เสถียร เลือกสมาชิกด้วย **label selector** และติดตามผ่าน **Endpoints/EndpointSlice** **ClusterIP** ใช้ได้แค่ภายใน **NodePort** เพิ่มการเปิด port (30000-32767) บนทุกโหนด และ **LoadBalancer** เพิ่ม external cloud load balancer มาไว้หน้า NodePort **kube-proxy** บนทุกโหนดคือตัวที่ทำให้ virtual IP ใช้งานได้จริง ด้วย rule แบบ iptables หรือ IPVS ที่ route ไปยัง Pod เบื้องหลัง
+</Callout>
+
+export const quizServiceTypes = [
+  {
+    q: 'ทำไม Kubernetes ต้องมี Service object ทั้งที่ Pod แต่ละตัวก็มี IP ของตัวเองอยู่แล้ว',
+    options: [
+      'Service ทำให้ Pod start เร็วขึ้น',
+      'Pod IP เปลี่ยนทุกครั้งที่ Pod ถูก reschedule หรือแทนที่ เลยต้องมีอะไรสักอย่างให้ address ที่เสถียร',
+      'Service เป็นสิ่งจำเป็นถึงจะทำให้ Pod มี IP ได้',
+      'Service มาแทนที่การใช้ label บน Pod',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ความต่างในทางปฏิบัติระหว่าง NodePort กับ ClusterIP คืออะไร',
+    options: [
+      'NodePort ใช้ได้แค่ traffic ภายใน ส่วน ClusterIP ใช้ได้แค่ traffic ภายนอก',
+      'NodePort ทำทุกอย่างที่ ClusterIP ทำ บวกกับเปิด port เดียวกันบนทุกโหนดเพื่อให้เข้าถึง Service จากนอก cluster ได้',
+      'มันเหมือนกันเป๊ะ แค่ชื่อต่างกัน',
+      'ClusterIP ต้องมี cloud provider ส่วน NodePort ไม่ต้อง',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Service ตัดสินใจยังไงว่า Pod ตัวไหนอยู่เบื้องหลังตัวมันในตอนนี้',
+    options: [
+      'ดูจาก timestamp ที่ Pod ถูกสร้าง',
+      'ด้วย label selector ที่ติดตามผ่าน Endpoints หรือ EndpointSlice ที่อัปเดตอัตโนมัติ',
+      'ด้วยลิสต์ Pod IP ที่ตายตัว เขียนไว้ครั้งเดียวตอนสร้าง Service',
+      'ดูจากโหนดที่ Pod ถูก schedule ไป',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'component ไหนที่ทำให้ Service ClusterIP กลายเป็น traffic ที่เข้าถึงได้จริงบนแต่ละโหนด',
+    options: [
+      'kubelet',
+      'CoreDNS',
+      'kube-proxy ด้วย rule แบบ iptables หรือ IPVS',
+      'scheduler',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="networking/services-clusterip-nodeport-loadbalancer" questions={quizServiceTypes} />
+
+<ProgressTracker client:visible id="networking/services-clusterip-nodeport-loadbalancer" />

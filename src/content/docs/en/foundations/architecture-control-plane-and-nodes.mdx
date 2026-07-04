@@ -1,0 +1,120 @@
+---
+title: 'Architecture: Control Plane and Nodes'
+description: 'The control plane and node components that make a Kubernetes cluster work, and why the API server is the only door to etcd.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A cluster's control plane makes decisions and holds state, while its nodes run Pods, and every one of those decisions and every byte of that state passes through a single front door: the API server.
+
+## The control plane: the brain
+
+The control plane is a small set of components, usually run together, that together decide what should happen in the cluster and remember what has already been decided.
+
+- **kube-apiserver** is the front door of the cluster. It exposes a REST API that every other component — and every `kubectl` command you run — talks to. It validates and authenticates requests, and it is the *only* component that talks directly to etcd.
+- **etcd** is a distributed, consistent key-value store that holds all cluster state: every object you have created, its current status, everything. If etcd is lost without a backup, the cluster's memory is lost with it.
+- **kube-scheduler** watches for newly created Pods that have no node assigned yet, and decides which node each one should run on, based on resource requirements, constraints, and current cluster load.
+- **kube-controller-manager** runs the built-in controllers as a single process — the node controller (notices when nodes go unreachable), the replication controller (keeps the right number of Pod replicas running), the endpoint controller (keeps Service endpoints up to date), and others. This is where the reconciliation loops from the previous lesson actually live.
+- **cloud-controller-manager** is optional, and only present on managed cloud clusters — it integrates cluster-level concerns like load balancers and node lifecycle with the underlying cloud provider's API.
+
+You can see the control plane's own Pods on a kubeadm-style cluster like any other workload:
+
+```bash
+kubectl get pods -n kube-system
+```
+
+## Node components: where Pods actually run
+
+Every node in the cluster runs three things:
+
+- **kubelet** is the node agent. It is the component that actually ensures the containers described in the Pod specs assigned to this node are running and healthy — it starts them, restarts them if they die, runs their probes, and reports the node's and its Pods' status back to the API server. Nothing runs on a node without kubelet making it happen.
+- **kube-proxy** maintains the network rules on the node that make Services work — routing traffic addressed to a Service's virtual IP to one of the matching Pods, wherever they happen to be running.
+- A **container runtime**, such as containerd or CRI-O, is what actually pulls images and runs containers, speaking to kubelet through the **Container Runtime Interface (CRI)**.
+
+Inspect a node's components and status directly:
+
+```bash
+kubectl describe node <node-name>
+```
+
+## Everything talks to etcd through the API server
+
+This is the architectural fact worth memorizing: **kube-scheduler, kube-controller-manager, kubelet, and everything else never touch etcd directly.** They all read and write cluster state exclusively by calling the API server, which is the single source of truth and authority for the entire cluster. This gives Kubernetes one consistent point for authentication, authorization, validation, and watch notifications — every controller and every kubelet is really just a client of the same REST API you use with `kubectl`.
+
+<Mermaid title="Control plane and node components, and the single path to etcd" code={architectureDiagram} />
+
+export const architectureDiagram = `flowchart TB
+  subgraph cp["Control Plane"]
+    api["kube-apiserver"]
+    etcd["etcd"]
+    sched["kube-scheduler"]
+    cm["kube-controller-manager"]
+  end
+  subgraph n1["Node"]
+    kubelet["kubelet"]
+    proxy["kube-proxy"]
+    cri["container runtime (containerd / CRI-O)"]
+  end
+  sched --> api
+  cm --> api
+  api --> etcd
+  kubelet --> api
+  proxy --> api`;
+
+<Callout title="The one-line takeaway">
+The **control plane** — **kube-apiserver**, **etcd**, **kube-scheduler**, and **kube-controller-manager** (plus an optional **cloud-controller-manager**) — decides what should happen and remembers all cluster state, while each **node** runs **kubelet** (which actually starts and watches containers), **kube-proxy** (which makes Services reachable), and a **container runtime** speaking **CRI**; every one of these components, without exception, reads and writes state only through the **API server**, which is the sole gateway to **etcd**.
+</Callout>
+
+export const quizArchitecture = [
+  {
+    q: 'What does etcd store?',
+    options: [
+      'Only container images pulled by nodes',
+      'Application log output from every Pod',
+      'All cluster state, as a distributed, consistent key-value store',
+      'The credentials used to authenticate to kubectl',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'What is kubelet responsible for on a node?',
+    options: [
+      'Routing traffic between Services and their Pods',
+      'Deciding which node a new Pod should be scheduled to',
+      'Ensuring the containers described in Pod specs assigned to its node are running and healthy, and reporting status back',
+      'Storing the cluster manifests submitted with kubectl apply',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'Which component decides which node a newly created Pod is scheduled to?',
+    options: [
+      'kubelet',
+      'kube-proxy',
+      'etcd',
+      'kube-scheduler',
+    ],
+    answer: 3,
+  },
+  {
+    q: 'Why is the API server the only component that talks directly to etcd?',
+    options: [
+      'etcd cannot accept connections from more than one client at a time',
+      'It keeps a single, authenticated, authoritative path to all cluster state so every other component reads and writes through one consistent interface',
+      'etcd is deprecated and is only kept for backups',
+      'kube-scheduler requires exclusive write access to function',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="foundations/architecture-control-plane-and-nodes" questions={quizArchitecture} />
+
+<ProgressTracker client:visible id="foundations/architecture-control-plane-and-nodes" />

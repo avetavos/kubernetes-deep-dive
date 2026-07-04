@@ -1,0 +1,190 @@
+---
+title: 'Logging and Metrics'
+description: 'What kubectl logs and metrics-server actually give you out of the box, and why real observability needs a dedicated logging stack plus Prometheus and Grafana.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+Kubernetes gives you just enough logging and metrics out of the box to debug a single Pod right now, but nothing that aggregates or retains data across the cluster — that is a separate stack you have to add yourself.
+
+## kubectl logs: a live window, not a history book
+
+`kubectl logs` reads a container's stdout/stderr directly from the node it is running on. It is the fastest way to look at what a Pod is doing right this moment:
+
+```bash
+# Stream logs live as they are written
+kubectl logs -f deploy/checkout
+
+# A Pod with more than one container: pick which one
+kubectl logs my-pod -c sidecar
+
+# The container just crashed and restarted: see its last words before it died
+kubectl logs my-pod --previous
+```
+
+`--previous` is the one people forget about and then need most: when a container crash-loops, the *current* container's logs start empty, but `--previous` shows you the logs from the instance that just crashed — usually exactly where the stack trace is.
+
+The important limitation: Kubernetes itself does **not** aggregate or persist these logs. If a Pod is deleted, its logs typically go with it. There is no built-in "search logs across every Pod in the cluster." That job belongs to a separate logging stack — commonly a node-level agent such as **Fluent Bit** (or Fluentd/Vector) that tails every container's log files and ships them to a backend like **Loki** or **Elasticsearch**, where they can be searched and retained long-term.
+
+```yaml
+# A minimal illustration: Fluent Bit runs as a DaemonSet so one agent per node
+# tails every container's logs and forwards them to a backend
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+spec:
+  selector:
+    matchLabels:
+      app: fluent-bit
+  template:
+    metadata:
+      labels:
+        app: fluent-bit
+    spec:
+      containers:
+        - name: fluent-bit
+          image: fluent/fluent-bit:3.1
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+```
+
+## metrics-server: enough for kubectl top and autoscaling, nothing more
+
+**metrics-server** is a lightweight cluster add-on that collects CPU and memory usage from every kubelet and holds it **in memory only** — no history, no persistence, no alerting. It exists to power exactly two things:
+
+```bash
+kubectl top nodes
+kubectl top pods -n checkout
+```
+
+...and the **HorizontalPodAutoscaler**, which polls metrics-server to decide whether to scale a Deployment up or down:
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: checkout
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: checkout
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+metrics-server is explicitly **not** a monitoring solution — if you ask "what was CPU usage three hours ago" or "alert me when memory crosses 90%", metrics-server has no answer. It only knows the current snapshot.
+
+## Prometheus + Grafana: the de facto observability stack
+
+For real observability — historical data, dashboards, alerting — the standard combination is **Prometheus** and **Grafana**.
+
+Prometheus works by **scraping**: it periodically pulls metrics from an HTTP `/metrics` endpoint that a workload exposes in Prometheus's own text format. Many applications and sidecars expose this endpoint themselves; for cluster-level object state (Deployment replica counts, Pod phases, node conditions, and so on) Prometheus scrapes **kube-state-metrics**, a separate service that turns Kubernetes API objects into Prometheus metrics.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: checkout
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9090"
+spec:
+  containers:
+    - name: checkout
+      image: checkout:2.3.0
+      ports:
+        - containerPort: 9090
+```
+
+```bash
+# A workload's own /metrics endpoint, in Prometheus text format
+curl http://checkout-pod:9090/metrics
+```
+
+Prometheus stores this scraped data as a time series and evaluates alerting rules against it. **Grafana** then sits on top as the visualization layer, querying Prometheus to render dashboards — CPU/memory trends, request latency, error rates — and to drive alert notifications.
+
+<Mermaid title="Two parallel pipelines: logs to a log backend, metrics to kubectl top/HPA and to Prometheus/Grafana" code={observabilityDiagram} />
+
+export const observabilityDiagram = `flowchart LR
+  subgraph Logs
+    stdout["Pod stdout/stderr"] --> agent["Node-level log agent\\n(Fluent Bit)"]
+    agent --> backend["Log backend\\n(Loki / Elasticsearch)"]
+  end
+  subgraph Metrics
+    cadvisor["kubelet cAdvisor"] --> ms["metrics-server\\n(in-memory)"]
+    ms --> top["kubectl top / HPA"]
+    workload["Workload /metrics\\n+ kube-state-metrics"] --> prom["Prometheus"]
+    prom --> grafana["Grafana dashboards"]
+  end`;
+
+<Callout title="The one-line takeaway">
+`kubectl logs` (with `-f`, `--previous`, and `-c`) gives you a live, per-Pod window into stdout/stderr, but Kubernetes does **not** aggregate or persist logs itself — that needs a node-level agent like **Fluent Bit** shipping to a backend such as **Loki** or **Elasticsearch**. **metrics-server** is a lightweight, in-memory-only collector that exists solely to power `kubectl top` and the **HorizontalPodAutoscaler** — it has no history and no alerting. Real observability comes from **Prometheus** scraping `/metrics` endpoints (plus **kube-state-metrics** for cluster object state) and **Grafana** for dashboards and alerting on top of that time-series data.
+</Callout>
+
+export const quizLoggingMetrics = [
+  {
+    q: 'Does Kubernetes aggregate and persist Pod logs across the cluster by default?',
+    options: [
+      'Yes, every log line is automatically stored centrally forever',
+      'No, kubectl logs reads directly from the node and logs are typically lost when the Pod is deleted, unless a separate logging stack is set up',
+      'Only if the Pod has more than one container',
+      'Only for Pods in the kube-system namespace',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is metrics-server best suited for?',
+    options: [
+      'Long-term historical dashboards and alerting',
+      'Powering kubectl top and the HorizontalPodAutoscaler using lightweight, in-memory current metrics',
+      'Aggregating logs from every node',
+      'Replacing Prometheus entirely in production clusters',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What flag shows the logs of a container that just crashed and was restarted?',
+    options: [
+      '--follow',
+      '--tail',
+      '--previous',
+      '--restart',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'How do Prometheus and Grafana relate to metrics-server?',
+    options: [
+      'They are the same tool under different names',
+      'Prometheus and Grafana provide historical, queryable, alertable observability by scraping /metrics endpoints and kube-state-metrics, going far beyond what the in-memory-only metrics-server offers',
+      'Grafana replaces the kubelet',
+      'Prometheus is required for kubectl top to work',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="observability-and-security/logging-and-metrics" questions={quizLoggingMetrics} />
+
+<ProgressTracker client:visible id="observability-and-security/logging-and-metrics" />

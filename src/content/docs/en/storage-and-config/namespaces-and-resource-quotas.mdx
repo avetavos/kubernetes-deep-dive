@@ -1,0 +1,154 @@
+---
+title: 'Namespaces and Resource Quotas'
+description: 'Dividing one cluster among teams without giving anyone network isolation for free.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A **Namespace** divides a single cluster's objects and names among multiple users, teams, or projects, but it does not divide the network — that takes a NetworkPolicy.
+
+## What a namespace actually scopes
+
+A Namespace scopes object **names**: `Deployment web` in namespace `team-a` and `Deployment web` in namespace `team-b` are two completely unrelated objects that happen to share a name. Namespaces are also the unit that **RBAC** (covered in a later module) is usually scoped to, so a team's permissions can be limited to the namespace they own rather than the whole cluster.
+
+What a Namespace does **not** give you is network isolation. By default, a Pod in `team-a` can still send traffic to a Pod in `team-b` — namespaces are a naming and organizational boundary, not a network boundary. If you need to stop that traffic, you need a **NetworkPolicy**, covered in the Networking module.
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-a
+```
+
+```bash
+kubectl create namespace team-a
+kubectl config set-context --current --namespace=team-a
+```
+
+## Not everything lives inside a namespace
+
+Some objects are **cluster-scoped** — they exist outside any namespace entirely, because they describe cluster-wide concepts rather than something owned by one team. **Nodes**, **PersistentVolumes**, and **ClusterRoles** are all cluster-scoped. Most everyday objects — Pods, Deployments, Services, ConfigMaps, PersistentVolumeClaims — are namespaced.
+
+```bash
+# List objects that live outside any namespace
+kubectl api-resources --namespaced=false
+```
+
+## ResourceQuota: capping a namespace's total consumption
+
+A **ResourceQuota** caps the aggregate resource consumption of an entire namespace — total CPU and memory requests and limits across every Pod in it, and/or total object counts such as the maximum number of Pods, Services, or PersistentVolumeClaims.
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-a-quota
+  namespace: team-a
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+    pods: "50"
+    persistentvolumeclaims: "10"
+```
+
+## LimitRange: bounding individual Pods and containers
+
+A ResourceQuota caps the namespace as a whole, but says nothing about any single Pod. Without a per-object bound, one unbounded Pod could request enough CPU and memory to consume an entire namespace's ResourceQuota by itself, starving everyone else in that namespace. A **LimitRange** closes that gap by setting default, minimum, and maximum requests/limits for individual Pods and containers created in the namespace.
+
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: team-a-limits
+  namespace: team-a
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 250m
+        memory: 256Mi
+      max:
+        cpu: "2"
+        memory: 2Gi
+      min:
+        cpu: 100m
+        memory: 128Mi
+```
+
+<Mermaid title="Two namespaces, each bounded by its own ResourceQuota and LimitRange" code={namespaceQuotaDiagram} />
+
+export const namespaceQuotaDiagram = `flowchart LR
+  subgraph cluster["Cluster"]
+    subgraph nsa["Namespace: team-a"]
+      qa["ResourceQuota"] --- la["LimitRange"]
+      pa1["Pod"] --- pa2["Pod"]
+    end
+    subgraph nsb["Namespace: team-b"]
+      qb["ResourceQuota"] --- lb["LimitRange"]
+      pb1["Pod"] --- pb2["Pod"]
+    end
+  end`;
+
+<Callout title="The one-line takeaway">
+A **Namespace** scopes object names and is usually the boundary RBAC is applied at, but it provides **no network isolation** by itself — that requires a NetworkPolicy. Some objects, like **Nodes**, **PersistentVolumes**, and **ClusterRoles**, are **cluster-scoped** and live outside any namespace, while most everyday objects are namespaced. A **ResourceQuota** caps a namespace's aggregate CPU/memory and object counts, while a **LimitRange** bounds the defaults, minimums, and maximums for individual Pods and containers — without it, a single unbounded Pod could consume an entire namespace's quota alone.
+</Callout>
+
+export const quizNamespaceQuota = [
+  {
+    q: 'By default, what do namespaces NOT provide between Pods in different namespaces',
+    options: [
+      'Unique object names',
+      'Network isolation — Pods in different namespaces can still reach each other unless a NetworkPolicy says otherwise',
+      'A scope for RBAC permissions',
+      'A way to organize objects by team',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which of these objects is cluster-scoped rather than namespaced',
+    options: [
+      'Deployment',
+      'ConfigMap',
+      'Node',
+      'PersistentVolumeClaim',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'What does a ResourceQuota control that a LimitRange does not',
+    options: [
+      'The default CPU request of a single container',
+      'The aggregate resource consumption and object counts across the entire namespace',
+      'The minimum memory limit of an individual Pod',
+      'The maximum CPU limit of an individual container',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does a namespace need a LimitRange in addition to a ResourceQuota',
+    options: [
+      'A LimitRange replaces the need for a ResourceQuota entirely',
+      'Without a LimitRange, a single unbounded Pod could request enough resources to consume the entire namespace ResourceQuota by itself',
+      'A LimitRange is required before any Pod can be created in a namespace',
+      'A LimitRange enables network isolation between namespaces',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="storage-and-config/namespaces-and-resource-quotas" questions={quizNamespaceQuota} />
+
+<ProgressTracker client:visible id="storage-and-config/namespaces-and-resource-quotas" />

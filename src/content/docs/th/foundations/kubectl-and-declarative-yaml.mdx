@@ -1,0 +1,125 @@
+---
+title: 'kubectl และ Declarative YAML'
+description: 'วิธีคุยกับ cluster ด้วย kubectl สี่ field หลักที่ manifest ทุกอันมี และ label กับ selector เชื่อม object เข้าด้วยกันได้อย่างไร'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียหลักในหนึ่งประโยค
+
+`kubectl` คือวิธีที่คุณส่ง desired state ให้ cluster และตรวจดูว่ามันกำลังทำอะไรอยู่ และเกือบทุกอย่างที่คุณส่งให้มันคือ YAML manifest ที่สร้างจากสี่ field หลักชุดเดียวกัน
+
+## พื้นฐาน kubectl คือ context, namespace และ verb
+
+kubeconfig ของคุณเก็บ credential ของหลาย cluster พร้อมกันได้ จัดกลุ่มเป็น **context** สลับว่าคำสั่งของคุณจะยิงไปที่ตัวไหนด้วย
+
+```bash
+kubectl config use-context my-cluster
+kubectl get pods -n my-namespace
+```
+
+flag `-n` (หรือ `--namespace`) จำกัดขอบเขตคำสั่งให้อยู่ใน namespace เดียว ถ้าไม่ใส่จะยิงไปยัง namespace default ของ context ปัจจุบัน ซึ่งปกติคือ `default` นอกจากนี้ verb ชุดเล็ก ๆ ก็ครอบคลุมการใช้งาน kubectl ในชีวิตประจำวันส่วนใหญ่แล้ว
+
+```bash
+kubectl get pods
+kubectl describe pod web-7d9f8c6b7-abcde
+kubectl logs web-7d9f8c6b7-abcde
+kubectl exec -it web-7d9f8c6b7-abcde -- sh
+```
+
+`get` แสดงรายการ object `describe` แสดงสถานะละเอียดและ event ล่าสุดของ object หนึ่งตัว (จุดแรกที่ควรดูเมื่อมีอะไรผิดปกติ) `logs` stream stdout/stderr ของ container ส่วน `exec` รันคำสั่งข้างใน container ที่กำลังรันอยู่ เหมาะเวลาต้องการ shell เร็ว ๆ เข้าไปดูข้างใน
+
+## Manifest ทุกอันมีสี่ field หลัก
+
+ไม่ว่าจะสร้าง object แบบไหน Pod, Deployment, Service หรืออะไรก็ตาม YAML ของมันมีโครงเดียวกัน
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: web
+spec:
+  containers:
+    - name: web
+      image: nginx:1.27
+      ports:
+        - containerPort: 80
+```
+
+`apiVersion` กับ `kind` บอกว่าคุณหมายถึง API group และ object type ไหน `metadata` เก็บตัวตนและข้อมูลบัญชี เช่น `name`, `namespace` (ถ้ามี) และ `labels` กับ `annotations` ที่คุณติดเอง `spec` คือ desired state ที่คุณเขียนขึ้น ทุกอย่างข้างบนคือ `spec` ของ Pod ตัวนี้ Kubernetes เพิ่ม field ที่ห้าให้เองคือ `status` เมื่อ object ถูกสร้างแล้ว field นี้คุณไม่เคยเขียนเอง อ่านได้อย่างเดียว เพราะมันสะท้อนสิ่งที่สังเกตเห็นจริง ไม่ใช่สิ่งที่คุณขอ
+
+## apply กับ create และ label คือกลไกเชื่อมโยง
+
+`kubectl apply -f file.yaml` เป็นแบบ declarative มัน diff ไฟล์ของคุณกับ last-applied configuration ของ object (ที่ถูก track ไว้ใน annotation) แล้ว patch เฉพาะส่วนที่เปลี่ยน และสร้าง object ให้ถ้ายังไม่มี ทำให้รันคำสั่งเดิมซ้ำ ๆ ได้อย่างปลอดภัย ซึ่งเป็นสิ่งที่ต้องการพอดีใน script และ CI ส่วน `kubectl create -f file.yaml` เป็นแบบ imperative แทน มันสร้าง object ครั้งเดียวและจะ error ถ้ามี object นั้นอยู่แล้ว คอร์สนี้ใช้ `apply` ตลอดทั้งเล่ม
+
+```bash
+kubectl apply -f pod.yaml
+kubectl create -f pod.yaml
+```
+
+label คือคู่ key-value ตามใจที่คุณติดไว้บน object เช่น `app: web` ใน Pod ด้านบน ตัวมันเองไม่ทำอะไร พลังของมันมาจาก **selector** ซึ่งเป็นสิ่งที่ object อื่นใช้หา Pod ที่ถูกติด label แบบนั้น Service ที่มี `selector: { app: web }` จะ route traffic ไปยังทุก Pod ที่มี label นั้น ส่วน ReplicaSet ของ Deployment ใช้ `matchLabels` selector เพื่อรู้ว่า Pod ไหนคือ Pod "ของมัน" ที่ต้องรักษาให้อยู่ตาม replica count ที่ต้องการ pattern label-กับ-selector นี้คือวิธีพื้นฐานที่สุดที่ object ใน Kubernetes ใช้หากันเจอ และคุณจะเห็นมันอีกในเกือบทุก module ถัดไป
+
+<Mermaid title="A declarative apply flows through the API server into etcd" code={kubectlYamlDiagram} />
+
+export const kubectlYamlDiagram = `flowchart LR
+  cmd["kubectl apply -f pod.yaml"] --> api["kube-apiserver"]
+  api --> etcd["etcd"]
+  api --> ctrl["Controllers notice the change and react"]`;
+
+<Callout title="The one-line takeaway">
+`kubectl` ส่ง **manifest** — YAML ที่สร้างจากสี่ field หลักชุดเดียวกัน คือ `apiVersion`, `kind`, `metadata` และ `spec` — ให้ cluster โดยจำกัดขอบเขตด้วย **context** และ **namespace** `kubectl apply` คือวิธีแบบ **declarative** ที่ idempotent รันซ้ำได้ (diff กับ last-applied configuration) ต่างจาก `kubectl create` ที่เป็น imperative และ **label** คู่กับ **selector** คือวิธีที่ Service, ReplicaSet และทุกอย่างอื่นใน Kubernetes ใช้หา Pod ที่ตัวเองควรจัดการ
+</Callout>
+
+export const quizKubectlYaml = [
+  {
+    q: 'What happens differently between kubectl apply and kubectl create when the target object already exists?',
+    options: [
+      'apply diffs against the last-applied configuration and patches only what changed; create errors because the object already exists',
+      'create always overwrites the object silently while apply always refuses',
+      'They behave identically in every situation',
+      'apply only works on Pods while create works on every object kind',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'What does a label selector actually do?',
+    options: [
+      'It encrypts traffic between Pods',
+      'It lets one object, such as a Service or ReplicaSet, find the set of Pods matching given key-value labels so it can route to or manage them',
+      'It sets CPU and memory requests and limits for a Pod',
+      'It pins a Pod to run on a specific node',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which four top-level fields does every Kubernetes object manifest have?',
+    options: [
+      'name, image, port, replicas',
+      'header, body, footer, status',
+      'apiVersion, kind, metadata, spec',
+      'cluster, namespace, context, kind',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'Which field on a live Kubernetes object is managed by the system and never something you author yourself?',
+    options: [
+      'spec',
+      'metadata',
+      'status',
+      'apiVersion',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="foundations/kubectl-and-declarative-yaml" questions={quizKubectlYaml} />
+
+<ProgressTracker client:visible id="foundations/kubectl-and-declarative-yaml" />

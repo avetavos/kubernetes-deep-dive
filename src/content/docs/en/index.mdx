@@ -1,0 +1,60 @@
+---
+title: Kubernetes — From Zero to Hero
+description: Master Kubernetes from first principles — architecture and the control plane, workloads (Pods, Deployments, StatefulSets, Jobs), networking (Services, Ingress, NetworkPolicy), storage and config, scheduling and autoscaling, observability and security (RBAC, Pod Security Standards), and running Kubernetes in production with Helm, Operators, and GitOps.
+template: splash
+hero:
+  tagline: A standalone, developer-focused course on Kubernetes. From the control plane and the declarative model to Pods, Services, storage, autoscaling, RBAC, and shipping to production with Helm and GitOps — taught through real manifests, kubectl, and diagrams.
+  actions:
+    - text: Start here
+      link: /kubernetes/en/foundations/
+      icon: right-arrow
+      variant: primary
+    - text: Jump to Workloads
+      link: /kubernetes/en/workloads/pods-the-atomic-unit/
+      icon: open-book
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## What you'll learn
+
+<CardGrid>
+  <Card title="Foundations & Architecture" icon="rocket">
+    Why orchestration, the control plane and node components, kubectl, declarative YAML, and running your first local cluster. [Start →](/kubernetes/en/foundations/)
+  </Card>
+  <Card title="Workloads" icon="seti:html">
+    Pods, Deployments and rolling updates, StatefulSets and DaemonSets, and batch work with Jobs and CronJobs. [Deploy →](/kubernetes/en/workloads/pods-the-atomic-unit/)
+  </Card>
+  <Card title="Networking" icon="random">
+    Services and kube-proxy, cluster DNS, Ingress and the Gateway API, and locking down traffic with NetworkPolicy. [Connect →](/kubernetes/en/networking/services-clusterip-nodeport-loadbalancer/)
+  </Card>
+  <Card title="Storage & Configuration" icon="seti:config">
+    Volumes, PersistentVolumes/Claims and StorageClasses, ConfigMaps and Secrets, and namespaces with resource quotas. [Configure →](/kubernetes/en/storage-and-config/volumes-and-volume-types/)
+  </Card>
+  <Card title="Scheduling & Scaling" icon="seti:plan">
+    Requests/limits and the scheduler, affinity/taints/tolerations, the HorizontalPodAutoscaler, and disruption budgets. [Scale →](/kubernetes/en/scheduling-and-scaling/the-scheduler-and-resource-requests/)
+  </Card>
+  <Card title="Observability & Security" icon="approve-check">
+    Liveness/readiness/startup probes, logs and metrics, RBAC and ServiceAccounts, and Pod Security Standards. [Secure →](/kubernetes/en/observability-and-security/probes-liveness-readiness-startup/)
+  </Card>
+  <Card title="Production & Ecosystem" icon="puzzle">
+    Packaging with Helm, extending the API with Operators and CRDs, GitOps, and a production checklist with the TypeScript API client. [Ship →](/kubernetes/en/production-and-ecosystem/helm-package-management/)
+  </Card>
+</CardGrid>
+
+## How this course works
+
+<CardGrid>
+  <Card title="The model first, then the manifest" icon="rocket">
+    Every topic starts from a model — the reconciliation loop, the Pod, the Service, the scheduler — so Kubernetes's behavior becomes mechanism you understand, not YAML you copy-paste.
+  </Card>
+  <Card title="Verified against current API groups" icon="random">
+    Written against the stable API groups in wide production use today — `apps/v1`, `batch/v1`, `networking.k8s.io/v1`, `autoscaling/v2`, `policy/v1` — and checked against the official docs via context7.
+  </Card>
+  <Card title="Guarantees, not just YAML" icon="approve-check">
+    Not "here's a Deployment" but "here's what a rolling update actually guarantees, and what a missing readiness probe or PodDisruptionBudget can still let go wrong." You'll reason about a cluster with confidence.
+  </Card>
+  <Card title="Diagrams that explain" icon="puzzle">
+    The control plane, the reconciliation loop, Service routing, and the scheduling pipeline as theme-aware Mermaid diagrams. Bilingual (English / ไทย) with saved quiz progress.
+  </Card>
+</CardGrid>

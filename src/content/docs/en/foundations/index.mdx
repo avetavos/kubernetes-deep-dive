@@ -1,0 +1,32 @@
+---
+title: 'Kubernetes — From Zero to Hero'
+description: 'A developer-focused, zero-to-hero course on Kubernetes — architecture and the control plane, workloads, networking, storage and config, scheduling and scaling, observability and security, and running Kubernetes in production.'
+sidebar:
+  order: 1
+---
+
+import Callout from '../../../../components/Callout.astro';
+
+**Kubernetes** is a declarative container orchestrator: you describe the state you want — how many replicas, which image, which ports are exposed — and a set of control loops continuously drives the cluster's actual state toward it. This course is written **for developers** — people who ship workloads to a cluster, debug why a Pod won't come up, and have to make Kubernetes behave correctly in production.
+
+Every manifest in this course uses the stable API groups you'll meet in real clusters — `apps/v1` for Deployments/StatefulSets/DaemonSets, `batch/v1` for Jobs/CronJobs, `networking.k8s.io/v1` for Ingress/NetworkPolicy, `autoscaling/v2` for the HorizontalPodAutoscaler, and `policy/v1` for PodDisruptionBudgets. `kubectl` and YAML are the same regardless of language, so every CLI and manifest example is language-agnostic; the few lessons with a programmatic API client use **TypeScript** with **`@kubernetes/client-node`**, the official JavaScript client.
+
+## What this course covers
+
+| Module | You will learn |
+| --- | --- |
+| **Foundations & Architecture** | Why orchestration, the control plane and node components, kubectl, declarative YAML, running a local cluster |
+| **Workloads** | Pods, Deployments and rolling updates, StatefulSets and DaemonSets, Jobs and CronJobs |
+| **Networking** | Services and kube-proxy, cluster DNS, Ingress and the Gateway API, NetworkPolicy |
+| **Storage & Configuration** | Volumes, PersistentVolumes/Claims and StorageClasses, ConfigMaps and Secrets, namespaces and quotas |
+| **Scheduling & Scaling** | Requests/limits and the scheduler, affinity/taints/tolerations, the HorizontalPodAutoscaler, disruption budgets |
+| **Observability & Security** | Probes, logs and metrics, RBAC and ServiceAccounts, Pod Security Standards |
+| **Production & Ecosystem** | Helm, Operators and CRDs, GitOps, and a production checklist with the API client |
+
+## How to read it
+
+Each lesson opens with the idea in one sentence, shows real `kubectl` commands and YAML manifests, has a diagram of the moving parts, and ends with a one-line takeaway plus a short quiz. Work top to bottom — later modules assume the Pod, control-loop, and label/selector vocabulary from these first lessons.
+
+<Callout title="The one-line takeaway">
+Kubernetes is a **declarative, self-healing orchestrator**: you describe desired state in YAML, and control loops continuously reconcile the cluster toward it. This course teaches Kubernetes from a developer's seat — the objects, the guarantees, and the production behavior — starting from the control plane itself.
+</Callout>

@@ -1,0 +1,182 @@
+---
+title: 'Production Checklist and the Kubernetes API Client'
+description: 'A production-readiness checklist tying together resource limits, probes, disruption budgets, RBAC, and network policy, plus a real programmatic deployment-verification example.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A production-ready workload is not one feature but a checklist of independent controls — resource limits, probes, disruption budgets, least-privilege RBAC, network policy, real secret encryption, bounded autoscaling, spread-out replicas, and namespace quotas — each covering a failure mode the others do not.
+
+## The checklist
+
+Every item below closes a specific gap. None of them is optional in a real production cluster, and none of them substitutes for another.
+
+- **Resource `requests`/`limits`** — set both, not just one. `requests` drives scheduling and determines a Pod's **QoS class** (`Guaranteed`, `Burstable`, or `BestEffort`), which the kubelet uses to decide eviction order under node pressure. `limits` caps how much a runaway container can take from its neighbors.
+- **Readiness AND liveness probes** — a **readiness probe** controls whether a Pod receives Service traffic (fixes "sends traffic to a Pod that is not ready yet"); a **liveness probe** controls whether the kubelet restarts the container (fixes "process is alive but hung, and traffic keeps failing"). They solve different problems and a workload needs both.
+- **PodDisruptionBudget (PDB)** for any multi-replica service — bounds how many replicas a **voluntary** disruption (node drain, cluster upgrade) is allowed to take down at once, so a rolling node upgrade cannot accidentally take an entire service to zero replicas.
+- **RBAC scoped to least privilege** — Roles and RoleBindings (or ClusterRole/ClusterRoleBinding) granting exactly the verbs and resources a workload's ServiceAccount needs, not `cluster-admin` by default.
+- **Default-deny NetworkPolicy** where appropriate — without one, every Pod can reach every other Pod in the cluster by default; a default-deny policy plus explicit allow rules makes lateral movement from a compromised Pod much harder.
+- **Real secret protection** — encryption at rest for etcd (Secrets are base64-encoded, not encrypted, unless an `EncryptionConfiguration` is applied) or an external secret manager, not base64 alone as a security boundary.
+- **A sensibly bounded HorizontalPodAutoscaler** — `minReplicas` prevents scaling to zero for a service that must always be available, `maxReplicas` caps cost and downstream load (databases, dependencies) during a traffic spike.
+- **Multiple replicas spread across nodes/zones** — Pod anti-affinity or topology spread constraints, so a single node or availability zone failure does not take down every replica at once; replica count alone does not guarantee this.
+- **ResourceQuota/LimitRange per namespace** — a `ResourceQuota` caps total resource consumption for a namespace, and a `LimitRange` supplies sane per-container defaults so a Pod deployed without explicit `requests`/`limits` does not silently become `BestEffort`.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-api
+spec:
+  replicas: 3
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: 'kubernetes.io/hostname'
+              labelSelector:
+                matchLabels:
+                  app: orders-api
+      containers:
+        - name: orders-api
+          image: myregistry/orders-api:2.3.0
+          resources:
+            requests:
+              cpu: '250m'
+              memory: '256Mi'
+            limits:
+              cpu: '500m'
+              memory: '512Mi'
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: 8080
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: 8080
+            periodSeconds: 10
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: orders-api-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: orders-api
+```
+
+## Closing the loop with a programmatic verification script
+
+`kubectl rollout status` covers the interactive case, but a deployment pipeline often needs the same check as code — for example, gating a promotion step on a Deployment actually reaching its desired replica count, not just on `kubectl apply` returning successfully. `@kubernetes/client-node`'s `KubeConfig.loadFromDefault()` resolves credentials the same way whether the script runs on an engineer's laptop (via `KUBECONFIG` or `~/.kube/config`) or inside the cluster itself as a CI job or Job Pod (via the mounted ServiceAccount token) — no branching logic needed for either environment:
+
+```typescript
+import * as k8s from '@kubernetes/client-node';
+
+const kc = new k8s.KubeConfig();
+// Resolves KUBECONFIG env var, then ~/.kube/config, then in-cluster ServiceAccount
+kc.loadFromDefault();
+
+const appsApi = kc.makeApiClient(k8s.AppsV1Api);
+
+async function verifyRollout(name: string, namespace: string, timeoutMs = 120_000): Promise<void> {
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    const dep = await appsApi.readNamespacedDeployment({ name, namespace });
+
+    const desired = dep.spec?.replicas ?? 0;
+    const ready = dep.status?.readyReplicas ?? 0;
+    const updated = dep.status?.updatedReplicas ?? 0;
+
+    console.log(`${namespace}/${name}: ${ready}/${desired} ready, ${updated}/${desired} updated`);
+
+    if (ready === desired && updated === desired) {
+      console.log('rollout complete');
+      return;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
+
+  throw new Error(`rollout of ${namespace}/${name} did not complete within ${timeoutMs}ms`);
+}
+
+await verifyRollout('orders-api', 'default');
+```
+
+This is the exact case where a programmatic client beats a shell script wrapping `kubectl`: the result feeds directly into a pipeline's pass/fail decision, with typed access to `status.readyReplicas` and `status.updatedReplicas` instead of parsing CLI text output.
+
+<Mermaid title="A production-ready Deployment: probes, requests/limits, PodDisruptionBudget, RBAC, and NetworkPolicy all covering different failure modes" code={productionChecklistDiagram} />
+
+export const productionChecklistDiagram = `flowchart TB
+  dep["Deployment: orders-api (3 replicas, spread across nodes)"]
+  dep --> probes["Readiness + liveness probes"]
+  dep --> resources["requests/limits (QoS)"]
+  dep --> pdb["PodDisruptionBudget (minAvailable: 2)"]
+  dep --> rbac["RBAC: least-privilege ServiceAccount"]
+  dep --> netpol["Default-deny NetworkPolicy + explicit allows"]
+  dep --> hpa["HorizontalPodAutoscaler (bounded min/max)"]
+  ns["Namespace"] --> quota["ResourceQuota / LimitRange"]
+  quota --> dep`;
+
+<Callout title="The one-line takeaway">
+Production readiness is a checklist, not a single switch: **requests/limits** set QoS and scheduling behavior, **readiness/liveness probes** solve two different failure modes, a **PodDisruptionBudget** bounds voluntary disruption during node drains and upgrades, **RBAC** and **default-deny NetworkPolicy** limit blast radius, real **encryption at rest** (not base64) protects Secrets, a bounded **HorizontalPodAutoscaler** and anti-affinity-spread replicas provide real availability, and a **ResourceQuota/LimitRange** protects the namespace as a whole; `KubeConfig.loadFromDefault()` in `@kubernetes/client-node` resolves credentials identically on a laptop or in-cluster, which is what makes a typed, programmatic rollout-verification script practical in a real pipeline.
+</Callout>
+
+export const quizProductionChecklist = [
+  {
+    q: 'Why does a PodDisruptionBudget matter even though it cannot stop involuntary failures like a node crashing unexpectedly',
+    options: [
+      'It has no real purpose and is only used for documentation',
+      'It bounds how many replicas a voluntary disruption, such as a node drain during a cluster upgrade, is allowed to take down at once',
+      'It replaces the need for multiple replicas entirely',
+      'It automatically restarts crashed nodes',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why are both readiness and liveness probes needed on the same workload',
+    options: [
+      'They do the same thing, having both is redundant',
+      'A readiness probe controls whether a Pod receives traffic, a liveness probe controls whether the kubelet restarts it, and each covers a different failure mode',
+      'Liveness probes are only needed for StatefulSets',
+      'Readiness probes are deprecated in favor of liveness probes',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why is base64 encoding alone not sufficient protection for Kubernetes Secrets',
+    options: [
+      'Base64 is a form of strong encryption on its own',
+      'Base64 is trivially reversible, so real protection requires etcd encryption at rest or an external secret manager',
+      'Secrets cannot be base64 encoded at all',
+      'Base64 encoding is only a display format and has no bearing on security',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does KubeConfig.loadFromDefault() resolve to when a script runs inside the cluster versus on a developer laptop',
+    options: [
+      'It always fails inside the cluster and only works on a laptop',
+      'Inside the cluster it uses the mounted ServiceAccount token, on a laptop it falls back to KUBECONFIG or ~/.kube/config, with no code branching required',
+      'It requires a completely different method name depending on environment',
+      'It only works if a KUBECONFIG environment variable is manually set in both environments',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/production-checklist-and-the-kubernetes-api-client" questions={quizProductionChecklist} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/production-checklist-and-the-kubernetes-api-client" />

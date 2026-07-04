@@ -1,0 +1,134 @@
+---
+title: 'Services: ClusterIP, NodePort, LoadBalancer'
+description: 'How a Service gives Pods a stable virtual IP and DNS name, and the practical difference between ClusterIP, NodePort, and LoadBalancer.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A **Service** gives a shifting set of Pods a single stable virtual IP and DNS name, load-balancing traffic across whichever matching Pods are currently healthy.
+
+## The problem: Pod IPs are not stable
+
+Pods are disposable. A Deployment reschedules a crashed Pod onto a different node, a rollout replaces every Pod with new ones, and the cluster autoscaler adds and removes nodes — every one of these events can give a Pod a brand new IP address. Anything that hardcodes a Pod IP breaks the moment that Pod is replaced.
+
+A **Service** solves this by sitting in front of a group of Pods. It picks its members using a **label selector**, and it tracks which of those Pods are currently ready through an **Endpoints** object (or the newer, scalable **EndpointSlice** objects). As Pods come and go, the controller updates the Endpoints/EndpointSlice automatically — clients never need to know.
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments
+spec:
+  selector:
+    app: payments
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+```bash
+# See which Pods this Service is currently routing to
+kubectl get endpoints payments
+kubectl get endpointslices -l kubernetes.io/service-name=payments
+```
+
+Any Pod whose labels match `app: payments` and that is passing its readiness probe is added to that list automatically. Delete the Pod and it drops out; a replacement Pod with the same labels is added back in — the Service's IP and DNS name never change.
+
+## Three Service types, each building on the last
+
+`spec.type` controls how the Service is reachable, and the three common types form a ladder — each one builds on the one before it.
+
+- **ClusterIP** (the default) — a virtual IP reachable only from inside the cluster. This is what most Pod-to-Pod communication uses.
+- **NodePort** — everything ClusterIP does, plus the same port is opened on every node in the cluster, in the `30000`–`32767` range by default. Hitting `<any-node-ip>:<nodePort>` reaches the Service from outside the cluster.
+- **LoadBalancer** — everything NodePort does, plus the cluster asks the cloud provider to provision an external load balancer that forwards to the NodePort.
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments-public
+spec:
+  type: LoadBalancer
+  selector:
+    app: payments
+  ports:
+    - port: 80
+      targetPort: 8080
+      nodePort: 30080
+```
+
+```bash
+kubectl get svc payments-public
+# EXTERNAL-IP column is populated once the cloud provider finishes provisioning
+```
+
+## kube-proxy makes the virtual IP real
+
+A Service's ClusterIP is not backed by a real network interface anywhere — it is a virtual address. **kube-proxy**, running on every node, watches the API server for Services and Endpoints/EndpointSlices and programs local rules (typically `iptables` or `IPVS`, depending on the configured mode) so that any packet sent to the virtual IP gets transparently rewritten and delivered to one of the backing Pods. This is why a Service works identically no matter which node a client Pod happens to be on.
+
+<Mermaid title="A client reaching a Service's virtual IP, routed by kube-proxy to a backing Pod" code={serviceRoutingDiagram} />
+
+export const serviceRoutingDiagram = `flowchart LR
+  client["Client Pod"] --> vip["Service virtual IP\\n(ClusterIP)"]
+  vip --> kp["kube-proxy rules\\n(iptables / IPVS)"]
+  kp --> p1["Pod 1"]
+  kp --> p2["Pod 2"]
+  kp --> p3["Pod 3"]`;
+
+<Callout title="The one-line takeaway">
+A **Service** gives a group of ephemeral Pods a stable virtual IP and DNS name, selecting members by **label selector** and tracking them via **Endpoints/EndpointSlice**. **ClusterIP** is internal-only, **NodePort** additionally opens a port (30000-32767) on every node, and **LoadBalancer** additionally provisions an external cloud load balancer in front of the NodePort. **kube-proxy** on every node is what actually implements the virtual IP, using iptables or IPVS rules to route to a backing Pod.
+</Callout>
+
+export const quizServiceTypes = [
+  {
+    q: 'Why does Kubernetes need a Service object at all, given that every Pod already has an IP address?',
+    options: [
+      'Services make Pods start faster',
+      'Pod IPs change whenever Pods are rescheduled or replaced, so something else is needed to provide a stable address',
+      'Services are required for a Pod to have any IP address',
+      'Services replace the need for labels on Pods',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the practical difference between NodePort and ClusterIP?',
+    options: [
+      'NodePort is only for internal traffic and ClusterIP is only for external traffic',
+      'NodePort does everything ClusterIP does, plus it opens the same port on every node so the Service is reachable from outside the cluster',
+      'They are exactly the same, just different names',
+      'ClusterIP requires a cloud provider and NodePort does not',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How does a Service decide which Pods are currently backing it',
+    options: [
+      'By Pod creation timestamp',
+      'By a label selector, tracked through Endpoints or EndpointSlice objects that update automatically',
+      'By a fixed list of Pod IPs written once at Service creation',
+      'By the node the Pod is scheduled on',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What component actually implements a Service ClusterIP as reachable traffic on each node',
+    options: [
+      'The kubelet',
+      'CoreDNS',
+      'kube-proxy, using iptables or IPVS rules',
+      'The scheduler',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="networking/services-clusterip-nodeport-loadbalancer" questions={quizServiceTypes} />
+
+<ProgressTracker client:visible id="networking/services-clusterip-nodeport-loadbalancer" />

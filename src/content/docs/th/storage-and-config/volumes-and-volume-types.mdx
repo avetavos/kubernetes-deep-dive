@@ -1,0 +1,151 @@
+---
+title: 'Volume และ Volume Type'
+description: 'Kubernetes ให้ directory ที่อยู่รอดข้าม restart กับ container ได้ยังไง และ volume type ที่คุณจะใช้จริง'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**Volume** คือ directory ที่ container ใน Pod เข้าถึงได้ และ lifecycle ของมันผูกกับ **Pod** ไม่ใช่ผูกกับ container ตัวใดตัวหนึ่ง
+
+## ทำไม filesystem ของ container เองถึงไม่พอ
+
+container แต่ละตัวมี writable layer เป็นของตัวเอง แต่ layer นั้นถูกทิ้งทันทีที่ container restart ไม่ว่าจะเพราะ crash, image update หรือ liveness probe fail ก็ตาม ซึ่งไม่มีปัญหาสำหรับ application code แบบ stateless แต่มันพังทันทีถ้าอะไรบางอย่างต้องอยู่รอดข้าม restart หรือต้อง share กันระหว่าง container ใน Pod เดียวกัน Volume แก้ทั้งสองปัญหานี้ มันถูก declare ครั้งเดียวที่ระดับ Pod และคงอยู่ตราบใดที่ Pod นั้นยังอยู่ ไม่ว่า container ตัวใดใน Pod จะ restart กี่รอบก็ตาม
+
+```bash
+# The container restarts, but the Pod (and its volumes) does not disappear
+kubectl get pod log-processor -o jsonpath='{.status.containerStatuses[*].restartCount}'
+```
+
+## Volume type ที่ใช้บ่อย
+
+- **`emptyDir`** — directory เปล่าที่ถูกสร้างตอน Pod เริ่มทำงาน เป็น scratch space เหมาะกับ cache หรือ share file ระหว่าง container หลักกับ sidecar มันถูกลบถาวรตอน Pod ถูกลบ ไม่ใช่แค่ตอน container ตัวใดตัวหนึ่ง restart
+- **`hostPath`** — mount path จาก filesystem ของ node จริงเข้ามาใน Pod ตรง ๆ ทรงพลังแต่เสี่ยง เพราะผูก Pod เข้ากับข้อมูลที่อยู่บน node เฉพาะตัวนั้น และอาจเปิดให้ container เข้าถึงส่วนที่ sensitive ของ filesystem ของ node ได้ ใช้เท่าที่จำเป็นจริง ๆ เท่านั้น (เช่น log collector หรือ agent ระดับ node)
+- **`configMap` / `secret` volume** — project ข้อมูล key-value จาก ConfigMap หรือ Secret เข้าไปใน Pod เป็นไฟล์ หนึ่ง key ต่อหนึ่งไฟล์ รายละเอียดอยู่ในบทถัดไปเรื่อง ConfigMap และ Secret
+- **projected volume** — รวมหลาย source (ConfigMap, Secret, downwardAPI, serviceAccountToken) เข้าเป็น directory เดียว container เลยต้องใช้ mount point เดียวก็เห็นข้อมูลที่มาจากหลาย object ได้
+
+นี่คือ Pod ที่ container สองตัว share `emptyDir` volume เดียวกัน ซึ่งเป็น pattern ที่พบบ่อยเวลามี container หลักคู่กับ sidecar ที่คอย ship log
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: log-processor
+spec:
+  volumes:
+    - name: shared-logs
+      emptyDir: {}
+  containers:
+    - name: app
+      image: my-app:1.0
+      volumeMounts:
+        - name: shared-logs
+          mountPath: /var/log/app
+    - name: log-shipper
+      image: fluent-bit:2.2
+      volumeMounts:
+        - name: shared-logs
+          mountPath: /var/log/app
+          readOnly: true
+```
+
+และตัวอย่าง `hostPath` ที่ mount directory `/proc` ของ node แบบ read-only เข้า monitoring agent
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: node-exporter
+spec:
+  volumes:
+    - name: proc
+      hostPath:
+        path: /proc
+        type: Directory
+  containers:
+    - name: node-exporter
+      image: prom/node-exporter:v1.7.0
+      volumeMounts:
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+```
+
+## การ declare volume มีสองขั้นตอนเสมอ
+
+แค่ตั้งชื่อ volume ยังใช้งานไม่ได้ volume ระดับ Pod ทุกตัวต้องมีสองส่วนที่ตรงกัน
+
+1. `spec.volumes[]` — declare volume และบอกว่าข้อมูลมาจากไหน (`emptyDir`, `hostPath`, `configMap`, `persistentVolumeClaim` ฯลฯ) ส่วนนี้อยู่ในระดับ Pod
+2. `spec.containers[].volumeMounts[]` ของแต่ละ container — เอา volume ที่ declare ไว้แล้วมา mount เข้า filesystem ของ container ตัวนั้น ที่ `mountPath` ที่กำหนด
+
+volume ที่ declare ไว้ใน `spec.volumes` แต่ไม่มี container ไหน reference ผ่าน `volumeMounts` เลย จะไม่มีผลอะไรกับ container นั้น มันแค่ไม่ถูก mount เข้าไป นี่คือวิธีที่ container สองตัวใน Pod เดียวกัน share ข้อมูลกันได้ด้วย ทั้งสองตัวใส่ `name` ของ volume เดียวกันใน `volumeMounts` ของตัวเอง ชี้ไปที่ directory เดียวกันที่ declare ไว้ครั้งเดียวใน `spec.volumes`
+
+```bash
+# Confirm both containers see the same file through the shared emptyDir
+kubectl exec log-processor -c log-shipper -- ls /var/log/app
+```
+
+<Mermaid title="container สองตัวใน Pod เดียวกัน share emptyDir volume เดียว" code={emptyDirDiagram} />
+
+export const emptyDirDiagram = `flowchart LR
+  subgraph pod["Pod: log-processor"]
+    a["Container: app"] -->|writes| vol[("emptyDir volume: shared-logs")]
+    vol -->|reads| b["Container: log-shipper"]
+  end`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**Volume** อยู่และตายไปพร้อม **Pod** ไม่ใช่พร้อม container ตัวใดตัวหนึ่ง นี่คือสิ่งที่ทำให้ข้อมูลอยู่รอดข้าม restart ของ container และ share กันระหว่าง container ได้ **`emptyDir`** คือ scratch space ที่อยู่ตาม lifetime ของ Pod และถูกลบตอน Pod ถูกลบ **`hostPath`** เข้าถึง filesystem ของ node เองโดยตรง ควรใช้เท่าที่จำเป็นเพราะผูกกับ node เฉพาะตัวและมีความเสี่ยงด้าน security **`configMap`/`secret`** volume project ข้อมูล config เป็นไฟล์ ส่วน **projected** volume รวมหลาย source เข้า mount เดียว การใช้ volume ต้อง declare สองที่เสมอ คือ `spec.volumes` เพื่อนิยามมัน และ `volumeMounts` ของ container เพื่อ mount มันจริง ๆ
+</Callout>
+
+export const quizVolumes = [
+  {
+    q: 'เกิดอะไรขึ้นกับข้อมูลใน emptyDir volume เมื่อ Pod ที่เป็นเจ้าของถูกลบ',
+    options: [
+      'ถูก copy ไปเก็บที่ node เพื่อกู้คืนทีหลัง',
+      'ถูกลบถาวรไปพร้อมกับ Pod',
+      'ถูกแปลงเป็น PersistentVolume โดยอัตโนมัติ',
+      'ยังอยู่ เพราะข้อมูล emptyDir อยู่ที่ระดับ cluster เสมอ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม hostPath ถึงถูกมองว่าเสี่ยง',
+    options: [
+      'มันถูก deprecate แล้วและใช้ไม่ได้บน Kubernetes เวอร์ชันปัจจุบัน',
+      'มันใช้ได้แค่กับ StatefulSet เท่านั้น',
+      'มันผูก Pod เข้ากับข้อมูลที่อยู่บน node เฉพาะตัว และอาจเปิดให้เข้าถึงส่วน sensitive ของ filesystem ของ node',
+      'มันต้อง config StorageClass ก่อนถึงจะใช้ได้',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'ทำไมการ mount volume เข้า container ถึงต้องใช้ทั้ง spec.volumes และ volumeMounts',
+    options: [
+      'spec.volumes declare volume ที่ระดับ Pod ส่วน volumeMounts ของแต่ละ container เอา volume ที่ declare ไว้แล้วมา mount เข้า filesystem ของ container ตัวนั้น',
+      'volumeMounts เป็น field เดียวที่สำคัญ spec.volumes เป็น syntax เก่าที่ไม่จำเป็น',
+      'spec.volumes ใช้กับ PersistentVolumeClaim เท่านั้น ไม่ใช้กับ emptyDir',
+      'Kubernetes บังคับให้ declare ซ้ำสองที่เพื่อ validation เฉยๆ และสอง field ต้องเหมือนกันทุกประการ',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'volume type ไหนถูกออกแบบมาให้รวมหลาย source เช่น ConfigMap กับ Secret เข้าเป็น mount directory เดียว',
+    options: [
+      'hostPath',
+      'emptyDir',
+      'projected volume',
+      'PersistentVolumeClaim',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="storage-and-config/volumes-and-volume-types" questions={quizVolumes} />
+
+<ProgressTracker client:visible id="storage-and-config/volumes-and-volume-types" />

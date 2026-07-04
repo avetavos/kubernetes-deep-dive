@@ -1,0 +1,138 @@
+---
+title: 'Pods: The Atomic Unit'
+description: 'The Pod as the smallest deployable unit in Kubernetes, shared networking and volumes, sidecar and init container patterns, and the Pod lifecycle.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A **Pod** is the smallest deployable unit in Kubernetes — one or more containers that always run together on the same node, sharing one network namespace and, optionally, one or more volumes.
+
+## What containers in a Pod share
+
+Every container in a Pod gets the same **IP address** and the same **network namespace**. That means two containers in one Pod reach each other over `localhost`, on whatever port the other one is listening on — no cluster networking involved. Containers in a Pod can also mount the same **volume**, which is how a sidecar reads files that the main container writes.
+
+```bash
+# From inside the "app" container, a sidecar in the same Pod is reachable on localhost
+kubectl exec -it app-with-sidecar -c app -- curl -s http://localhost:9090/metrics
+```
+
+This shared-namespace guarantee is the whole reason a Pod exists as a concept: it is the boundary within which "these containers are always co-located and can talk over localhost" holds true. Containers in different Pods never get this for free — they need a Service and a routable address.
+
+## Multi-container patterns: sidecars and init containers
+
+Two patterns cover almost every reason to put more than one container in a Pod:
+
+- **Sidecar** — a helper container that runs alongside the main container for the Pod's whole lifetime, for example a log shipper that tails the main container's log files and forwards them, or a proxy that handles TLS termination.
+- **Init containers** — containers that run **to completion, in order, before any main container starts**. A common use is waiting for a dependency to become reachable, or running a one-time migration before the main container boots.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app-with-sidecar
+spec:
+  restartPolicy: Always
+  initContainers:
+    - name: wait-for-db
+      image: busybox:1.36
+      command: ['sh', '-c', 'until nc -z db 5432; do sleep 1; done']
+  containers:
+    - name: app
+      image: myregistry/app:1.4.0
+      ports:
+        - containerPort: 8080
+    - name: log-shipper
+      image: myregistry/log-shipper:2.1.0
+      volumeMounts:
+        - name: logs
+          mountPath: /var/log/app
+  volumes:
+    - name: logs
+      emptyDir: {}
+```
+
+`wait-for-db` blocks the Pod's startup until the database is reachable, then exits successfully; only then do `app` and `log-shipper` start, sharing the Pod's network namespace and the `logs` volume.
+
+<Mermaid title="One Pod: an init container runs first, then the main container and a sidecar share one network namespace" code={podsDiagram} />
+
+export const podsDiagram = `flowchart TB
+  subgraph pod["Pod app-with-sidecar (one IP, one network namespace)"]
+    init["initContainer: wait-for-db (runs first, to completion)"] --> app["container: app"]
+    app -->|localhost| sidecar["container: log-shipper (sidecar)"]
+  end`;
+
+## Pod lifecycle: phases, states, and restartPolicy
+
+A Pod moves through a small set of **phases**: `Pending` (accepted but not all containers are running yet, often waiting on scheduling or image pulls), `Running` (bound to a node, at least one container running), `Succeeded` or `Failed` (all containers have terminated), and occasionally `Unknown` (the Pod's state cannot be obtained). Underneath the phase, each individual container has its own **state**: `Waiting`, `Running`, or `Terminated`.
+
+What happens when a container exits is controlled by `restartPolicy` on the Pod spec: `Always` restarts any exited container forever (the default, used for long-running services), `OnFailure` restarts only on a non-zero exit code (used for Jobs), and `Never` never restarts (also common for Jobs, or for one-shot debugging Pods).
+
+```bash
+# Watch a Pod move through its phases
+kubectl get pod app-with-sidecar --watch
+
+# Container-level detail: state (Waiting/Running/Terminated), restart count, exit code
+kubectl describe pod app-with-sidecar
+```
+
+## Why bare Pods are not how you run things
+
+A Pod is ephemeral by design and it is rarely something you create directly. If you `kubectl apply` a bare Pod and its node fails, or the container inside it crashes past what `restartPolicy` will fix, **nothing recreates that Pod** — it is simply gone. In practice you almost always create a Deployment, StatefulSet, or DaemonSet instead: those controllers own a Pod template, watch the actual state of the cluster, and recreate Pods whenever reality drifts from the desired count. The rest of this module is those controllers.
+
+<Callout title="The one-line takeaway">
+A **Pod** is one or more containers sharing a network namespace (one IP, reachable over **localhost**) and optionally volumes; **init containers** run to completion in order before **sidecar** and other main containers start; a Pod's phase (`Pending`/`Running`/`Succeeded`/`Failed`/`Unknown`) and its `restartPolicy` (`Always`/`OnFailure`/`Never`) govern its lifecycle, but a **bare Pod that dies is not recreated** — that job belongs to the controllers covered next.
+</Callout>
+
+export const quizPods = [
+  {
+    q: 'What do all containers in the same Pod share by default?',
+    options: [
+      'Nothing, they are fully isolated from one another',
+      'The same network namespace (one Pod IP) and, optionally, mounted volumes',
+      'Only the same volumes, never the network',
+      'The same container image',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the defining behavior of an init container?',
+    options: [
+      'It runs alongside the main containers for the whole life of the Pod',
+      'It runs to completion, in order, before any main container starts',
+      'It replaces the main container whenever the main container fails',
+      'It only runs on the node host network, never inside the Pod',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'A bare Pod (created directly, no controller) has its only container crash repeatedly and its node later fails entirely. What happens to the Pod?',
+    options: [
+      'Kubernetes automatically recreates it on a healthy node',
+      'Nothing recreates it, a bare Pod that is gone stays gone, which is why controllers are used instead',
+      'It automatically becomes a DaemonSet',
+      'The scheduler retries creating it forever',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which values can a Pod\'s restartPolicy take?',
+    options: [
+      'Always, OnFailure, or Never',
+      'Retry, Skip, or Ignore',
+      'True or False',
+      'A restart count only, no named policy',
+    ],
+    answer: 0,
+  },
+];
+
+<Quiz client:visible id="workloads/pods-the-atomic-unit" questions={quizPods} />
+
+<ProgressTracker client:visible id="workloads/pods-the-atomic-unit" />

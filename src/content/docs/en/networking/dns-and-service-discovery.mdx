@@ -1,0 +1,132 @@
+---
+title: 'DNS and Service Discovery'
+description: 'How CoreDNS gives every Service a stable DNS name, and how headless Services expose individual Pod IPs for StatefulSets.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+**CoreDNS** gives every Service a predictable DNS name so Pods can find each other by name instead of by IP, and a **headless Service** flips that from one load-balanced IP to the individual IPs of each backing Pod.
+
+## CoreDNS and the Service DNS name
+
+**CoreDNS** runs as a Deployment inside the cluster (typically in `kube-system`) and serves as the cluster's internal DNS server. Every Pod is configured, via its `/etc/resolv.conf`, to send DNS queries to CoreDNS. The moment a Service is created, CoreDNS starts answering for it with a fully qualified name of the form:
+
+```text
+<service-name>.<namespace>.svc.cluster.local
+```
+
+```bash
+# From inside any Pod in the cluster
+nslookup payments.default.svc.cluster.local
+```
+
+Within the **same namespace**, the short form also works, because a Pod's DNS search path automatically includes its own namespace's `svc.cluster.local` suffix:
+
+```bash
+# From a Pod that lives in the same namespace as the "payments" Service
+nslookup payments
+curl http://payments/health
+```
+
+For a normal (non-headless) Service, that name resolves to a single A/AAAA record: the Service's ClusterIP. Every request to that name still gets load-balanced across the backing Pods by kube-proxy — DNS just gets a client to the virtual IP.
+
+## Headless Services: skipping the load balancer
+
+Sometimes a client needs to reach a *specific* Pod, not "any healthy Pod behind the Service." Setting `clusterIP: None` creates a **headless Service**:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: cache
+spec:
+  clusterIP: None
+  selector:
+    app: cache
+  ports:
+    - port: 6379
+```
+
+A headless Service gets no virtual IP at all. Instead, CoreDNS returns the individual IPs of every matching, ready Pod directly. A query still resolves the same name, `cache.default.svc.cluster.local`, but the answer is now a list of Pod IPs instead of one ClusterIP.
+
+## Why StatefulSets rely on this
+
+A **StatefulSet** gives each of its Pods a stable identity — `web-0`, `web-1`, `web-2` — and pairs that with a headless Service (via `spec.serviceName`) so each Pod also gets its own individual, stable DNS record:
+
+```text
+<pod-name>.<service-name>.<namespace>.svc.cluster.local
+```
+
+```bash
+# Reach one specific ordinal Pod directly, not a load-balanced peer
+nslookup web-0.cache.default.svc.cluster.local
+```
+
+This is exactly what distributed, stateful systems need: a database replica has to reconnect to the *same* peer it had before, not a random one a load balancer happens to pick. Without a headless Service, that per-Pod DNS record would not exist at all.
+
+<Mermaid title="A Pod's DNS query resolved by CoreDNS: a Service ClusterIP, or individual Pod IPs for a headless Service" code={dnsResolutionDiagram} />
+
+export const dnsResolutionDiagram = `flowchart TB
+  pod["Client Pod"] -->|"DNS query"| coredns["CoreDNS"]
+  coredns -->|"normal Service"| vip["Service ClusterIP\\n(load-balanced)"]
+  coredns -->|"headless Service"| p0["web-0 IP"]
+  coredns -->|"headless Service"| p1["web-1 IP"]
+  coredns -->|"headless Service"| p2["web-2 IP"]`;
+
+<Callout title="The one-line takeaway">
+**CoreDNS** is the cluster's internal DNS server, giving every Service a name in the form `<service>.<namespace>.svc.cluster.local` (with a short form usable inside the same namespace), which normally resolves to the Service's load-balanced ClusterIP. A **headless Service** (`clusterIP: None`) skips load balancing and returns individual Pod IPs directly, which is exactly what **StatefulSets** use to give each ordinal Pod its own stable DNS record at `<pod-name>.<service>.<namespace>.svc.cluster.local`.
+</Callout>
+
+export const quizDnsDiscovery = [
+  {
+    q: 'What is the full DNS name format Kubernetes automatically assigns to a Service',
+    options: [
+      '<service-name>.cluster.local only',
+      '<service-name>.<namespace>.svc.cluster.local',
+      '<namespace>.<service-name>.local',
+      'Services do not get automatic DNS names',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why do StatefulSets need a headless Service for DNS purposes',
+    options: [
+      'They do not, StatefulSets work identically to Deployments for networking',
+      'A headless Service gives each ordinal Pod its own stable, individually addressable DNS record instead of one load-balanced address',
+      'Headless Services are faster than normal Services at DNS resolution',
+      'Headless Services are required for any Pod to get a DNS name at all',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What role does CoreDNS play in the cluster',
+    options: [
+      'It implements the virtual IP routing for Services on each node',
+      'It runs as the cluster internal DNS server, answering queries for Service and Pod DNS names',
+      'It schedules Pods onto nodes based on DNS records',
+      'It is only used for external, internet-facing DNS lookups',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does a headless Service (clusterIP: None) return when queried by DNS',
+    options: [
+      'Nothing, headless Services cannot be queried',
+      'A single virtual IP, exactly like a normal Service',
+      'The individual IPs of the matching, ready Pods directly',
+      'An error, since there is no ClusterIP to return',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="networking/dns-and-service-discovery" questions={quizDnsDiscovery} />
+
+<ProgressTracker client:visible id="networking/dns-and-service-discovery" />

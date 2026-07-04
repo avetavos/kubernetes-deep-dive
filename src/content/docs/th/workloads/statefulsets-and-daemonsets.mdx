@@ -1,0 +1,188 @@
+---
+title: 'StatefulSet และ DaemonSet'
+description: 'stable identity และ storage ต่อ Pod ด้วย StatefulSet และการรัน Pod ครบทุก node ด้วย DaemonSet'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**StatefulSet** ให้ Pod แต่ละตัวมี identity ที่คงที่และ unique พร้อม storage ของตัวเองที่อยู่ข้ามการ reschedule ส่วน **DaemonSet** การันตีว่ามี Pod ที่ตรงเงื่อนไขรันอยู่บนทุก node พอดีหนึ่งตัว สอง controller นี้แก้ปัญหาเรื่อง "identity" กับ "coverage" ต่างจาก Deployment ที่ให้แค่จำนวน replica เฉย ๆ
+
+## StatefulSet: identity คงที่และ storage ต่อ Pod
+
+ในขณะที่ Pod ของ Deployment สลับกันได้ Pod ของ StatefulSet ได้ **ordinal name** ที่คาดเดาได้ — `db-0`, `db-1`, `db-2` — และแต่ละ ordinal ก็เก็บ PersistentVolumeClaim **ของตัวเอง** ที่ create จาก `volumeClaimTemplates` ไว้ข้ามการ restart และ reschedule `db-1` จะกลับมาพร้อม volume เดิมเสมอ ไม่ว่าจะไปลงที่ node ไหนก็ตาม StatefulSet ยังต้องมี **headless Service** (`clusterIP: None`) ด้วย เพื่อให้ Pod แต่ละตัวได้ DNS name คงที่ของตัวเอง แทนที่ Service จะ load-balance กระจายไปทุกตัว
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+  labels:
+    app: db
+spec:
+  clusterIP: None
+  selector:
+    app: db
+  ports:
+    - port: 5432
+      name: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+spec:
+  serviceName: db
+  replicas: 3
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      containers:
+        - name: postgres
+          image: myregistry/postgres:16
+          ports:
+            - containerPort: 5432
+              name: postgres
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ['ReadWriteOnce']
+        resources:
+          requests:
+            storage: 10Gi
+```
+
+นี่คือรูปแบบที่ใช้ทุกครั้งที่สมาชิกต้องการ identity ที่คงที่ระหว่างกัน เช่น database และระบบ distributed ใด ๆ ที่ node 0 มีความพิเศษ หรือ peer ต้องหากันด้วยชื่อคงที่ ไม่ใช่หา Pod ที่บังเอิญมีอยู่ตอนนั้น
+
+```bash
+# Pods come up in order: db-0, then db-1, then db-2
+kubectl get pods -l app=db -o wide
+
+# Each Pod has its own stable DNS name via the headless Service
+kubectl run -it --rm debug --image=busybox:1.36 --restart=Never -- \
+  nslookup db-0.db.default.svc.cluster.local
+
+# Scaling and deletion are ordered too: highest ordinal first
+kubectl scale statefulset/db --replicas=2
+```
+
+การ deploy, scale และลบ Pod ของ StatefulSet เกิดขึ้น **ทีละตัว ตามลำดับ** เสมอ `db-1` จะไม่เริ่มจนกว่า `db-0` จะรันและ ready แล้ว ส่วนการ scale ลงก็ลบ ordinal สูงสุดก่อน การเรียงลำดับแบบนี้เองที่ทำให้ logic ตอน bootstrap ของระบบ distributed พึ่งพา "สมาชิกก่อนหน้าขึ้นแล้ว" ได้อย่างปลอดภัย
+
+## DaemonSet: หนึ่ง Pod บนทุก node
+
+**DaemonSet** ไม่มีค่า `replicas` เลย แต่จะ schedule Pod ที่ตรงเงื่อนไขพอดีหนึ่งตัวลงทุก node ใน cluster (หรือบางส่วน ถ้าจำกัดขอบเขตด้วย node selector หรือ affinity rule) พอ node ใหม่เข้าร่วม cluster DaemonSet controller ก็จะ schedule Pod ของมันลง node นั้นให้อัตโนมัติ พอ node ออกไป Pod ก็หายไปด้วย นี่คือรูปแบบสำหรับ agent ระดับ node เช่น log collector, monitoring และ metrics agent และ network plugin
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-log-agent
+spec:
+  selector:
+    matchLabels:
+      app: node-log-agent
+  template:
+    metadata:
+      labels:
+        app: node-log-agent
+    spec:
+      containers:
+        - name: log-agent
+          image: myregistry/log-agent:3.0.0
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+```
+
+```bash
+# One Pod per matching node -- the count follows the cluster, not a replicas field
+kubectl get pods -l app=node-log-agent -o wide
+```
+
+<Mermaid title="StatefulSet: ordered Pods with their own storage. DaemonSet: one Pod per node" code={statefulDaemonDiagram} />
+
+export const statefulDaemonDiagram = `flowchart TB
+  subgraph ss["StatefulSet db (ordered identity)"]
+    w0["db-0"] --- s0[("data-db-0")]
+    w1["db-1"] --- s1[("data-db-1")]
+    w2["db-2"] --- s2[("data-db-2")]
+  end
+  subgraph ds["DaemonSet node-log-agent (one per node)"]
+    n1["Node 1"] --> a1["log-agent"]
+    n2["Node 2"] --> a2["log-agent"]
+    n3["Node 3"] --> a3["log-agent"]
+  end`;
+
+## สาม controller สามความกังวลที่ต่างกัน
+
+Deployment ไม่สนใจว่า replica แต่ละตัวจะไปลง node ไหน และ Pod ของมันถูกออกแบบให้สลับกันได้ StatefulSet สนใจ **identity คงที่ต่อ ordinal** ชื่อเดิม storage เดิมทุกครั้ง DaemonSet สนใจ **coverage ระดับ node** หนึ่ง Pod ต่อหนึ่ง node จำนวนที่คุณไม่ต้องตั้งเองเพราะมันตามจำนวน node ของ cluster ไปเอง
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**StatefulSet** ให้ Pod มี ordinal name คงที่ (`db-0`, `db-1`, ...) มี PersistentVolumeClaim ของตัวเองต่อ Pod ผ่าน `volumeClaimTemplates` มีลำดับตอน rollout/scaling/deletion และต้องมี **headless Service** เพื่อให้แต่ละ Pod มี DNS ของตัวเอง **DaemonSet** schedule Pod ที่ตรงเงื่อนไขพอดีหนึ่งตัวลงทุก node (node ใหม่ได้ Pod อัตโนมัติ) โดยไม่มีค่า `replicas` ให้ตั้ง สรุปคือ Deployment = replica สลับกันได้ StatefulSet = identity ต่อ ordinal DaemonSet = coverage แบบหนึ่งต่อ node
+</Callout>
+
+export const quizStatefulDaemon = [
+  {
+    q: 'StatefulSet ให้ identity คงที่แบบไหนกับ Pod ที่ Deployment ไม่ให้',
+    options: [
+      'CPU limit คงที่ทุก Pod',
+      'ordinal name ที่คาดเดาได้ (db-0, db-1, ...) และ PersistentVolumeClaim คงที่ต่อ Pod ข้ามการ reschedule',
+      'public IP address ที่การันตีได้',
+      'ภูมิคุ้มกันจากการถูก evict โดย scheduler',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม StatefulSet ต้องมี headless Service (clusterIP: None)',
+    options: [
+      'ไม่ต้องมีก็ได้ headless Service เป็นแค่ของตกแต่ง',
+      'เพื่อให้ Pod แต่ละตัวมี DNS name คงที่ของตัวเอง แทนที่จะ load balance traffic กระจายไปทุกตัว',
+      'เพื่อปิด networking ของ Pod ใน StatefulSet ทั้งหมด',
+      'เพื่อให้ทุก Pod ได้ IP address เดียวกันเป๊ะ ๆ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมถึงใช้ DaemonSet สำหรับ log-collection agent แทน Deployment',
+    options: [
+      'DaemonSet รันถูกกว่า Deployment เสมอ',
+      'DaemonSet การันตีว่ามี agent Pod หนึ่งตัวต่อ node ที่ตรงเงื่อนไขพอดี รวมถึง node ที่เพิ่มเข้ามาทีหลังด้วย ซึ่งตรงกับสิ่งที่ agent ระดับ node ต้องการ',
+      'Deployment รันได้แค่ replica เดียว',
+      'DaemonSet รันได้เฉพาะใน default namespace เท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'สิ่งที่ Deployment ตั้งใจไม่การันตี ต่างจาก StatefulSet คืออะไร',
+    options: [
+      'replica Pod แต่ละตัวจะไป node ไหนหรือมี identity คงที่แบบไหน replica สลับกันได้',
+      'image ของ container ที่ใช้',
+      'จำนวน replica',
+      'label selector ที่ match กับ Pod ของมัน',
+    ],
+    answer: 0,
+  },
+];
+
+<Quiz client:visible id="workloads/statefulsets-and-daemonsets" questions={quizStatefulDaemon} />
+
+<ProgressTracker client:visible id="workloads/statefulsets-and-daemonsets" />

@@ -1,0 +1,131 @@
+---
+title: 'Scheduler กับ Resource Requests'
+description: 'requests กับ limits คุมการ scheduling และการบังคับใช้ runtime อย่างไร QoS class ตัดสินลำดับ eviction อย่างไร และ scheduler filter score และ bind Pod เข้า Node อย่างไร'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+Scheduler วาง Pod ลงบน Node ที่มี capacity ว่างพอจะรองรับ **requests** ของมัน ส่วน **limits** คือเพดานที่จำกัดว่า Pod ใช้ resource ได้มากแค่ไหนตอนที่รันอยู่จริง
+
+## requests คือพื้นล่าง limits คือเพดานบน
+
+ทุก container ใน Pod ประกาศ `resources.requests` และ `resources.limits` สำหรับ CPU และ memory ได้ และตัวเลขสองตัวนี้ทำหน้าที่ต่างกันโดยสิ้นเชิง
+
+- **`requests`** คือขั้นต่ำที่ container ต้องการแน่ ๆ scheduler จะนับ Node เป็นตัวเลือกก็ต่อเมื่อ Node นั้นมี capacity ที่ *ยังไม่ถูกจอง* พอจะครอบคลุม requests ของทุก container — มันไม่สนใจ limits เลยตอนตัดสินใจว่า Pod ไปลงที่ไหนได้
+- **`limits`** คือเพดานแข็งที่ถูกบังคับใช้ตอน runtime หลังจาก Pod รันไปแล้ว CPU เป็น resource ที่บีบอัดได้ ดังนั้นการใช้เกิน limit ของ CPU จะถูก **throttle** ไม่ใช่ถูกฆ่า ส่วน memory บีบอัดไม่ได้ container ที่ใช้ memory เกิน limit จะโดน **OOMKilled** แล้ว restart
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: payments-worker
+spec:
+  containers:
+    - name: worker
+      image: payments-worker:1.4.0
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "256Mi"
+        limits:
+          cpu: "500m"
+          memory: "256Mi"
+```
+
+```bash
+# See which node a Pod landed on, and check the node's spare capacity
+kubectl get pod payments-worker -o jsonpath='{.spec.nodeName}{"\n"}'
+kubectl describe node <node-name> | grep -A5 "Allocated resources"
+```
+
+เพราะ scheduler มองแค่ requests เท่านั้น Pod ที่ไม่ตั้ง requests เลยจึงมองไม่เห็นในสายตาของ capacity planning มันถูก schedule ไปที่ไหนก็ได้ และมันยังแย่ง resource จน Pod ข้าง ๆ ที่ตั้ง requests ไว้ถูกต้องอาจอดได้ด้วย
+
+## QoS class ตัดสินว่าใครโดน evict ก่อน
+
+Kubernetes คำนวณ **Quality of Service (QoS) class** ให้ทุก Pod อัตโนมัติจาก requests และ limits ของมัน — คุณไม่ต้องตั้งค่า field นี้เอง
+
+- **Guaranteed** — ทุก container มี `requests` เท่ากับ `limits` ทั้ง CPU และ memory
+- **Burstable** — มีอย่างน้อยหนึ่ง container ตั้ง requests ไว้ แต่ค่าต่างจาก limits หรือมีแค่บาง resource ที่ตั้งทั้งคู่
+- **BestEffort** — ไม่มี container ไหนตั้ง requests หรือ limits เลย
+
+```bash
+# QoS class is computed and reported on the Pod status
+kubectl get pod payments-worker -o jsonpath='{.status.qosClass}{"\n"}'
+```
+
+QoS class จะมีผลก็ต่อเมื่อ Node เริ่มขาด resource เมื่อ kubelet ต้องเรียก memory คืนภายใต้ pressure มันจะ evict Pod ระดับ **BestEffort** ก่อน ตามด้วย **Burstable** และจะแตะ Pod ระดับ **Guaranteed** ก็ต่อเมื่อไม่เหลือทางเลือกอื่นแล้วเท่านั้น นี่คือจุดที่การตั้ง requests และ limits อย่างระมัดระวังส่งผลตรง ๆ และเห็นชัดว่า workload ไหนของคุณจะรอดเมื่อมี noisy neighbor
+
+## Scheduler เลือก Node อย่างไร filter score bind
+
+สำหรับทุก Pod ที่ยังไม่ถูก schedule scheduler จะรันการตัดสินใจสองขั้นตอนก่อนจะฟันธง
+
+1. **Filtering** — ตัด Node ที่รัน Pod นี้ไม่ได้เด็ดขาดออกไปทั้งหมด ไม่ว่าจะเป็น CPU/memory ว่างไม่พอครอบคลุม requests, มี taint ที่ Pod ไม่ tolerate หรือมี affinity/anti-affinity rule ที่ตัดออก ที่เหลือคือชุด Node ที่ *เป็นไปได้*
+2. **Scoring** — จัดอันดับ Node ที่เป็นไปได้ด้วยชุด scoring plugin (กระจายข้าม zone, อัด density แบบ bin-pack และอื่น ๆ) แล้วเลือกตัวที่คะแนนสูงสุด
+
+เมื่อ Node ตัวใดชนะ scheduler จะ **bind** Pod เข้ากับมันโดยเขียน `spec.nodeName` แล้ว kubelet บน Node นั้นจะรับช่วงต่อและสั่ง start container
+
+<Mermaid title="A Pod's requests and limits flowing through the scheduler's filter, score, and bind steps" code={schedulerPipelineDiagram} />
+
+export const schedulerPipelineDiagram = `flowchart LR
+  pod["Pod spec\\n(requests + limits)"] --> filter["Filter:\\nwhich Nodes CAN run it"]
+  filter --> score["Score:\\nrank the feasible Nodes"]
+  score --> bind["Bind:\\nPod assigned to winning Node"]
+  bind --> node["Node"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**`requests`** คือขั้นต่ำที่ scheduler จองพื้นที่ให้แน่นอน ส่วน **`limits`** คือเพดานแข็งที่บังคับใช้ตอน runtime — CPU เกิน limit จะถูก **throttle** memory เกิน limit จะทำให้ container โดน **OOMKilled** Kubernetes คำนวณ **QoS class** (**Guaranteed**, **Burstable** หรือ **BestEffort**) ให้อัตโนมัติจากค่าพวกนี้ และมันตัดสินลำดับ eviction เมื่อ resource ตึง — BestEffort ไปก่อน Guaranteed ไปสุดท้าย ตัว scheduler เองทำงานสองขั้น: **filtering** จนเหลือ Node ที่เป็นไปได้ แล้ว **scoring** เพื่อเลือกตัวที่เหมาะที่สุด ก่อนจะ **bind** Pod เข้าที่
+</Callout>
+
+export const quizScheduler = [
+  {
+    q: 'ตอน scheduler ตัดสินใจว่า Pod รันที่ไหนได้ มันเทียบอะไรกับอะไร',
+    options: [
+      'requests ของ Pod เทียบกับ capacity ที่ยังว่างและไม่ถูกจองของแต่ละ Node',
+      'limits ของ Pod เทียบกับ capacity รวมทั้งหมดของแต่ละ Node',
+      'ขนาด image ของ container ใน Pod',
+      'จำนวน label ที่ติดอยู่บน Pod',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'container ใช้ memory เกิน limit จะเกิดอะไรขึ้น',
+    options: [
+      'ถูก throttle เหมือน CPU',
+      'ไม่มีอะไรเกิดขึ้น memory limit เป็นแค่คำแนะนำ',
+      'container โดน OOMKilled แล้ว restart',
+      'Pod ถูกย้ายไป Node อื่นอัตโนมัติ',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'เมื่อ Node ขาด memory QoS class ไหนโดน evict ก่อน',
+    options: [
+      'Guaranteed',
+      'Burstable',
+      'BestEffort',
+      'ถูก evict พร้อมกันหมดทุกตัว',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'scheduler รันสองขั้นตอนหลักอะไรก่อนจะ bind Pod เข้ากับ Node',
+    options: [
+      'Scoring แล้วค่อย Filtering',
+      'Filtering แล้วค่อย Scoring',
+      'Logging แล้วค่อย Binding',
+      'Binding แล้วค่อย Filtering',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="scheduling-and-scaling/the-scheduler-and-resource-requests" questions={quizScheduler} />
+
+<ProgressTracker client:visible id="scheduling-and-scaling/the-scheduler-and-resource-requests" />

@@ -1,0 +1,138 @@
+---
+title: 'Pod: หน่วยที่เล็กที่สุดใน Kubernetes'
+description: 'Pod ในฐานะหน่วยที่เล็กที่สุดที่ deploy ได้ใน Kubernetes การแชร์ network และ volume, pattern แบบ sidecar และ init container และ lifecycle ของ Pod'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**Pod** คือหน่วยที่เล็กที่สุดที่ deploy ได้ใน Kubernetes container หนึ่งตัวหรือมากกว่านั้นที่รันอยู่บน node เดียวกันเสมอ แชร์ network namespace เดียวกัน และแชร์ volume ได้ด้วยถ้าต้องการ
+
+## สิ่งที่ container ใน Pod เดียวกันแชร์กัน
+
+container ทุกตัวใน Pod เดียวกันได้ **IP address** เดียวกันและ **network namespace** เดียวกัน หมายความว่า container สองตัวใน Pod เดียวกันคุยกันผ่าน `localhost` ได้เลย ที่ port ไหนก็ได้ที่อีกตัวเปิดรอ ไม่ต้องผ่าน networking ของ cluster เลย container ใน Pod เดียวกันยังแชร์ **volume** เดียวกันได้ด้วย ซึ่งเป็นวิธีที่ sidecar อ่านไฟล์ที่ container หลักเขียนไว้
+
+```bash
+# From inside the "app" container, a sidecar in the same Pod is reachable on localhost
+kubectl exec -it app-with-sidecar -c app -- curl -s http://localhost:9090/metrics
+```
+
+การแชร์ namespace แบบนี้คือเหตุผลทั้งหมดที่ Pod มีอยู่เป็น concept แยกต่างหาก มันคือขอบเขตที่ทำให้ "container พวกนี้อยู่ node เดียวกันเสมอและคุยกันผ่าน localhost ได้" เป็นจริงเสมอ container ที่อยู่คนละ Pod ไม่ได้สิ่งนี้ฟรี ๆ ต้องผ่าน Service และ address ที่ route ได้เท่านั้น
+
+## Multi-container pattern: sidecar และ init container
+
+สอง pattern นี้ครอบคลุมเกือบทุกเหตุผลที่จะใส่ container มากกว่าหนึ่งตัวใน Pod เดียว
+
+- **Sidecar** container ผู้ช่วยที่รันคู่กับ container หลักตลอดอายุของ Pod เช่น log shipper ที่ tail log file ของ container หลักแล้วส่งต่อ หรือ proxy ที่จัดการ TLS termination
+- **Init container** container ที่รัน **จนจบ ตามลำดับ ก่อนที่ container หลักตัวไหนจะเริ่มทำงาน** ใช้บ่อยเพื่อรอให้ dependency พร้อมใช้งาน หรือรัน migration ครั้งเดียวก่อน container หลักจะบูต
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app-with-sidecar
+spec:
+  restartPolicy: Always
+  initContainers:
+    - name: wait-for-db
+      image: busybox:1.36
+      command: ['sh', '-c', 'until nc -z db 5432; do sleep 1; done']
+  containers:
+    - name: app
+      image: myregistry/app:1.4.0
+      ports:
+        - containerPort: 8080
+    - name: log-shipper
+      image: myregistry/log-shipper:2.1.0
+      volumeMounts:
+        - name: logs
+          mountPath: /var/log/app
+  volumes:
+    - name: logs
+      emptyDir: {}
+```
+
+`wait-for-db` จะบล็อกไม่ให้ Pod เริ่มทำงานจนกว่าจะเชื่อมต่อ database ได้ แล้ว exit สำเร็จ จากนั้น `app` กับ `log-shipper` ถึงจะเริ่ม โดยแชร์ network namespace และ volume `logs` ของ Pod ร่วมกัน
+
+<Mermaid title="One Pod: an init container runs first, then the main container and a sidecar share one network namespace" code={podsDiagram} />
+
+export const podsDiagram = `flowchart TB
+  subgraph pod["Pod app-with-sidecar (one IP, one network namespace)"]
+    init["initContainer: wait-for-db (runs first, to completion)"] --> app["container: app"]
+    app -->|localhost| sidecar["container: log-shipper (sidecar)"]
+  end`;
+
+## Lifecycle ของ Pod: phase, state และ restartPolicy
+
+Pod เดินผ่านชุด **phase** เล็ก ๆ ได้แก่ `Pending` (ถูกรับเข้าระบบแล้วแต่ container ยังไม่ได้รันครบทุกตัว มักติดที่การ schedule หรือดึง image) `Running` (bound กับ node แล้ว มี container อย่างน้อยหนึ่งตัวกำลังรัน) `Succeeded` หรือ `Failed` (container ทุกตัว terminate แล้ว) และบางครั้งก็ `Unknown` (ดึง state ของ Pod ไม่ได้) ใต้ phase ลงไป container แต่ละตัวมี **state** ของตัวเอง คือ `Waiting`, `Running` หรือ `Terminated`
+
+สิ่งที่เกิดขึ้นเมื่อ container exit ถูกควบคุมด้วย `restartPolicy` บน Pod spec `Always` restart container ที่ exit ทุกครั้งไม่มีสิ้นสุด (ค่า default ใช้กับ service ที่รันระยะยาว) `OnFailure` restart เฉพาะตอน exit code ไม่เป็นศูนย์ (ใช้กับ Job) และ `Never` ไม่ restart เลย (ก็ใช้กับ Job บ่อยเหมือนกัน หรือ Pod สำหรับ debug แบบครั้งเดียว)
+
+```bash
+# Watch a Pod move through its phases
+kubectl get pod app-with-sidecar --watch
+
+# Container-level detail: state (Waiting/Running/Terminated), restart count, exit code
+kubectl describe pod app-with-sidecar
+```
+
+## ทำไมถึงไม่รัน Pod เปล่า ๆ ตรง ๆ ในทางปฏิบัติ
+
+Pod ถูกออกแบบมาให้เป็น ephemeral และแทบไม่มีใคร create มันตรง ๆ ถ้า `kubectl apply` Pod เปล่า ๆ แล้ว node ของมันล่ม หรือ container ข้างในพัง เกินกว่าที่ `restartPolicy` จะช่วยได้ **ไม่มีอะไรมา recreate Pod นั้นให้** มันหายไปเฉย ๆ ในทางปฏิบัติคุณแทบจะ create Deployment, StatefulSet หรือ DaemonSet แทนเสมอ controller เหล่านั้นถือ Pod template ไว้ คอย watch state จริงของ cluster และ recreate Pod ทุกครั้งที่ของจริงเบี่ยงไปจากจำนวนที่ต้องการ ส่วนที่เหลือของ module นี้คือ controller พวกนั้น
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**Pod** คือ container หนึ่งตัวหรือมากกว่าที่แชร์ network namespace เดียวกัน (IP เดียว คุยกันผ่าน **localhost** ได้) และแชร์ volume ได้ถ้าต้องการ **init container** รันจนจบตามลำดับก่อนที่ **sidecar** และ container หลักตัวอื่นจะเริ่ม phase ของ Pod (`Pending`/`Running`/`Succeeded`/`Failed`/`Unknown`) และ `restartPolicy` (`Always`/`OnFailure`/`Never`) คุม lifecycle ของมัน แต่ **Pod เปล่า ๆ ที่ตายไปแล้วจะไม่ถูก recreate** งานนั้นเป็นของ controller ที่จะเรียนต่อไป
+</Callout>
+
+export const quizPods = [
+  {
+    q: 'container ทุกตัวใน Pod เดียวกันแชร์อะไรกันโดย default',
+    options: [
+      'ไม่แชร์อะไรเลย แยกกันอิสระทั้งหมด',
+      'network namespace เดียวกัน (IP เดียวของ Pod) และแชร์ volume ที่ mount ได้ถ้าต้องการ',
+      'แชร์แค่ volume เท่านั้น ไม่แชร์ network',
+      'image ของ container เดียวกัน',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'พฤติกรรมหลักของ init container คืออะไร',
+    options: [
+      'รันคู่กับ container หลักตลอดอายุของ Pod',
+      'รันจนจบ ตามลำดับ ก่อนที่ container หลักตัวไหนจะเริ่ม',
+      'มาแทน container หลักทุกครั้งที่ container หลักพัง',
+      'รันบน host network ของ node เท่านั้น ไม่รันใน Pod',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Pod เปล่า ๆ (create ตรง ๆ ไม่มี controller) container ตัวเดียวข้างในพังซ้ำ ๆ แล้ว node ของมันก็ล่มไปเลย เกิดอะไรขึ้นกับ Pod',
+    options: [
+      'Kubernetes recreate มันบน node ที่ยังใช้งานได้โดยอัตโนมัติ',
+      'ไม่มีอะไร recreate มันให้ Pod เปล่า ๆ ที่หายไปแล้วก็หายไปเลย นี่คือเหตุผลที่ต้องใช้ controller แทน',
+      'มันกลายเป็น DaemonSet โดยอัตโนมัติ',
+      'scheduler จะพยายาม create มันใหม่ไปเรื่อย ๆ ไม่มีสิ้นสุด',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'restartPolicy ของ Pod รับค่าอะไรได้บ้าง',
+    options: [
+      'Always, OnFailure หรือ Never',
+      'Retry, Skip หรือ Ignore',
+      'True หรือ False',
+      'นับ restart count อย่างเดียว ไม่มีชื่อ policy',
+    ],
+    answer: 0,
+  },
+];
+
+<Quiz client:visible id="workloads/pods-the-atomic-unit" questions={quizPods} />
+
+<ProgressTracker client:visible id="workloads/pods-the-atomic-unit" />

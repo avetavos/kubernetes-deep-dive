@@ -1,0 +1,150 @@
+---
+title: 'Pod และ Cluster Security'
+description: 'SecurityContext ทำให้ container แข็งแรงขึ้นยังไง Pod Security Admission มาแทนที่ PodSecurityPolicy ยังไง และ security posture จริงต้องมีอะไรอีกบ้าง'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+การทำให้ Pod แข็งแรงขึ้นคือการวางหลายชั้นควบคุมที่เป็นอิสระต่อกัน คือ `securityContext` ต่อ container, ระดับ Pod Security Admission ต่อ namespace, และการป้องกันระดับ cluster อย่าง etcd encryption ซึ่งไม่มีชั้นไหนทดแทนอีกชั้นได้
+
+## SecurityContext: ทำให้ container แข็งแรงจากข้างใน
+
+`securityContext` ตั้งได้ทั้งระดับ Pod (เป็นค่า default ให้ทุก container) และระดับ container (override เฉพาะ container นั้น) field ที่สำคัญที่สุดสำหรับ hardening มีดังนี้
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: checkout
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+  containers:
+    - name: checkout
+      image: checkout:2.3.0
+      securityContext:
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        privileged: false
+        capabilities:
+          drop: ["ALL"]
+          add: ["NET_BIND_SERVICE"]
+```
+
+- **`runAsNonRoot`** ปฏิเสธไม่ให้ container start ถ้า image ของมันจะรันเป็น UID 0
+- **`runAsUser` / `runAsGroup`** ล็อก UID/GID ที่ container รันจริง ไม่ว่า `Dockerfile` ของ image จะระบุไว้ว่ายังไง
+- **`readOnlyRootFilesystem`** mount root filesystem ของ container แบบอ่านอย่างเดียว ทำให้คนที่ได้ code execution ไม่สามารถเขียน payload ลง disk ให้อยู่ถาวรได้
+- **`allowPrivilegeEscalation: false`** กันไม่ให้ process ได้สิทธิ์มากกว่า parent ของมัน เช่นผ่าน setuid binary
+- **`privileged: false`** ไม่ให้ container เข้าถึง device และ kernel capability ของ host แบบเต็มรูปแบบเด็ดขาด container ที่เป็น privileged นั้นเทียบเท่ากับ root บนโหนดโดยตรง ดังนั้นควรใช้เป็นทางเลือกสุดท้าย ไม่ใช่ default
+- **`capabilities`** Linux แบ่งสิทธิ์ของ root ออกเป็น capability ย่อย ๆ การ drop `ALL` แล้วเพิ่มกลับเฉพาะที่จำเป็นจริง ๆ (เช่น `NET_BIND_SERVICE` สำหรับ bind port ต่ำกว่า 1024) ปลอดภัยกว่าการรันด้วย user ที่มี capability set แบบ default เต็มชุดมาก
+
+```bash
+kubectl get pod checkout -o jsonpath='{.spec.securityContext}'
+kubectl get pod checkout -o jsonpath='{.spec.containers[0].securityContext}'
+```
+
+## Pod Security Admission: บังคับ baseline ระดับ namespace
+
+**Pod Security Admission** ถูกฝังอยู่ใน API server และ GA มาตั้งแต่ Kubernetes 1.25 มันคือตัวที่ **มาแทนที่** PodSecurityPolicy รุ่นเก่า ซึ่งถูกถอดออกไปแล้วใน 1.25 นั่นคือ PodSecurityPolicy หายไปเลย ไม่ใช่แค่ deprecated ดังนั้น cluster ที่รัน 1.25 ขึ้นไปจึงต้องใช้ Pod Security Admission (หรือ policy engine ของ third-party) แทน
+
+Pod Security Admission ทำงานผ่าน namespace label ล้วน ๆ ไม่ต้องสร้างหรือ bind policy object แยกเลย
+
+```bash
+kubectl label --overwrite ns checkout \
+  pod-security.kubernetes.io/enforce=restricted \
+  pod-security.kubernetes.io/warn=restricted \
+  pod-security.kubernetes.io/audit=restricted
+```
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: checkout
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+```
+
+มี Pod Security Standards ระดับมาตรฐานสามระดับ เรียงจากหลวมสุดไปเข้มสุด
+
+- **`privileged`** ไม่มีข้อจำกัดใด ๆ เลย เท่ากับปิด Pod Security Admission สำหรับ namespace นั้น
+- **`baseline`** บล็อกช่องทาง privilege-escalation ที่รู้จักกันชัดเจนที่สุด (host namespace, privileged container, volume type อันตรายบางแบบ) ในขณะที่ยังเข้ากันได้กับ workload ทั่วไปส่วนใหญ่
+- **`restricted`** เข้มงวดมาก ต้องมี `runAsNonRoot`, drop capabilities, และห้าม privilege escalation ตามแนวทาง best practice ของการทำ Pod hardening ในปัจจุบันอย่างใกล้ชิด
+
+แต่ละระดับมีสามโหมดที่เป็นอิสระต่อกัน คือ `enforce` ที่บล็อก Pod ที่ไม่ผ่านเงื่อนไขจริง ๆ ไม่ให้ถูก admit ส่วน `audit` กับ `warn` เป็นแบบไม่บล็อก คือแค่ log การละเมิดหรือโชว์ warning ฝั่ง client โดยไม่หยุด Pod รูปแบบการ rollout ที่นิยมกันคือ `enforce` ระดับที่ cluster ผ่านอยู่แล้ว พร้อม `warn`/`audit` ที่ระดับเข้มกว่า เพื่อดูว่าอะไรจะพังก่อนที่จะขยับ `enforce` ให้เข้มขึ้นจริง
+
+## นอกเหนือจาก Pod: การควบคุมระดับ cluster และ network
+
+ทั้ง SecurityContext และ Pod Security Admission ทำงานที่ระดับ Pod แต่ security posture ที่แท้จริงต้องมีการควบคุมระดับ cluster ด้วย
+
+Secret ถูก encode ด้วย base64 เท่านั้นโดย default ซึ่งเป็นแค่ encoding ไม่ใช่ encryption ใครก็ตามที่มีสิทธิ์อ่าน Secret ผ่าน API (หรือเข้าถึงไฟล์ข้อมูลของ etcd โดยตรง) สามารถ decode มันออกมาได้ง่ายมาก การควบคุมระดับ cluster ที่ปกป้อง Secret data at rest ได้จริงคือ **etcd encryption at rest** ซึ่ง API server จะ apply ให้อัตโนมัติ ทำให้ข้อมูลของ Secret ถูก encrypt ก่อนที่จะถูกเขียนลง storage ของ etcd
+
+**NetworkPolicy** (พูดถึงในโมดูล Networking) ก็เป็นส่วนสำคัญของ security posture ด้วยเช่นกัน RBAC กับ Pod Security Admission ควบคุมว่าตัวตนของ Pod ทำอะไรกับ API ได้บ้างและ Pod ถูก configure ยังไง แต่ทั้งสองอย่างไม่ได้จำกัดว่า Pod ไหนคุยกับ Pod ไหนได้ผ่าน network นั่นเป็นหน้าที่ของ NetworkPolicy และ security story ที่สมบูรณ์ต้องมีทั้งสามชั้นทำงานร่วมกัน
+
+<Mermaid title="Pod ถูก admit หรือ reject โดย Pod Security Admission ตามระดับ enforce ของ namespace นั้น" code={podSecurityDiagram} />
+
+export const podSecurityDiagram = `flowchart LR
+  submit["Pod submitted to namespace"] --> check{"Complies with\\nnamespace enforce level?"}
+  ns["Namespace label:\\npod-security.kubernetes.io/enforce"] --> check
+  check -- "yes" --> admitted["Pod admitted"]
+  check -- "no" --> rejected["Pod rejected"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**`securityContext`** ต่อ container ทำให้ container รันได้แข็งแรงขึ้นจริง ๆ ผ่าน `runAsNonRoot`, ล็อก `runAsUser`/`runAsGroup`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, drop Linux `capabilities`, และไม่ใช้ `privileged: true` เว้นแต่จำเป็นจริง ๆ **Pod Security Admission** GA มาตั้งแต่ Kubernetes 1.25 บังคับ baseline ระดับ namespace ผ่าน label อย่าง `pod-security.kubernetes.io/enforce: restricted` ด้วยระดับ **privileged / baseline / restricted** (หลวมสุดไปเข้มสุด) พร้อม `audit`/`warn` แบบไม่บล็อกสำหรับ rollout แบบค่อยเป็นค่อยไป มันคือตัวที่ **มาแทนที่** PodSecurityPolicy ที่ถูกถอดออกไปใน 1.25 อย่างสมบูรณ์ Secret ถูก encode ด้วย base64 เท่านั้น ดังนั้น **etcd encryption at rest** คือการควบคุมระดับ cluster ที่ปกป้องมันได้จริง และ **NetworkPolicy** เติมเต็มภาพด้วยการจำกัด traffic ระหว่าง Pod
+</Callout>
+
+export const quizPodSecurity = [
+  {
+    q: 'อะไรมาแทนที่ PodSecurityPolicy และตั้งแต่เมื่อไหร่',
+    options: [
+      'NetworkPolicy ตั้งแต่ Kubernetes 1.20',
+      'Pod Security Admission ซึ่ง GA ใน Kubernetes 1.25 พร้อมกับที่ PodSecurityPolicy ถูกถอดออก',
+      'RBAC ตั้งแต่ Kubernetes 1.18',
+      'ไม่มีอะไรมาแทนที่ PodSecurityPolicy ยังเป็นมาตรฐานปัจจุบันอยู่',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Pod Security Standards สามระดับเรียงจากหลวมสุดไปเข้มสุดคืออะไร',
+    options: [
+      'restricted, baseline, privileged',
+      'baseline, restricted, privileged',
+      'privileged, baseline, restricted',
+      'enforce, audit, warn',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'SecurityContext ระดับ container ควบคุมอะไรบ้างจริง ๆ',
+    options: [
+      'Pod ถูกสร้างใน namespace ไหน',
+      'Pod ถูก schedule ไปที่ Node ไหน',
+      'สิ่งต่าง ๆ อย่าง runAsNonRoot, readOnlyRootFilesystem, allowPrivilegeEscalation, และการ drop Linux capabilities',
+      'Service ไหน route traffic มาที่ Pod',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'ทำไม Secret ที่ encode ด้วย base64 แล้วยังต้องมี etcd encryption at rest เพื่อความลับที่แท้จริง',
+    options: [
+      'การ encode แบบ base64 เป็น encryption ที่แข็งแรงอยู่แล้วในตัวมันเอง',
+      'base64 เป็นแค่ encoding ไม่ใช่ encryption ใครก็ตามที่มีสิทธิ์อ่าน Secret หรือเข้าถึงข้อมูลของ etcd สามารถ decode มันออกมาได้ง่ายมากถ้าไม่มี etcd encryption at rest',
+      'ต้องมี etcd encryption at rest ก่อนถึงจะสร้าง Secret ได้เลย',
+      'ข้อมูลที่ encode ด้วย base64 เก็บใน etcd ไม่ได้ถ้าไม่มี encryption',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="observability-and-security/pod-and-cluster-security" questions={quizPodSecurity} />
+
+<ProgressTracker client:visible id="observability-and-security/pod-and-cluster-security" />

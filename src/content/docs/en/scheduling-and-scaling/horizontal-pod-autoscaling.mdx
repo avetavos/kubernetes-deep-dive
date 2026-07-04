@@ -1,0 +1,149 @@
+---
+title: 'Horizontal Pod Autoscaling'
+description: 'How the HorizontalPodAutoscaler uses metrics-server and resource requests to change a workload replica count, and how it differs from VerticalPodAutoscaler and Cluster Autoscaler.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The idea in one sentence
+
+A **HorizontalPodAutoscaler** watches a metric against a target and adjusts a Deployment's `replicas` between a minimum and maximum to keep that metric near the target — nothing more.
+
+## Two hard prerequisites before HPA does anything
+
+The HorizontalPodAutoscaler (`autoscaling/v2`) sounds simple, but it silently does nothing at all unless two things are true first.
+
+1. **The workload's Pods must have resource `requests` set.** By default HPA scales on CPU or memory *utilization*, and utilization is calculated as a percentage of what a Pod requested — no requests means there is no denominator to compute a percentage from.
+2. **`metrics-server`** (or a custom/external metrics adapter) **must be installed in the cluster.** HPA does not measure anything itself; it reads metrics that something else collected and exposed through the metrics API. No metrics source, no scaling decision, ever.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      containers:
+        - name: web-app
+          image: web-app:3.2.0
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+```
+
+```bash
+# metrics-server has to actually be running before HPA can read any utilization
+kubectl get deployment metrics-server -n kube-system
+```
+
+## Defining the HorizontalPodAutoscaler
+
+With requests in place and metrics-server running, the HPA object itself just names a target and a metric:
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+```
+
+```bash
+kubectl get hpa web-app
+kubectl describe hpa web-app
+```
+
+This says: keep average CPU utilization across all `web-app` Pods near 60% of their requested CPU, scaling the Deployment anywhere between 3 and 20 replicas to hold that line. HPA also supports scaling on custom, non-resource metrics — queue depth, requests-per-second, and similar — through the `custom.metrics.k8s.io` and `external.metrics.k8s.io` APIs, for teams whose bottleneck is not CPU or memory at all.
+
+## What HPA does not do
+
+It is worth being precise about the boundary here, because two other autoscalers sound similar but do completely different jobs:
+
+- **HorizontalPodAutoscaler** changes how many replicas a Deployment or StatefulSet has. That is the entire job.
+- **VerticalPodAutoscaler (VPA)** changes the `requests`/`limits` of the Pods that already exist, resizing them instead of adding more of them.
+- **Cluster Autoscaler** changes how many Nodes the cluster has, adding or removing machines underneath everything else (the next lesson covers this).
+
+<Mermaid title="metrics-server feeding Pod CPU utilization into the HPA controller, which adjusts a Deployment's replica count" code={hpaDiagram} />
+
+export const hpaDiagram = `flowchart LR
+  pods["Deployment Pods"] --> ms["metrics-server"]
+  ms --> hpa["HorizontalPodAutoscaler controller"]
+  hpa -->|"raise or lower"| replicas["Deployment.spec.replicas"]`;
+
+<Callout title="The one-line takeaway">
+A **HorizontalPodAutoscaler** (`autoscaling/v2`) changes a Deployment's or StatefulSet's `replicas` to keep a watched metric near a target, but it does nothing without two prerequisites: the Pods must have resource **`requests`** set (utilization is a percentage of the request), and **metrics-server** or a custom/external metrics adapter must be installed to supply the metric. It can also scale on custom or external metrics for non-resource signals. HPA only ever changes replica count — resizing existing Pods is **VerticalPodAutoscaler**'s job, and adding or removing Nodes is **Cluster Autoscaler**'s job.
+</Callout>
+
+export const quizHpa = [
+  {
+    q: 'What must be installed in a cluster before HPA can make any scaling decision at all?',
+    options: [
+      'A LoadBalancer Service',
+      'metrics-server (or a custom/external metrics adapter)',
+      'A second scheduler',
+      'A PodDisruptionBudget',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why are resource requests a hard prerequisite for CPU/memory-based HPA?',
+    options: [
+      'Requests are only cosmetic and do not actually matter',
+      'Utilization is calculated as a percentage of the requested value, so without a request there is nothing to calculate the percentage against',
+      'HPA uses requests to set the container image version',
+      'Requests determine the maxReplicas value automatically',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does HorizontalPodAutoscaler change, compared to VerticalPodAutoscaler and Cluster Autoscaler?',
+    options: [
+      'HPA changes replica count; VPA resizes existing Pods requests/limits; Cluster Autoscaler changes the number of Nodes',
+      'They all do exactly the same thing under different names',
+      'HPA changes Node count; VPA changes replica count; Cluster Autoscaler resizes Pods',
+      'Only Cluster Autoscaler can change replica count',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'Besides CPU and memory, what else can an HPA scale on?',
+    options: [
+      'Nothing else, HPA only supports CPU and memory',
+      'Custom and external metrics such as queue depth or requests-per-second, via the custom.metrics.k8s.io and external.metrics.k8s.io APIs',
+      'The number of Nodes in the cluster',
+      'The Pod image tag',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="scheduling-and-scaling/horizontal-pod-autoscaling" questions={quizHpa} />
+
+<ProgressTracker client:visible id="scheduling-and-scaling/horizontal-pod-autoscaling" />

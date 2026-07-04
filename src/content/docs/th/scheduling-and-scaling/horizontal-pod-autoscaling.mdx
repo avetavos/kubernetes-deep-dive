@@ -1,0 +1,149 @@
+---
+title: 'Horizontal Pod Autoscaling'
+description: 'HorizontalPodAutoscaler ใช้ metrics-server และ resource requests เพื่อปรับจำนวน replica ของ workload อย่างไร และต่างจาก VerticalPodAutoscaler กับ Cluster Autoscaler อย่างไร'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**HorizontalPodAutoscaler** จับตา metric เทียบกับ target แล้วปรับ `replicas` ของ Deployment ให้อยู่ระหว่างค่าต่ำสุดกับสูงสุด เพื่อดึง metric นั้นให้ใกล้ target — แค่นั้นเอง
+
+## สองข้อบังคับก่อน HPA จะทำงานได้
+
+HorizontalPodAutoscaler (`autoscaling/v2`) ฟังดูง่าย แต่มันจะไม่ทำอะไรเลยแบบเงียบ ๆ ถ้าสองอย่างนี้ยังไม่จริง
+
+1. **Pod ของ workload ต้องตั้ง resource `requests` ไว้** โดย default HPA scale ตาม CPU หรือ memory *utilization* และ utilization คำนวณเป็นเปอร์เซ็นต์ของสิ่งที่ Pod request ไว้ — ไม่มี requests ก็ไม่มีตัวหารมาคำนวณเปอร์เซ็นต์
+2. **`metrics-server`** (หรือ custom/external metrics adapter) **ต้องถูกติดตั้งใน cluster** HPA เองไม่วัดอะไรเลย มันแค่อ่าน metric ที่อะไรบางอย่างเก็บและ expose ผ่าน metrics API ไม่มีแหล่ง metric ก็ไม่มีการตัดสินใจ scale เกิดขึ้นเลย
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      containers:
+        - name: web-app
+          image: web-app:3.2.0
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+```
+
+```bash
+# metrics-server has to actually be running before HPA can read any utilization
+kubectl get deployment metrics-server -n kube-system
+```
+
+## นิยาม HorizontalPodAutoscaler
+
+เมื่อตั้ง requests ไว้แล้วและ metrics-server รันอยู่ object HPA เองก็แค่ระบุ target กับ metric
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+```
+
+```bash
+kubectl get hpa web-app
+kubectl describe hpa web-app
+```
+
+ค่านี้หมายความว่า คุม average CPU utilization ของ Pod `web-app` ทุกตัวให้อยู่ใกล้ 60% ของ CPU ที่ request ไว้ โดย scale Deployment ระหว่าง 3 ถึง 20 replica เพื่อรักษาระดับนั้น HPA ยังรองรับการ scale ตาม custom metric ที่ไม่ใช่ resource ด้วย เช่น queue depth หรือ requests-per-second ผ่าน API `custom.metrics.k8s.io` และ `external.metrics.k8s.io` สำหรับทีมที่ bottleneck ไม่ได้อยู่ที่ CPU หรือ memory เลย
+
+## สิ่งที่ HPA ไม่ทำ
+
+ควรพูดให้ชัดตรงเส้นแบ่งนี้ เพราะมี autoscaler อีกสองตัวที่ฟังดูคล้ายกันแต่ทำหน้าที่คนละอย่างโดยสิ้นเชิง
+
+- **HorizontalPodAutoscaler** เปลี่ยนจำนวน replica ของ Deployment หรือ StatefulSet นี่คืองานทั้งหมดของมัน
+- **VerticalPodAutoscaler (VPA)** เปลี่ยน `requests`/`limits` ของ Pod ที่มีอยู่แล้ว ปรับขนาดมันแทนที่จะเพิ่มจำนวน
+- **Cluster Autoscaler** เปลี่ยนจำนวน Node ของ cluster เพิ่มหรือลดเครื่องที่อยู่ข้างใต้ทุกอย่าง (บทถัดไปพูดถึงเรื่องนี้)
+
+<Mermaid title="metrics-server feeding Pod CPU utilization into the HPA controller, which adjusts a Deployment's replica count" code={hpaDiagram} />
+
+export const hpaDiagram = `flowchart LR
+  pods["Deployment Pods"] --> ms["metrics-server"]
+  ms --> hpa["HorizontalPodAutoscaler controller"]
+  hpa -->|"raise or lower"| replicas["Deployment.spec.replicas"]`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**HorizontalPodAutoscaler** (`autoscaling/v2`) เปลี่ยน `replicas` ของ Deployment หรือ StatefulSet เพื่อดึง metric ที่จับตาอยู่ให้ใกล้ target แต่มันจะไม่ทำอะไรเลยถ้าไม่มีสองข้อบังคับ: Pod ต้องตั้ง **`requests`** ไว้ (utilization คือเปอร์เซ็นต์ของ request) และต้องมี **metrics-server** หรือ custom/external metrics adapter ติดตั้งไว้เพื่อป้อน metric มันยัง scale ตาม custom หรือ external metric สำหรับ signal ที่ไม่ใช่ resource ได้ด้วย HPA เปลี่ยนแค่จำนวน replica เท่านั้น — การปรับขนาด Pod ที่มีอยู่แล้วเป็นงานของ **VerticalPodAutoscaler** ส่วนการเพิ่มหรือลด Node เป็นงานของ **Cluster Autoscaler**
+</Callout>
+
+export const quizHpa = [
+  {
+    q: 'ต้องติดตั้งอะไรใน cluster ก่อน HPA จะตัดสินใจ scale ได้เลย',
+    options: [
+      'LoadBalancer Service',
+      'metrics-server (หรือ custom/external metrics adapter)',
+      'scheduler ตัวที่สอง',
+      'PodDisruptionBudget',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม resource requests ถึงเป็นข้อบังคับสำหรับ HPA ที่ scale ตาม CPU/memory',
+    options: [
+      'requests เป็นแค่ของตกแต่ง ไม่มีผลจริง',
+      'utilization คำนวณเป็นเปอร์เซ็นต์ของค่า requests ถ้าไม่มี requests ก็ไม่มีอะไรมาคำนวณเปอร์เซ็นต์',
+      'HPA ใช้ requests ตั้งเวอร์ชัน image ของ container',
+      'requests กำหนดค่า maxReplicas ให้อัตโนมัติ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'HorizontalPodAutoscaler เปลี่ยนอะไร เทียบกับ VerticalPodAutoscaler และ Cluster Autoscaler',
+    options: [
+      'HPA เปลี่ยนจำนวน replica, VPA ปรับ requests/limits ของ Pod ที่มีอยู่, Cluster Autoscaler เปลี่ยนจำนวน Node',
+      'ทั้งสามตัวทำสิ่งเดียวกันแค่ชื่อต่างกัน',
+      'HPA เปลี่ยนจำนวน Node, VPA เปลี่ยนจำนวน replica, Cluster Autoscaler ปรับขนาด Pod',
+      'มีแค่ Cluster Autoscaler เท่านั้นที่เปลี่ยนจำนวน replica ได้',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'นอกจาก CPU กับ memory แล้ว HPA ยัง scale ตามอะไรได้อีก',
+    options: [
+      'ไม่มีอย่างอื่นแล้ว HPA รองรับแค่ CPU กับ memory',
+      'custom และ external metric เช่น queue depth หรือ requests-per-second ผ่าน API custom.metrics.k8s.io และ external.metrics.k8s.io',
+      'จำนวน Node ใน cluster',
+      'image tag ของ Pod',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="scheduling-and-scaling/horizontal-pod-autoscaling" questions={quizHpa} />
+
+<ProgressTracker client:visible id="scheduling-and-scaling/horizontal-pod-autoscaling" />

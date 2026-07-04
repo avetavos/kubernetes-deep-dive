@@ -1,0 +1,120 @@
+---
+title: 'Architecture: Control Plane และ Node'
+description: 'component ของ control plane และ node ที่ทำให้ Kubernetes cluster ทำงานได้ และทำไม API server ถึงเป็นประตูเดียวสู่ etcd'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียหลักในหนึ่งประโยค
+
+control plane ของ cluster ตัดสินใจและเก็บ state ส่วน node รัน Pod และทุกการตัดสินใจ ทุก byte ของ state นั้น ต้องผ่านประตูเดียวคือ API server
+
+## Control plane คือสมองของ cluster
+
+control plane คือ component ชุดเล็ก ๆ ที่มักรันอยู่ด้วยกัน และร่วมกันตัดสินใจว่า cluster ควรทำอะไร พร้อมจดจำสิ่งที่ตัดสินใจไปแล้ว
+
+- **kube-apiserver** คือประตูหน้าของ cluster มันเปิด REST API ที่ทุก component อื่น รวมถึงทุกคำสั่ง `kubectl` ที่คุณรัน ต้องคุยด้วย มันตรวจสอบและ authenticate request และเป็น component เดียวเท่านั้นที่คุยกับ etcd โดยตรง
+- **etcd** คือ distributed key-value store ที่มีความ consistent เก็บ cluster state ทั้งหมด ทุก object ที่คุณสร้าง สถานะปัจจุบันของมัน ทุกอย่าง ถ้า etcd หายไปโดยไม่มี backup ความจำของ cluster ก็หายไปด้วย
+- **kube-scheduler** คอยดู Pod ที่เพิ่งสร้างใหม่และยังไม่มี node กำหนด แล้วตัดสินใจว่าแต่ละตัวควรรันบน node ไหน โดยดูจาก resource requirement, constraint และ load ปัจจุบันของ cluster
+- **kube-controller-manager** รัน controller ในตัวทั้งหมดเป็น process เดียว เช่น node controller (สังเกตเมื่อ node เข้าไม่ถึง) replication controller (รักษาจำนวน Pod replica ให้ถูกต้อง) endpoint controller (อัปเดต endpoint ของ Service ให้ทันสมัย) และอื่น ๆ ตรงนี้คือที่ที่ reconciliation loop จากบทก่อนหน้าทำงานจริง
+- **cloud-controller-manager** เป็น optional และมีเฉพาะบน managed cloud cluster ทำหน้าที่เชื่อม concern ระดับ cluster เช่น load balancer และ node lifecycle เข้ากับ API ของ cloud provider
+
+คุณดู Pod ของ control plane เองได้บน cluster สไตล์ kubeadm เหมือน workload ทั่วไป
+
+```bash
+kubectl get pods -n kube-system
+```
+
+## Node component คือที่ที่ Pod รันจริง
+
+ทุก node ใน cluster รันสามอย่างนี้
+
+- **kubelet** คือ node agent เป็น component ที่ทำให้ container ตาม Pod spec ที่ assign มาให้ node นี้รันอยู่จริงและ healthy มันเริ่ม container, restart เมื่อมันตาย, รัน probe ของมัน และรายงานสถานะของ node กับ Pod กลับไปยัง API server ไม่มีอะไรรันบน node ได้ ถ้าไม่มี kubelet เป็นคนสั่ง
+- **kube-proxy** ดูแล network rule บน node ที่ทำให้ Service ทำงานได้ คือ route traffic ที่ยิงไปยัง virtual IP ของ Service ไปหา Pod ตัวใดตัวหนึ่งที่ match ไม่ว่ามันจะรันอยู่ที่ไหน
+- **container runtime** เช่น containerd หรือ CRI-O คือตัวที่ pull image และรัน container จริง ๆ โดยคุยกับ kubelet ผ่าน **Container Runtime Interface (CRI)**
+
+ตรวจสอบ component และสถานะของ node โดยตรงได้ด้วย
+
+```bash
+kubectl describe node <node-name>
+```
+
+## ทุกอย่างคุยกับ etcd ผ่าน API server เท่านั้น
+
+นี่คือข้อเท็จจริงเชิง architecture ที่ควรจำ **kube-scheduler, kube-controller-manager, kubelet และทุกอย่างอื่น ไม่เคยแตะ etcd โดยตรง** ทุกตัวอ่านและเขียน cluster state ผ่านการเรียก API server เท่านั้น ซึ่งเป็น single source of truth และเป็นผู้มีอำนาจเดียวของทั้ง cluster สิ่งนี้ทำให้ Kubernetes มีจุดเดียวที่สม่ำเสมอสำหรับ authentication, authorization, validation และ watch notification controller ทุกตัวและ kubelet ทุกตัว จริง ๆ แล้วก็แค่เป็น client ของ REST API ตัวเดียวกับที่คุณใช้กับ `kubectl`
+
+<Mermaid title="Control plane and node components, and the single path to etcd" code={architectureDiagram} />
+
+export const architectureDiagram = `flowchart TB
+  subgraph cp["Control Plane"]
+    api["kube-apiserver"]
+    etcd["etcd"]
+    sched["kube-scheduler"]
+    cm["kube-controller-manager"]
+  end
+  subgraph n1["Node"]
+    kubelet["kubelet"]
+    proxy["kube-proxy"]
+    cri["container runtime (containerd / CRI-O)"]
+  end
+  sched --> api
+  cm --> api
+  api --> etcd
+  kubelet --> api
+  proxy --> api`;
+
+<Callout title="The one-line takeaway">
+**control plane** — **kube-apiserver**, **etcd**, **kube-scheduler** และ **kube-controller-manager** (บวก **cloud-controller-manager** ที่เป็น optional) — ตัดสินใจว่าควรเกิดอะไรขึ้นและจดจำ cluster state ทั้งหมด ส่วนแต่ละ **node** รัน **kubelet** (ตัวที่เริ่มและเฝ้าดู container จริง) **kube-proxy** (ตัวที่ทำให้ Service เข้าถึงได้) และ **container runtime** ที่คุยผ่าน **CRI** ทุก component เหล่านี้ ไม่มีข้อยกเว้น อ่านและเขียน state ผ่าน **API server** เท่านั้น ซึ่งเป็นประตูเดียวสู่ **etcd**
+</Callout>
+
+export const quizArchitecture = [
+  {
+    q: 'What does etcd store?',
+    options: [
+      'Only container images pulled by nodes',
+      'Application log output from every Pod',
+      'All cluster state, as a distributed, consistent key-value store',
+      'The credentials used to authenticate to kubectl',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'What is kubelet responsible for on a node?',
+    options: [
+      'Routing traffic between Services and their Pods',
+      'Deciding which node a new Pod should be scheduled to',
+      'Ensuring the containers described in Pod specs assigned to its node are running and healthy, and reporting status back',
+      'Storing the cluster manifests submitted with kubectl apply',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'Which component decides which node a newly created Pod is scheduled to?',
+    options: [
+      'kubelet',
+      'kube-proxy',
+      'etcd',
+      'kube-scheduler',
+    ],
+    answer: 3,
+  },
+  {
+    q: 'Why is the API server the only component that talks directly to etcd?',
+    options: [
+      'etcd cannot accept connections from more than one client at a time',
+      'It keeps a single, authenticated, authoritative path to all cluster state so every other component reads and writes through one consistent interface',
+      'etcd is deprecated and is only kept for backups',
+      'kube-scheduler requires exclusive write access to function',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="foundations/architecture-control-plane-and-nodes" questions={quizArchitecture} />
+
+<ProgressTracker client:visible id="foundations/architecture-control-plane-and-nodes" />

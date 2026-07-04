@@ -1,0 +1,150 @@
+---
+title: 'Job และ CronJob'
+description: 'รัน Pod จนจบงานด้วย Job และตั้งเวลารันแบบ cron ด้วย CronJob'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ไอเดียในหนึ่งประโยค
+
+**Job** รัน Pod หนึ่งตัวหรือมากกว่าจนกว่างานจะสำเร็จ ไม่ใช่ปล่อยให้รันตลอดไป ส่วน **CronJob** create Job ให้อัตโนมัติตาม schedule แบบ cron
+
+## Job: รันจนจบงาน ไม่ใช่รันตลอดไป
+
+Pod ของ Deployment มีไว้ให้รันไม่มีกำหนด ส่วน Pod ของ Job มีไว้ให้ **จบงาน** Job จะนับจำนวนที่สำเร็จและ retry เมื่อพังจนถึง limit ที่กำหนด แทนที่จะ restart Pod ไปเรื่อย ๆ แบบ controller ที่รันระยะยาว
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: report-backfill
+spec:
+  completions: 5
+  parallelism: 2
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: backfill
+          image: myregistry/report-backfill:1.0.0
+          args: ['--month=2026-06']
+```
+
+`completions: 5` หมายความว่า Job จะยังไม่จบจนกว่า Pod 5 ตัวจะ exit สำเร็จ `parallelism: 2` จำกัดว่า Pod พวกนั้นรันพร้อมกันได้กี่ตัว `backoffLimit: 3` คือจำนวนครั้งที่ยอมให้พังได้ก่อนที่ Job จะยอมแพ้แล้วตีตัวเองเป็น `Failed` `activeDeadlineSeconds: 600` คือ timeout รวมของทั้ง Job นับเป็นเวลาจริง พอเกินก็ terminate ทันทีไม่สนว่าสำเร็จไปกี่ตัวแล้ว สังเกต `restartPolicy: OnFailure` ด้วย Pod template ของ Job ต้องใช้ `OnFailure` หรือ `Never` เท่านั้น ห้ามใช้ `Always` เพราะจุดประสงค์ทั้งหมดของ Job คือหยุดเมื่องานเสร็จ
+
+```bash
+# Watch completions accumulate, then check the Job's final status
+kubectl get job report-backfill --watch
+kubectl describe job report-backfill
+
+# Logs from a finished Job's Pods
+kubectl logs -l job-name=report-backfill --tail=100
+```
+
+## CronJob: ตั้งเวลารัน Job
+
+**CronJob** ไม่ได้รัน Pod เองตรง ๆ แต่จะ create **Job** ตาม schedule แล้ว Job นั้นก็ create Pod เหมือนกับที่คุณ submit Job ด้วยมือตอนนั้นเป๊ะ ๆ
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly-report
+spec:
+  schedule: '0 2 * * *'
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: report
+              image: myregistry/nightly-report:1.0.0
+```
+
+`schedule: '0 2 * * *'` รันตอน 02:00 ทุกวัน ตาม cron syntax มาตรฐาน `concurrencyPolicy` ตัดสินว่าจะทำยังไงถ้า run ก่อนหน้ายังไม่จบตอนที่ run ถัดไปถึงกำหนด `Allow` (ค่า default) ปล่อยให้รันคู่กันไปเลย `Forbid` ข้าม run ใหม่ไปทั้งหมด และ `Replace` ยกเลิก Job ที่ยังรันอยู่แล้วเริ่ม Job ใหม่แทนที่ `startingDeadlineSeconds` กำหนดว่า run ที่พลาดเวลาไปแล้วยังเริ่มได้ช้าสุดแค่ไหน `successfulJobsHistoryLimit` กับ `failedJobsHistoryLimit` คุมว่า CronJob จะเก็บ Job object เก่าไว้ให้ตรวจสอบกี่ตัวก่อนจะ garbage-collect ทิ้ง
+
+<Mermaid title="A CronJob creates a Job on its schedule; the Job creates Pods that run to completion" code={jobsDiagram} />
+
+export const jobsDiagram = `flowchart LR
+  cj["CronJob nightly-report (schedule: 0 2 * * *)"] -->|creates| j["Job nightly-report-29102026"]
+  j -->|creates| p1["Pod (runs to completion)"]
+  j -->|creates| p2["Pod (runs to completion)"]
+  p1 --> done["Succeeded, Pods stop"]
+  p2 --> done`;
+
+## จัดการ Job และ CronJob
+
+```bash
+# List CronJobs and the Jobs they have created
+kubectl get cronjob nightly-report
+kubectl get jobs --selector=job-name
+
+# Trigger one ad-hoc run right now, without waiting for the schedule
+kubectl create job nightly-report-manual --from=cronjob/nightly-report
+```
+
+เพราะ schedule ของ CronJob ยิงซ้ำได้หลายรอบ `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` เลยสำคัญในทางปฏิบัติ ถ้าไม่ตั้งไว้ Job และ Pod object เก่าจะสะสมไปเรื่อย ๆ ทุกคืน
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**Job** รัน Pod จนจบงาน ไม่ใช่รันตลอดไป `completions` กำหนดว่าต้องสำเร็จกี่ครั้ง `parallelism` กำหนดว่ารันพร้อมกันได้กี่ตัว `backoffLimit` กำหนดว่ายอมพังได้กี่ครั้ง และ Pod template ของมันต้องใช้ `restartPolicy: OnFailure` หรือ `Never` **CronJob** create Job ตาม `schedule` โดยมี `concurrencyPolicy` (`Allow`/`Forbid`/`Replace`) คุม run ที่ทับซ้อนกัน และ `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` จำกัดว่าจะเก็บ history ไว้แค่ไหน
+</Callout>
+
+export const quizJobs = [
+  {
+    q: 'workload model ของ Job ต่างจาก Deployment ยังไง',
+    options: [
+      'Job รัน Pod จนจบงานที่มีขอบเขตแน่นอน ส่วน Deployment ปล่อยให้ Pod รันไม่มีกำหนด',
+      'มันเหมือนกันเป๊ะ Job แค่เป็นชื่อเก่าของ Deployment',
+      'Job ไม่เคย create Pod เลย มีแต่ Deployment เท่านั้นที่ create',
+      'Job ต้องมี headless Service ส่วน Deployment ไม่ต้อง',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'backoffLimit บน Job คุมอะไร',
+    options: [
+      'จำนวน Pod replica ที่ Job create',
+      'จำนวนครั้งที่ Job retry Pod ที่พัง ก่อนจะตีทั้ง Job เป็น failed',
+      'ระยะเวลาหน่วงก่อนที่ schedule จะเริ่ม',
+      'เวลารันสูงสุดของทั้ง Job',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Pod template ของ Job ใช้ restartPolicy ค่าไหนได้บ้าง',
+    options: [
+      'Always เพราะ Job ต้อง restart ไปเรื่อย ๆ ไม่มีสิ้นสุด',
+      'OnFailure หรือ Never เพราะ Job รันจนจบงาน จึงใช้ Always ไม่ได้',
+      'Never เท่านั้น OnFailure ใช้กับ Job ไม่ได้',
+      'ค่าไหนก็ได้ Job ไม่สนใจ restartPolicy',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'concurrencyPolicy: Forbid บน CronJob ทำอะไร',
+    options: [
+      'รันทุก Job ตาม schedule พร้อมกันหมด ไม่สนใจ run ก่อนหน้า',
+      'ข้าม run ใหม่ตาม schedule ถ้า Job ที่ CronJob นี้ create ไว้ก่อนหน้ายังรันอยู่',
+      'ห้าม CronJob create Job เลยตลอดไป',
+      'ลบ Job เก่าทันทีหลังจากมันรันจบ',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="workloads/jobs-and-cronjobs" questions={quizJobs} />
+
+<ProgressTracker client:visible id="workloads/jobs-and-cronjobs" />
