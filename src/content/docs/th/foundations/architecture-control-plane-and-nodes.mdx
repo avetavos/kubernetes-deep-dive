@@ -74,27 +74,27 @@ export const architectureDiagram = `flowchart TB
 
 export const quizArchitecture = [
   {
-    q: 'What does etcd store?',
+    q: 'etcd เก็บอะไร',
     options: [
-      'Only container images pulled by nodes',
-      'Application log output from every Pod',
-      'All cluster state, as a distributed, consistent key-value store',
-      'The credentials used to authenticate to kubectl',
+      'แค่ container image ที่ node ดึงมา',
+      'log output ของแอปจากทุก Pod',
+      'state ทั้งหมดของ cluster ในรูป distributed key-value store ที่ consistent',
+      'credential ที่ใช้ authenticate เข้า kubectl',
     ],
     answer: 2,
   },
   {
-    q: 'What is kubelet responsible for on a node?',
+    q: 'kubelet รับผิดชอบอะไรบน node',
     options: [
-      'Routing traffic between Services and their Pods',
-      'Deciding which node a new Pod should be scheduled to',
-      'Ensuring the containers described in Pod specs assigned to its node are running and healthy, and reporting status back',
-      'Storing the cluster manifests submitted with kubectl apply',
+      'route traffic ระหว่าง Service กับ Pod ของมัน',
+      'ตัดสินใจว่า Pod ใหม่ควรถูก schedule ไปที่ node ไหน',
+      'ทำให้ container ตาม Pod spec ที่ถูก assign มาที่ node ของมันรันอยู่และ healthy แล้วรายงาน status กลับ',
+      'เก็บ manifest ของ cluster ที่ส่งเข้ามาด้วย kubectl apply',
     ],
     answer: 2,
   },
   {
-    q: 'Which component decides which node a newly created Pod is scheduled to?',
+    q: 'component ไหนตัดสินใจว่า Pod ที่เพิ่งถูกสร้างจะถูก schedule ไปที่ node ไหน',
     options: [
       'kubelet',
       'kube-proxy',
@@ -104,12 +104,12 @@ export const quizArchitecture = [
     answer: 3,
   },
   {
-    q: 'Why is the API server the only component that talks directly to etcd?',
+    q: 'ทำไม API server ถึงเป็น component เดียวที่คุยกับ etcd โดยตรง',
     options: [
-      'etcd cannot accept connections from more than one client at a time',
-      'It keeps a single, authenticated, authoritative path to all cluster state so every other component reads and writes through one consistent interface',
-      'etcd is deprecated and is only kept for backups',
-      'kube-scheduler requires exclusive write access to function',
+      'etcd รับ connection จาก client ได้ทีละหนึ่งเท่านั้น',
+      'มันเป็น path เดียวที่ authenticate แล้วและเชื่อถือได้ไปยัง state ทั้งหมดของ cluster ทำให้ component อื่นทุกตัวอ่านและเขียนผ่าน interface เดียวที่ consistent',
+      'etcd ถูก deprecated แล้ว เก็บไว้แค่สำหรับ backup',
+      'kube-scheduler ต้องการสิทธิ์ write แบบ exclusive ถึงจะทำงานได้',
     ],
     answer: 1,
   },

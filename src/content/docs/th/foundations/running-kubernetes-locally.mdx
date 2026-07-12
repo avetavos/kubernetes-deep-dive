@@ -78,17 +78,17 @@ export const runningLocallyDiagram = `flowchart TB
 
 export const quizRunningLocally = [
   {
-    q: 'What are kind, minikube, and k3d primarily used for?',
+    q: 'kind, minikube และ k3d ใช้ทำอะไรเป็นหลัก',
     options: [
-      'Running production-grade, highly available Kubernetes clusters across regions',
-      'Running local Kubernetes clusters for development and learning, not production',
-      'Replacing kubectl with a different command-line tool',
-      'Managing billing for managed Kubernetes services',
+      'รัน Kubernetes cluster ระดับ production ที่ highly available ข้ามหลาย region',
+      'รัน Kubernetes cluster บนเครื่อง local ไว้ develop และเรียนรู้ ไม่ใช่ production',
+      'แทนที่ kubectl ด้วย command-line tool ตัวอื่น',
+      'จัดการ billing ของ managed Kubernetes service',
     ],
     answer: 1,
   },
   {
-    q: 'Which command tells you whether your cluster nodes are healthy and ready?',
+    q: 'คำสั่งไหนบอกว่า node ใน cluster ของคุณ healthy และ ready หรือยัง',
     options: [
       'kubectl get nodes',
       'kubectl get pods',
@@ -98,17 +98,17 @@ export const quizRunningLocally = [
     answer: 0,
   },
   {
-    q: 'What is the kube-system namespace used for?',
+    q: 'namespace kube-system ใช้ทำอะไร',
     options: [
-      'A namespace reserved for your own application Pods',
-      'The namespace holding components managed by the control plane itself, such as CoreDNS and kube-proxy',
-      'A namespace only used for running automated tests',
-      'A deprecated namespace kept only for backward compatibility',
+      'เป็น namespace ที่กันไว้ให้ application Pod ของคุณเอง',
+      'เป็น namespace ที่เก็บ component ซึ่งจัดการโดย control plane เอง เช่น CoreDNS และ kube-proxy',
+      'เป็น namespace ที่ใช้รัน automated test เท่านั้น',
+      'เป็น namespace ที่ deprecated แล้ว เก็บไว้เพื่อ backward compatibility เท่านั้น',
     ],
     answer: 1,
   },
   {
-    q: 'Which command creates a new namespace of your own?',
+    q: 'คำสั่งไหนสร้าง namespace ใหม่ของคุณเอง',
     options: [
       'kubectl apply namespace my-app',
       'kubectl run namespace my-app',

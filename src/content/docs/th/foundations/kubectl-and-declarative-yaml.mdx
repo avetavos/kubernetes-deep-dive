@@ -79,27 +79,27 @@ export const kubectlYamlDiagram = `flowchart LR
 
 export const quizKubectlYaml = [
   {
-    q: 'What happens differently between kubectl apply and kubectl create when the target object already exists?',
+    q: 'เมื่อ object ปลายทางมีอยู่แล้ว kubectl apply กับ kubectl create ต่างกันยังไง',
     options: [
-      'apply diffs against the last-applied configuration and patches only what changed; create errors because the object already exists',
-      'create always overwrites the object silently while apply always refuses',
-      'They behave identically in every situation',
-      'apply only works on Pods while create works on every object kind',
+      'apply diff กับ last-applied configuration แล้ว patch เฉพาะส่วนที่เปลี่ยน ส่วน create จะ error เพราะ object มีอยู่แล้ว',
+      'create เขียนทับ object แบบเงียบ ๆ เสมอ ส่วน apply ปฏิเสธเสมอ',
+      'ทั้งคู่ทำงานเหมือนกันเป๊ะในทุกสถานการณ์',
+      'apply ใช้ได้แค่กับ Pod ส่วน create ใช้ได้กับ object ทุก kind',
     ],
     answer: 0,
   },
   {
-    q: 'What does a label selector actually do?',
+    q: 'จริง ๆ แล้ว label selector ทำอะไร',
     options: [
-      'It encrypts traffic between Pods',
-      'It lets one object, such as a Service or ReplicaSet, find the set of Pods matching given key-value labels so it can route to or manage them',
-      'It sets CPU and memory requests and limits for a Pod',
-      'It pins a Pod to run on a specific node',
+      'มัน encrypt traffic ระหว่าง Pod',
+      'มันทำให้ object หนึ่ง เช่น Service หรือ ReplicaSet หา Pod ชุดที่ match label แบบ key-value ที่กำหนดเจอ เพื่อจะ route ไปหาหรือจัดการมันได้',
+      'มันตั้ง request และ limit ของ CPU กับ memory ให้ Pod',
+      'มัน pin Pod ให้รันบน node เฉพาะตัว',
     ],
     answer: 1,
   },
   {
-    q: 'Which four top-level fields does every Kubernetes object manifest have?',
+    q: 'manifest ของ Kubernetes object ทุกตัวมี top-level field สี่ตัวอะไรบ้าง',
     options: [
       'name, image, port, replicas',
       'header, body, footer, status',
@@ -109,7 +109,7 @@ export const quizKubectlYaml = [
     answer: 2,
   },
   {
-    q: 'Which field on a live Kubernetes object is managed by the system and never something you author yourself?',
+    q: 'field ไหนบน Kubernetes object ที่ live อยู่ ถูกจัดการโดยระบบ และไม่ใช่สิ่งที่คุณเขียนเอง',
     options: [
       'spec',
       'metadata',
