@@ -75,3 +75,76 @@ html.read-mode .sidebar-collapse-toggle { display: none !important; }
 @media (min-width: 50rem) {
   mobile-starlight-toc { display: none !important; }
 }
+
+/* ---- Paper read mode ---- */
+/* Adaptive paper: cream day / candlelight night. Scoped under html.read-mode
+   so normal mode is untouched. Starlight resolves data-theme to light|dark. */
+html.read-mode[data-theme='light'] {
+  --sl-color-bg: #f2e7d0;
+  --sl-color-bg-nav: #ecdfc2;
+  --sl-color-bg-inline-code: #e7d9bc;
+  --sl-color-text: #43382a;
+  --sl-color-white: #332a1e;
+  --sl-color-black: #f2e7d0;
+  --sl-color-gray-1: #3a3023;
+  --sl-color-gray-2: #4a3f30;
+  --sl-color-gray-3: #6b5d48;
+  --sl-color-gray-4: #8a7a60;
+  --sl-color-gray-5: #c9b990;
+  --sl-color-gray-6: #eadfc6;
+  --sl-color-gray-7: #eee3cc;
+  --sl-color-hairline-light: #dccda8;
+  --sl-color-hairline: #dccda8;
+  --sl-color-hairline-shade: #d4c49c;
+  --sl-color-accent-low: #e7d9bc;
+  --sl-color-accent: #7a4f1d;
+  --sl-color-accent-high: #5c3a12;
+  --sl-color-text-accent: #7a4f1d;
+  --paper-code-bg: #eadfc6;
+  --paper-code-border: #dccda8;
+}
+html.read-mode[data-theme='dark'] {
+  --sl-color-bg: #252019;
+  --sl-color-bg-nav: #2b251d;
+  --sl-color-bg-inline-code: #322b22;
+  --sl-color-text: #d8ccb4;
+  --sl-color-white: #e6dcc6;
+  --sl-color-black: #252019;
+  --sl-color-gray-1: #e2d7c0;
+  --sl-color-gray-2: #cfc3aa;
+  --sl-color-gray-3: #a89a7e;
+  --sl-color-gray-4: #7d715c;
+  --sl-color-gray-5: #4a4234;
+  --sl-color-gray-6: #2f2921;
+  --sl-color-gray-7: #2b251d;
+  --sl-color-hairline-light: #3a3328;
+  --sl-color-hairline: #3a3328;
+  --sl-color-hairline-shade: #201b15;
+  --sl-color-accent-low: #3a2f1d;
+  --sl-color-accent: #d0a35c;
+  --sl-color-accent-high: #e2bd7f;
+  --sl-color-text-accent: #d0a35c;
+  --paper-code-bg: #2f2921;
+  --paper-code-border: #3a3328;
+}
+/* Serif reading type; Thai text falls back to the system Thai font. */
+html.read-mode .sl-markdown-content,
+html.read-mode .sl-markdown-content :is(h1, h2, h3, h4, h5, h6),
+html.read-mode .content-panel h1 {
+  font-family: 'Iowan Old Style', Georgia, 'Times New Roman', serif;
+}
+html.read-mode .sl-markdown-content {
+  font-size: 1.0625rem;
+  line-height: 1.75;
+}
+/* Code blocks sit on paper-tinted panels (beats Expressive Code theme bg). */
+html.read-mode .sl-markdown-content pre {
+  background: var(--paper-code-bg) !important;
+  border: 1px solid var(--paper-code-border);
+}
+/* Toggle button matches the paper */
+html.read-mode .readmode-toggle {
+  background: var(--sl-color-bg-nav);
+  color: var(--sl-color-text);
+  border-color: var(--paper-code-border);
+}

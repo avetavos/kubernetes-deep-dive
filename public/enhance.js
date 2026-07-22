@@ -11,13 +11,13 @@
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'readmode-toggle';
-    btn.textContent = saved ? 'Exit read mode' : 'Read mode';
+    btn.textContent = saved ? 'Exit paper mode' : 'Paper mode';
     btn.setAttribute('aria-pressed', String(saved));
     btn.addEventListener('click', () => {
       const on = !document.documentElement.classList.contains('read-mode');
       apply(on);
       btn.setAttribute('aria-pressed', String(on));
-      btn.textContent = on ? 'Exit read mode' : 'Read mode';
+      btn.textContent = on ? 'Exit paper mode' : 'Paper mode';
       try { localStorage.setItem(KEY, on ? '1' : '0'); } catch (e) {}
     });
     document.body.appendChild(btn);
