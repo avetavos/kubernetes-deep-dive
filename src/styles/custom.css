@@ -148,3 +148,6 @@ html.read-mode .readmode-toggle {
   color: var(--sl-color-text);
   border-color: var(--paper-code-border);
 }
+
+/* ---- Paper read mode: keep content clear of the sticky header ---- */
+html.read-mode .main-frame { padding-top: var(--sl-nav-height, 3.5rem) !important; }
