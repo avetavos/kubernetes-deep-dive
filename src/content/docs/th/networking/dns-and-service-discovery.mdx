@@ -16,7 +16,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## CoreDNS กับ DNS name ของ Service
 
-**CoreDNS** รันเป็น Deployment อยู่ใน cluster (ปกติอยู่ใน `kube-system`) และทำหน้าที่เป็น DNS server ภายในของ cluster ทุก Pod ถูกตั้งค่าผ่าน `/etc/resolv.conf` ให้ส่ง DNS query ไปที่ CoreDNS พอ Service ถูกสร้างขึ้น CoreDNS จะเริ่มตอบให้มันทันทีด้วยชื่อเต็มในรูปแบบ
+**CoreDNS** รันเป็น Deployment อยู่ใน cluster (ปกติอยู่ใน `kube-system`) และทำหน้าที่เป็น DNS server ภายในของ cluster ทุก Pod ถูกตั้งค่าผ่าน `/etc/resolv.conf` ให้ส่ง DNS query ไปที่ CoreDNS พอ Service ถูกสร้างขึ้น CoreDNS จะเริ่มตอบชื่อของ Service นั้นทันทีด้วยชื่อเต็มในรูปแบบ
 
 ```text
 <service-name>.<namespace>.svc.cluster.local
@@ -81,7 +81,7 @@ export const dnsResolutionDiagram = `flowchart TB
   coredns -->|"headless Service"| p2["web-2 IP"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**CoreDNS** คือ DNS server ภายในของ cluster ให้ทุก Service มีชื่อในรูปแบบ `<service>.<namespace>.svc.cluster.local` (มีชื่อสั้นใช้ได้ใน namespace เดียวกัน) ซึ่งปกติ resolve ไปที่ ClusterIP ที่ load balance ของ Service **Headless Service** (`clusterIP: None`) ข้ามการ load balance แล้วคืน IP ของแต่ละ Pod โดยตรง ซึ่งเป็นสิ่งที่ **StatefulSet** ใช้เพื่อให้แต่ละ ordinal Pod มี DNS record เสถียรของตัวเองที่ `<pod-name>.<service>.<namespace>.svc.cluster.local`
+**CoreDNS** คือ DNS server ภายในของ cluster ให้ทุก Service มีชื่อในรูปแบบ `<service>.<namespace>.svc.cluster.local` (มีชื่อสั้นใช้ได้ใน namespace เดียวกัน) ซึ่งปกติ resolve ไปที่ ClusterIP ที่ load balance ของ Service **Headless Service** (`clusterIP: None`) ข้ามการ load balance แล้วคืน IP ของแต่ละ Pod โดยตรง นั่นคือสิ่งที่ **StatefulSet** ใช้เพื่อให้แต่ละ ordinal Pod มี DNS record เสถียรของตัวเองที่ `<pod-name>.<service>.<namespace>.svc.cluster.local`
 </Callout>
 
 export const quizDnsDiscovery = [

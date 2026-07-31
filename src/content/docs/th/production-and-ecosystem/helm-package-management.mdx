@@ -1,6 +1,6 @@
 ---
 title: 'Helm และ Package Management'
-description: 'วิธีที่ Helm package manifest ของ Kubernetes ให้เป็น Chart ที่ parameterize และ version ได้ แล้วจัดการมันในฐานะ Release ที่ track ไว้'
+description: 'วิธีที่ Helm package manifest ของ Kubernetes ให้เป็น Chart ที่ parameterize และ version ได้ แล้วจัดการในฐานะ Release ที่ track ไว้'
 sidebar:
   order: 1
 ---
@@ -12,13 +12,13 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-**Helm** คือ package manager ของ Kubernetes มันแปลง directory ของ manifest ที่ template ไว้ให้กลายเป็น **Chart** ที่ parameterize และ version ได้ แล้วติดตั้งในฐานะ **Release** ที่ถูก track
+**Helm** คือ package manager ของ Kubernetes ทำหน้าที่แปลง directory ของ manifest ที่ template ไว้ให้กลายเป็น **Chart** ที่ parameterize และ version ได้ แล้วติดตั้งในฐานะ **Release** ที่ถูก track
 
 ## ปัญหา: raw YAML ไม่ parameterize หรือ version ได้ดี
 
 Deployment, Service, ConfigMap YAML ไม่กี่ไฟล์ทำงานได้ดีถ้ามีแค่ environment เดียว แต่พอมีมากกว่าหนึ่ง environment ปัญหาก็เริ่ม dev, staging, prod ต้องการ replica count, resource limit, image tag และ hostname ต่างกัน ทั้งที่โครงสร้างของ manifest เหมือนกันเป๊ะ การ copy-paste YAML สามชุดแล้วแก้แต่ละชุดด้วยมือหมายความว่าทุกครั้งที่เปลี่ยนอะไรก็ต้องไปแก้สามที่ให้ตรงกัน นอกจากนี้ยังไม่มีแนวคิดว่า "manifest 12 ไฟล์นี้คือหน่วยเดียวที่ version ร่วมกัน" มาให้เลย `kubectl apply` มองแต่ละไฟล์แยกจากกัน ไม่มีประวัติร่วม และไม่มีวิธีง่าย ๆ ที่จะ package ทั้งชุดให้คนอื่นเอาไปติดตั้งต่อ
 
-**Helm** แก้ทั้งสองปัญหานี้พร้อมกัน มัน package manifest ที่เกี่ยวข้องกันให้เป็นหน่วยเดียวเรียกว่า **Chart** แทนที่ค่า hardcode ด้วย template placeholder แล้ว track การติดตั้งแต่ละครั้งของ Chart นั้นในฐานะ **Release** ที่มีประวัติ version ของตัวเอง
+**Helm** แก้ทั้งสองปัญหานี้พร้อมกัน ด้วยการ package manifest ที่เกี่ยวข้องกันให้เป็นหน่วยเดียวเรียกว่า **Chart** แทนที่ค่า hardcode ด้วย template placeholder แล้ว track การติดตั้งแต่ละครั้งของ Chart นั้นในฐานะ **Release** ที่มีประวัติ version ของตัวเอง
 
 ## โครงสร้างของ Chart
 
@@ -59,7 +59,7 @@ image:
   tag: '1.4.0'
 ```
 
-`helm template` (render อย่างเดียว ไม่ได้ติดตั้งจริง) หรือ `helm install` จะเติมค่าลงใน placeholder เหล่านั้นแล้วได้ Kubernetes YAML ธรรมดาออกมา Helm ไม่ได้คิดกลไก deploy ใหม่ขึ้นมาเอง มันแค่ generate manifest ที่ `kubectl` เอาไป apply ได้เหมือนเดิม
+`helm template` (render อย่างเดียว ไม่ได้ติดตั้งจริง) หรือ `helm install` จะเติมค่าลงใน placeholder เหล่านั้นแล้วได้ Kubernetes YAML ธรรมดาออกมา Helm ไม่ได้คิดกลไก deploy ใหม่ขึ้นมาเอง แค่ generate manifest ที่ `kubectl` เอาไป apply ได้เหมือนเดิม
 
 ## การส่งค่า configuration เฉพาะแต่ละ environment
 
@@ -120,7 +120,7 @@ export const quizHelm = [
   {
     q: 'ความต่างระหว่าง Helm Chart กับ Helm Release คืออะไร',
     options: [
-      'มันคือสิ่งเดียวกัน แค่เรียกชื่อต่างกันสำหรับ manifest ของ Kubernetes',
+      'เป็นสิ่งเดียวกัน แค่เรียกชื่อต่างกันสำหรับ manifest ของ Kubernetes',
       'Chart คือ template ที่ package ไว้พร้อมค่า default ส่วน Release คือ instance หนึ่งที่ตั้งชื่อไว้และถูก track ของ Chart นั้นที่ติดตั้งใน cluster',
       'Chart จะมีอยู่ก็ต่อเมื่อถูกติดตั้งเป็น Release แล้วเท่านั้น',
       'Release คือไฟล์ source ส่วน Chart คือ Pod ที่รันอยู่',
@@ -150,10 +150,10 @@ export const quizHelm = [
   {
     q: 'helm template ต่างจาก helm install ตรงไหน',
     options: [
-      'มันแค่ render Chart ให้เป็น Kubernetes manifest ธรรมดาในเครื่อง โดยไม่ได้ติดตั้งอะไรเข้า cluster',
-      'มันติดตั้ง Chart แต่ข้ามการสร้าง Release record',
+      'แค่ render Chart ให้เป็น Kubernetes manifest ธรรมดาในเครื่อง โดยไม่ได้ติดตั้งอะไรเข้า cluster',
+      'ติดตั้ง Chart แต่ข้ามการสร้าง Release record',
       'ใช้ได้แค่กับ Chart ที่ไม่มี values.yaml เท่านั้น',
-      'มันเหมือนกับ helm install ทุกประการ',
+      'เหมือนกับ helm install ทุกประการ',
     ],
     answer: 0,
   },

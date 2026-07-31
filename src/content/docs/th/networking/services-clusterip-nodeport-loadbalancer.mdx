@@ -18,7 +18,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 Pod เป็นของใช้แล้วทิ้ง Deployment ย้าย Pod ที่ crash ไปโหนดอื่น rollout แทนที่ Pod ทุกตัวด้วยตัวใหม่ และ cluster autoscaler เพิ่มลดโหนดไปเรื่อย ๆ เหตุการณ์พวกนี้แต่ละอย่างทำให้ Pod ได้ IP ใหม่ได้ตลอด อะไรก็ตามที่ hardcode Pod IP ไว้จะพังทันทีที่ Pod นั้นถูกแทนที่
 
-**Service** แก้ปัญหานี้ด้วยการยืนอยู่หน้ากลุ่ม Pod มันเลือกสมาชิกด้วย **label selector** และติดตามว่า Pod ไหนพร้อมใช้งานอยู่ผ่าน **Endpoints** object (หรือ **EndpointSlice** ซึ่งเป็นเวอร์ชันใหม่ที่ scale ได้ดีกว่า) พอ Pod เกิดหรือหายไป controller จะอัปเดต Endpoints/EndpointSlice ให้อัตโนมัติ client ไม่ต้องรู้เรื่องนี้เลย
+**Service** แก้ปัญหานี้ด้วยการยืนอยู่หน้ากลุ่ม Pod โดยเลือกสมาชิกด้วย **label selector** และติดตามว่า Pod ไหนพร้อมใช้งานอยู่ผ่าน **Endpoints** object (หรือ **EndpointSlice** ที่เป็นเวอร์ชันใหม่ที่ scale ได้ดีกว่า) พอ Pod เกิดหรือหายไป controller จะอัปเดต Endpoints/EndpointSlice ให้อัตโนมัติ client ไม่ต้องรู้เรื่องนี้เลย
 
 ```yaml
 apiVersion: v1
@@ -39,7 +39,7 @@ kubectl get endpoints payments
 kubectl get endpointslices -l kubernetes.io/service-name=payments
 ```
 
-Pod ตัวไหนก็ตามที่ label ตรงกับ `app: payments` และผ่าน readiness probe จะถูกเพิ่มเข้าลิสต์นี้อัตโนมัติ ลบ Pod ทิ้งมันก็หลุดจากลิสต์ Pod ตัวใหม่ที่ label เดียวกันก็ถูกเพิ่มกลับเข้ามาแทน โดยที่ IP กับ DNS name ของ Service ไม่เปลี่ยนเลย
+Pod ตัวไหนก็ตามที่ label ตรงกับ `app: payments` และผ่าน readiness probe จะถูกเพิ่มเข้าลิสต์นี้อัตโนมัติ ลบ Pod ทิ้งก็หลุดจากลิสต์ไปเอง Pod ตัวใหม่ที่ label เดียวกันก็ถูกเพิ่มกลับเข้ามาแทน โดยที่ IP กับ DNS name ของ Service ไม่เปลี่ยนเลย
 
 ## Service สามแบบ ต่อยอดกันเป็นชั้น ๆ
 
@@ -71,7 +71,7 @@ kubectl get svc payments-public
 
 ## kube-proxy คือตัวที่ทำให้ virtual IP ใช้งานได้จริง
 
-ClusterIP ของ Service ไม่ได้มี network interface จริงอยู่ที่ไหนเลย มันเป็นแค่ address เสมือน **kube-proxy** ที่รันอยู่บนทุกโหนดคอย watch API server ดู Service กับ Endpoints/EndpointSlice แล้วเขียน rule ในเครื่อง (ปกติเป็น `iptables` หรือ `IPVS` แล้วแต่ mode ที่ตั้งไว้) เพื่อให้ packet ที่ส่งไปหา virtual IP ถูก rewrite แล้วส่งต่อไปยัง Pod ตัวใดตัวหนึ่งที่อยู่เบื้องหลังโดยอัตโนมัติ นี่คือเหตุผลที่ Service ทำงานเหมือนกันไม่ว่า client Pod จะอยู่โหนดไหน
+ClusterIP ของ Service ไม่ได้มี network interface จริงอยู่ที่ไหนเลย เป็นแค่ address เสมือน **kube-proxy** ที่รันอยู่บนทุกโหนดคอย watch API server ดู Service กับ Endpoints/EndpointSlice แล้วเขียน rule ในเครื่อง (ปกติเป็น `iptables` หรือ `IPVS` แล้วแต่ mode ที่ตั้งไว้) เพื่อให้ packet ที่ส่งไปหา virtual IP ถูก rewrite แล้วส่งต่อไปยัง Pod ตัวใดตัวหนึ่งที่อยู่เบื้องหลังโดยอัตโนมัติ นี่คือเหตุผลที่ Service ทำงานเหมือนกันไม่ว่า client Pod จะอยู่โหนดไหน
 
 <Mermaid title="Client เข้าถึง virtual IP ของ Service ผ่าน kube-proxy ไปยัง Pod ที่อยู่เบื้องหลัง" code={serviceRoutingDiagram} />
 
@@ -102,13 +102,13 @@ export const quizServiceTypes = [
     options: [
       'NodePort ใช้ได้แค่ traffic ภายใน ส่วน ClusterIP ใช้ได้แค่ traffic ภายนอก',
       'NodePort ทำทุกอย่างที่ ClusterIP ทำ บวกกับเปิด port เดียวกันบนทุกโหนดเพื่อให้เข้าถึง Service จากนอก cluster ได้',
-      'มันเหมือนกันเป๊ะ แค่ชื่อต่างกัน',
+      'เหมือนกันเป๊ะ แค่ชื่อต่างกัน',
       'ClusterIP ต้องมี cloud provider ส่วน NodePort ไม่ต้อง',
     ],
     answer: 1,
   },
   {
-    q: 'Service ตัดสินใจยังไงว่า Pod ตัวไหนอยู่เบื้องหลังตัวมันในตอนนี้',
+    q: 'Service ตัดสินใจยังไงว่าตอนนี้มี Pod ตัวไหนอยู่เบื้องหลังบ้าง',
     options: [
       'ดูจาก timestamp ที่ Pod ถูกสร้าง',
       'ด้วย label selector ที่ติดตามผ่าน Endpoints หรือ EndpointSlice ที่อัปเดตอัตโนมัติ',

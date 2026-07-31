@@ -16,10 +16,10 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## สองข้อบังคับก่อน HPA จะทำงานได้
 
-HorizontalPodAutoscaler (`autoscaling/v2`) ฟังดูง่าย แต่มันจะไม่ทำอะไรเลยแบบเงียบ ๆ ถ้าสองอย่างนี้ยังไม่จริง
+HorizontalPodAutoscaler (`autoscaling/v2`) ฟังดูง่าย แต่จะไม่ทำอะไรเลยแบบเงียบ ๆ ถ้าสองอย่างนี้ยังไม่จริง
 
 1. **Pod ของ workload ต้องตั้ง resource `requests` ไว้** โดย default HPA scale ตาม CPU หรือ memory *utilization* และ utilization คำนวณเป็นเปอร์เซ็นต์ของสิ่งที่ Pod request ไว้ — ไม่มี requests ก็ไม่มีตัวหารมาคำนวณเปอร์เซ็นต์
-2. **`metrics-server`** (หรือ custom/external metrics adapter) **ต้องถูกติดตั้งใน cluster** HPA เองไม่วัดอะไรเลย มันแค่อ่าน metric ที่อะไรบางอย่างเก็บและ expose ผ่าน metrics API ไม่มีแหล่ง metric ก็ไม่มีการตัดสินใจ scale เกิดขึ้นเลย
+2. **`metrics-server`** (หรือ custom/external metrics adapter) **ต้องถูกติดตั้งใน cluster** HPA เองไม่วัดอะไรเลย แค่อ่าน metric ที่อะไรบางอย่างเก็บและ expose ผ่าน metrics API ไม่มีแหล่ง metric ก็ไม่มีการตัดสินใจ scale เกิดขึ้นเลย
 
 ```yaml
 apiVersion: apps/v1
@@ -86,8 +86,8 @@ kubectl describe hpa web-app
 
 ควรพูดให้ชัดตรงเส้นแบ่งนี้ เพราะมี autoscaler อีกสองตัวที่ฟังดูคล้ายกันแต่ทำหน้าที่คนละอย่างโดยสิ้นเชิง
 
-- **HorizontalPodAutoscaler** เปลี่ยนจำนวน replica ของ Deployment หรือ StatefulSet นี่คืองานทั้งหมดของมัน
-- **VerticalPodAutoscaler (VPA)** เปลี่ยน `requests`/`limits` ของ Pod ที่มีอยู่แล้ว ปรับขนาดมันแทนที่จะเพิ่มจำนวน
+- **HorizontalPodAutoscaler** เปลี่ยนจำนวน replica ของ Deployment หรือ StatefulSet นี่คืองานทั้งหมดของตัวเอง
+- **VerticalPodAutoscaler (VPA)** เปลี่ยน `requests`/`limits` ของ Pod ที่มีอยู่แล้ว คือปรับขนาด Pod แทนที่จะเพิ่มจำนวน
 - **Cluster Autoscaler** เปลี่ยนจำนวน Node ของ cluster เพิ่มหรือลดเครื่องที่อยู่ข้างใต้ทุกอย่าง (บทถัดไปพูดถึงเรื่องนี้)
 
 <Mermaid title="metrics-server feeding Pod CPU utilization into the HPA controller, which adjusts a Deployment's replica count" code={hpaDiagram} />
@@ -98,7 +98,7 @@ export const hpaDiagram = `flowchart LR
   hpa -->|"raise or lower"| replicas["Deployment.spec.replicas"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**HorizontalPodAutoscaler** (`autoscaling/v2`) เปลี่ยน `replicas` ของ Deployment หรือ StatefulSet เพื่อดึง metric ที่จับตาอยู่ให้ใกล้ target แต่มันจะไม่ทำอะไรเลยถ้าไม่มีสองข้อบังคับ: Pod ต้องตั้ง **`requests`** ไว้ (utilization คือเปอร์เซ็นต์ของ request) และต้องมี **metrics-server** หรือ custom/external metrics adapter ติดตั้งไว้เพื่อป้อน metric มันยัง scale ตาม custom หรือ external metric สำหรับ signal ที่ไม่ใช่ resource ได้ด้วย HPA เปลี่ยนแค่จำนวน replica เท่านั้น — การปรับขนาด Pod ที่มีอยู่แล้วเป็นงานของ **VerticalPodAutoscaler** ส่วนการเพิ่มหรือลด Node เป็นงานของ **Cluster Autoscaler**
+**HorizontalPodAutoscaler** (`autoscaling/v2`) เปลี่ยน `replicas` ของ Deployment หรือ StatefulSet เพื่อดึง metric ที่จับตาอยู่ให้ใกล้ target แต่จะไม่ทำอะไรเลยถ้าไม่มีสองข้อบังคับ: Pod ต้องตั้ง **`requests`** ไว้ (utilization คือเปอร์เซ็นต์ของ request) และต้องมี **metrics-server** หรือ custom/external metrics adapter ติดตั้งไว้เพื่อป้อน metric นอกจากนี้ HPA ยัง scale ตาม custom หรือ external metric สำหรับ signal ที่ไม่ใช่ resource ได้ด้วย HPA เปลี่ยนแค่จำนวน replica เท่านั้น — การปรับขนาด Pod ที่มีอยู่แล้วเป็นงานของ **VerticalPodAutoscaler** ส่วนการเพิ่มหรือลด Node เป็นงานของ **Cluster Autoscaler**
 </Callout>
 
 export const quizHpa = [

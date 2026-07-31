@@ -16,7 +16,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ค่า default: network แบบแบนราบและเปิดหมด
 
-ตั้งแต่แกะกล่องมา networking ของ Kubernetes ไม่มี isolation เลย Pod ไหนก็ส่ง traffic ไปหา Pod อื่นได้หมด ไม่ว่าจะอยู่ namespace ไหน และแล้วแต่วิธี expose Service Pod ก็มักถูกเข้าถึงจากนอก cluster ได้ด้วย ไม่มี default-deny อยู่ที่ไหนเลย เรื่องนี้เข้าใจง่ายแต่หมายความว่า Pod ที่ถูก compromise หรือ config ผิดสามารถเข้าถึงส่วนอื่นของ cluster ได้มากกว่าที่มันควรต้องการเยอะ
+ตั้งแต่แกะกล่องมา networking ของ Kubernetes ไม่มี isolation เลย Pod ไหนก็ส่ง traffic ไปหา Pod อื่นได้หมด ไม่ว่าจะอยู่ namespace ไหน และแล้วแต่วิธี expose Service Pod ก็มักถูกเข้าถึงจากนอก cluster ได้ด้วย ไม่มี default-deny อยู่ที่ไหนเลย เรื่องนี้เข้าใจง่ายแต่หมายความว่า Pod ที่ถูก compromise หรือ config ผิดสามารถเข้าถึงส่วนอื่นของ cluster ได้มากกว่าที่ควรต้องการเยอะ
 
 ## NetworkPolicy: เลือก Pod ก่อน แล้วค่อยอนุญาต traffic
 
@@ -51,13 +51,13 @@ kubectl get networkpolicy -n shop
 kubectl describe networkpolicy allow-frontend-to-api -n shop
 ```
 
-## NetworkPolicy จะทำงานก็ต่อเมื่อ CNI บังคับใช้มันจริง
+## NetworkPolicy จะทำงานก็ต่อเมื่อ CNI บังคับใช้จริง
 
-นี่คือข้อควรระวังที่สำคัญที่สุด `NetworkPolicy` object เฉย ๆ ไม่มีผลอะไรเลยถ้า **CNI plugin** ของ cluster ไม่ได้ implement การบังคับใช้ NetworkPolicy จริง Kubernetes รับและเก็บ object นี้ได้เสมอ `kubectl apply` จะสำเร็จ แต่ถ้า CNI ไม่บังคับใช้ policy traffic จริงก็ไม่เปลี่ยนอะไรเลย ต้องเช็คก่อนเสมอว่า CNI ที่ติดตั้งอยู่รองรับ NetworkPolicy ก่อนจะพึ่งมันเพื่อทำ isolation
+นี่คือข้อควรระวังที่สำคัญที่สุด `NetworkPolicy` object เฉย ๆ ไม่มีผลอะไรเลยถ้า **CNI plugin** ของ cluster ไม่ได้ implement การบังคับใช้ NetworkPolicy จริง Kubernetes รับและเก็บ object นี้ได้เสมอ `kubectl apply` จะสำเร็จ แต่ถ้า CNI ไม่บังคับใช้ policy traffic จริงก็ไม่เปลี่ยนอะไรเลย ต้องเช็คก่อนเสมอว่า CNI ที่ติดตั้งอยู่รองรับ NetworkPolicy ก่อนจะพึ่ง NetworkPolicy เพื่อทำ isolation
 
 ## รูปแบบ default-deny
 
-จุดที่คนสับสนกันบ่อย Pod ที่ไม่มี NetworkPolicy ตัวไหนเลือกมันเลยจะยังคงเปิดเต็มที่ (allow-all) สำหรับทิศทาง traffic นั้น isolation เป็นแบบ opt-in ต่อ Pod ไม่ใช่ทั้ง cluster ถ้าจะปิด namespace หนึ่งให้แน่นหนา ต้องสร้าง policy ที่เลือก Pod ทุกตัวแต่ไม่อนุญาตอะไรเลยโดยตั้งใจ
+จุดที่คนสับสนกันบ่อย Pod ที่ไม่มี NetworkPolicy ตัวไหนเลือกเลย จะยังคงเปิดเต็มที่ (allow-all) สำหรับทิศทาง traffic นั้น isolation เป็นแบบ opt-in ต่อ Pod ไม่ใช่ทั้ง cluster ถ้าจะปิด namespace หนึ่งให้แน่นหนา ต้องสร้าง policy ที่เลือก Pod ทุกตัวแต่ไม่อนุญาตอะไรเลยโดยตั้งใจ
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -119,7 +119,7 @@ export const networkPolicyDiagram = `flowchart LR
   end`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-networking ของ Kubernetes แบนราบโดย default ทุก Pod คุยกับ Pod อื่นได้หมด และ Pod ที่ไม่มี NetworkPolicy ตัวไหนเลือกมันก็ยังคงเปิดเต็มที่ **NetworkPolicy** (`networking.k8s.io/v1`) เลือก Pod ด้วย `podSelector` และกำหนด rule `ingress`/`egress` ที่อนุญาต แต่มันมีผลก็ต่อเมื่อ **CNI plugin** ของ cluster บังคับใช้ NetworkPolicy จริง `podSelector: {}` คู่กับ `ingress: []` ที่ว่างเปล่าคือรูปแบบ **default-deny** มาตรฐาน และการรวม `namespaceSelector` กับ `podSelector` ไว้ใน rule เดียวจะจำกัด traffic ให้เหลือแค่ Pod เจาะจงใน namespace เจาะจง
+networking ของ Kubernetes แบนราบโดย default ทุก Pod คุยกับ Pod อื่นได้หมด และ Pod ที่ไม่มี NetworkPolicy ตัวไหนเลือกก็ยังคงเปิดเต็มที่ **NetworkPolicy** (`networking.k8s.io/v1`) เลือก Pod ด้วย `podSelector` และกำหนด rule `ingress`/`egress` ที่อนุญาต แต่มีผลก็ต่อเมื่อ **CNI plugin** ของ cluster บังคับใช้ NetworkPolicy จริง `podSelector: {}` คู่กับ `ingress: []` ที่ว่างเปล่าคือรูปแบบ **default-deny** มาตรฐาน และการรวม `namespaceSelector` กับ `podSelector` ไว้ใน rule เดียวจะจำกัด traffic ให้เหลือแค่ Pod เจาะจงใน namespace เจาะจง
 </Callout>
 
 export const quizNetworkPolicies = [

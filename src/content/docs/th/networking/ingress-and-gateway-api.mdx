@@ -1,6 +1,6 @@
 ---
 title: 'Ingress และ Gateway API'
-description: 'วิธีที่ Ingress route HTTP traffic เข้า cluster ทำไมมันต้องพึ่ง controller ถึงจะทำงานได้ และ Gateway API เป็นตัวต่อยอดที่ยืดหยุ่นกว่ายังไง'
+description: 'วิธีที่ Ingress route HTTP traffic เข้า cluster ทำไมต้องพึ่ง controller ถึงจะทำงานได้ และ Gateway API เป็นตัวต่อยอดที่ยืดหยุ่นกว่ายังไง'
 sidebar:
   order: 3
 ---
@@ -12,11 +12,11 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-**Ingress** อธิบาย rule การ route HTTP(S) แบบ Layer-7 เพื่อพา traffic ภายนอกไปหา Service ภายใน แต่ rule พวกนั้นจะไม่ทำงานเลยจนกว่าจะมี **Ingress controller** รันอยู่จริงเพื่อ implement มัน
+**Ingress** อธิบาย rule การ route HTTP(S) แบบ Layer-7 เพื่อพา traffic ภายนอกไปหา Service ภายใน แต่ rule พวกนั้นจะไม่ทำงานเลยจนกว่าจะมี **Ingress controller** รันอยู่จริงเพื่อ implement rule พวกนั้น
 
 ## Ingress: rule การ route ไม่ใช่ router
 
-LoadBalancer Service ใช้ได้ดีกับแอปเดียว แต่การ provision cloud load balancer แยกต่อแอปมันแพงและไม่ให้ route ตาม hostname หรือ URL path ได้ **Ingress** แก้ปัญหานี้ที่ Layer 7 จุดเข้าเดียวที่ตรวจ HTTP request แล้ว route ตาม host กับ path
+LoadBalancer Service ใช้ได้ดีกับแอปเดียว แต่การ provision cloud load balancer แยกต่อแอปนั้นแพง แถมยัง route ตาม hostname หรือ URL path ไม่ได้ด้วย **Ingress** แก้ปัญหานี้ที่ Layer 7 จุดเข้าเดียวที่ตรวจ HTTP request แล้ว route ตาม host กับ path
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -51,7 +51,7 @@ manifest นั้นแสดงสองอย่างพร้อมกั�
 
 ## Ingress object เดี่ยว ๆ ไม่ทำอะไรเลย
 
-ตรงนี้คือจุดที่คนสับสนกันบ่อย การสร้าง `Ingress` object เฉย ๆ ไม่ทำให้ traffic ถูก route ไปไหนเลยด้วยตัวมันเอง Ingress เป็นแค่การประกาศ intent เท่านั้น มันต้องพึ่ง **Ingress controller** ซึ่งเป็น software แยกต่างหากที่รันอยู่จริงใน cluster (เช่น controller ที่ใช้ nginx, controller ของ cloud provider หรือตัวอื่น ๆ) คอย watch Ingress object แล้วเขียน proxy หรือ load balancer จริงให้ตรงตามนั้น ถ้าไม่มี controller รันอยู่ Ingress resource ก็แค่นอนเฉย ๆ ไม่มีผลอะไร
+ตรงนี้คือจุดที่คนสับสนกันบ่อย การสร้าง `Ingress` object เฉย ๆ ไม่ทำให้ traffic ถูก route ไปไหนเลยด้วยตัวเอง Ingress เป็นแค่การประกาศ intent เท่านั้น ต้องพึ่ง **Ingress controller** ที่เป็น software แยกต่างหากที่รันอยู่จริงใน cluster (เช่น controller ที่ใช้ nginx, controller ของ cloud provider หรือตัวอื่น ๆ) คอย watch Ingress object แล้วเขียน proxy หรือ load balancer จริงให้ตรงตามนั้น ถ้าไม่มี controller รันอยู่ Ingress resource ก็แค่นอนเฉย ๆ ไม่มีผลอะไร
 
 ```bash
 # An Ingress with no controller watching it accomplishes nothing
@@ -120,7 +120,7 @@ export const ingressRoutingDiagram = `flowchart LR
   ing --> svcB["Service: frontend-svc"] --> podB["Pods"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**Ingress** ประกาศ rule การ route แบบ Layer-7 ตาม host กับ path แต่ไม่ทำอะไรเลยถ้าไม่มี **Ingress controller** รันอยู่เพื่อ implement มัน และ `IngressClass` เลือกว่า controller ตัวไหนจัดการ Ingress ตัวไหนเวลามีติดตั้งหลายตัว **Gateway API** คือตัวต่อยอดใหม่กว่าที่แยก role ชัดเจน `GatewayClass` (implementation), `Gateway` (listener ปกติดูแลโดย platform), และ `HTTPRoute`/`GRPCRoute` (rule การ route ปกติดูแลโดยทีม application) ซึ่ง resource หลักตอนนี้ GA แล้ว ในขณะที่ Ingress ก็ยังถูกใช้กันแพร่หลายและได้รับ support เต็มที่
+**Ingress** ประกาศ rule การ route แบบ Layer-7 ตาม host กับ path แต่ไม่ทำอะไรเลยถ้าไม่มี **Ingress controller** รันอยู่เพื่อ implement rule เหล่านั้น และ `IngressClass` เลือกว่า controller ตัวไหนจัดการ Ingress ตัวไหนเวลามีติดตั้งหลายตัว **Gateway API** คือตัวต่อยอดใหม่กว่าที่แยก role ชัดเจน `GatewayClass` (implementation), `Gateway` (listener ปกติดูแลโดย platform), และ `HTTPRoute`/`GRPCRoute` (rule การ route ปกติดูแลโดยทีม application) ซึ่ง resource หลักตอนนี้ GA แล้ว ส่วน Ingress ก็ยังถูกใช้กันแพร่หลายและได้รับ support เต็มที่
 </Callout>
 
 export const quizIngressGateway = [
@@ -128,7 +128,7 @@ export const quizIngressGateway = [
     q: 'ทำไมการสร้าง Ingress object เดี่ยว ๆ ถึงไม่ทำให้ traffic ถูก route',
     options: [
       'Ingress object ถูก deprecate ไปแล้ว ไม่เคยทำงานได้เลย',
-      'Ingress เป็นแค่การประกาศ intent เรื่อง routing ต้องมี Ingress controller รันอยู่ใน cluster ถึงจะ implement มันได้จริง',
+      'Ingress เป็นแค่การประกาศ intent เรื่อง routing ต้องมี Ingress controller รันอยู่ใน cluster ถึงจะ implement rule เหล่านั้นได้จริง',
       'Ingress ใช้ได้แค่กับ LoadBalancer Service เท่านั้น ไม่ใช่ ClusterIP',
       'Ingress object ต้อง restart API server ถึงจะมีผล',
     ],
@@ -137,7 +137,7 @@ export const quizIngressGateway = [
   {
     q: 'host-based routing กับ path-based routing ใน Ingress rule ต่างกันยังไง',
     options: [
-      'มันคือฟีเจอร์เดียวกันแค่คนละชื่อ',
+      'เป็นฟีเจอร์เดียวกันแค่คนละชื่อ',
       'host-based routing match ตาม hostname ของ request (เช่น shop.example.com) ส่วน path-based routing match ตาม URL path (เช่น /api) ภายใน host ที่ match แล้ว',
       'host-based routing ใช้ได้แค่กับ Gateway API เท่านั้น ไม่ใช่ Ingress',
       'path-based routing ต้องมี LoadBalancer แยกต่อ path',

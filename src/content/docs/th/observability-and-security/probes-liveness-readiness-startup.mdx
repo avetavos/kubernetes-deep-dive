@@ -51,13 +51,13 @@ spec:
         failureThreshold: 1
 ```
 
-ความผิดพลาดที่เจอบ่อยในโลกจริงคือการไม่ใส่ readiness probe เลย พอไม่มี readiness probe Kubernetes จะถือว่า container พร้อมทันทีที่มัน start ขึ้นมา ทั้งที่ตัวแอปข้างในอาจจะยังโหลด config อยู่ warm cache อยู่ หรือกำลังเปิด connection กับ database ระหว่าง rollout แบบนี้ traffic จริงจะถูกส่งตรงเข้าไปยัง container ที่ยังรับมือไม่ไหว ซึ่งเป็นสาเหตุที่พบบ่อยของ error ที่พุ่งขึ้นทันทีหลัง deploy ทุกครั้ง
+ความผิดพลาดที่เจอบ่อยในโลกจริงคือการไม่ใส่ readiness probe เลย พอไม่มี readiness probe Kubernetes จะถือว่า container พร้อมทันทีที่ start ขึ้นมา ทั้งที่ตัวแอปข้างในอาจจะยังโหลด config อยู่ warm cache อยู่ หรือกำลังเปิด connection กับ database ระหว่าง rollout แบบนี้ traffic จริงจะถูกส่งตรงเข้าไปยัง container ที่ยังรับมือไม่ไหว ที่เป็นสาเหตุที่พบบ่อยของ error ที่พุ่งขึ้นทันทีหลัง deploy ทุกครั้ง
 
 ## Startup probe: ให้เวลา container ที่ start ช้า
 
 container บางตัว เช่นแอป JVM เก่า หรือตัวที่ทำ migration หนัก ๆ หรือ preload cache ตอน boot อาจใช้เวลาหลายนาทีกว่าจะตอบสนองได้ การตั้ง `initialDelaySeconds` สั้น ๆ บน liveness probe ไม่พอ แต่ถ้าตั้งยาวไปก็ทำให้ตรวจจับปัญหาค้างจริง ๆ หลัง app ขึ้นมาแล้วช้าตามไปด้วย
 
-**Startup probe** แก้ปัญหานี้ ตราบใดที่ startup probe ยังไม่ผ่าน liveness กับ readiness probe จะถูกปิดไปเลย container ที่ boot ช้าจึงไม่โดน liveness probe ที่ใจร้อนฆ่าทิ้งก่อนเวลา พอ startup probe ผ่านครั้งเดียว มันก็หยุดรันถาวร แล้วให้ liveness/readiness ทำงานแทนต่อไปตลอดอายุ container
+**Startup probe** แก้ปัญหานี้ ตราบใดที่ startup probe ยังไม่ผ่าน liveness กับ readiness probe จะถูกปิดไปเลย container ที่ boot ช้าจึงไม่โดน liveness probe ที่ใจร้อนฆ่าทิ้งก่อนเวลา พอ startup probe ผ่านครั้งเดียว probe ตัวนี้ก็หยุดรันถาวร แล้วให้ liveness/readiness ทำงานแทนต่อไปตลอดอายุ container
 
 ```yaml
     startupProbe:
@@ -68,7 +68,7 @@ container บางตัว เช่นแอป JVM เก่า หรือ
       periodSeconds: 10
 ```
 
-ด้วย `failureThreshold: 30` และ `periodSeconds: 10` container ตัวนี้มีเวลาสูงสุด 300 วินาทีให้กลายเป็น healthy ก่อนที่ kubelet จะยอมแพ้แล้ว restart มัน
+ด้วย `failureThreshold: 30` และ `periodSeconds: 10` container ตัวนี้มีเวลาสูงสุด 300 วินาทีให้กลายเป็น healthy ก่อนที่ kubelet จะยอมแพ้แล้ว restart container
 
 ```bash
 # Watch probe-driven restarts and readiness state
@@ -93,7 +93,7 @@ probe ทุกแบบ (liveness, readiness, startup) เลือกใช้
 
 field สำหรับปรับจูนใช้ได้กับทุกกลไก คือ `initialDelaySeconds` (รอก่อนเช็คครั้งแรก) `periodSeconds` (เช็คถี่แค่ไหน) `timeoutSeconds` (รอ response นานแค่ไหน) `failureThreshold` (fail ติดกันกี่ครั้งถึงจะสั่งการ) และ `successThreshold` (สำเร็จติดกันกี่ครั้งถึงจะกลับมา healthy ซึ่งของ liveness กับ startup ต้องเป็น `1` เท่านั้น)
 
-<Mermaid title="วงจรชีวิต container: startup probe กั้น liveness กับ readiness ก่อนที่มันจะรันต่อเนื่อง" code={probeLifecycleDiagram} />
+<Mermaid title="วงจรชีวิต container: startup probe กั้น liveness กับ readiness ก่อนที่จะรันต่อเนื่อง" code={probeLifecycleDiagram} />
 
 export const probeLifecycleDiagram = `flowchart LR
   boot["Container starts"] --> sp{"startupProbe\\nsucceeded?"}
@@ -105,7 +105,7 @@ export const probeLifecycleDiagram = `flowchart LR
   ready -- "succeeds again" --> add["Pod added back to Endpoints"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**Liveness probe** fail แล้ว container จะถูก **restart** **Readiness probe** fail แล้ว Pod จะถูก **เอาออกจาก Endpoints ของ Service** โดยไม่แตะ container เลย **Startup probe** กั้น liveness กับ readiness ไว้จนกว่า container ที่ boot ช้าจะ start เสร็จ probe เลือกใช้ **httpGet**, **tcpSocket**, **exec**, หรือ **grpc** ได้ ปรับจูนด้วย `initialDelaySeconds`, `periodSeconds`, `timeoutSeconds`, `failureThreshold`, และ `successThreshold` การไม่ใส่ readiness probe แปลว่า traffic จะเข้าถึง container ทันทีที่มัน start ซึ่งเป็นสาเหตุยอดฮิตของ error หลัง rollout
+**Liveness probe** fail แล้ว container จะถูก **restart** **Readiness probe** fail แล้ว Pod จะถูก **เอาออกจาก Endpoints ของ Service** โดยไม่แตะ container เลย **Startup probe** กั้น liveness กับ readiness ไว้จนกว่า container ที่ boot ช้าจะ start เสร็จ probe เลือกใช้ **httpGet**, **tcpSocket**, **exec**, หรือ **grpc** ได้ ปรับจูนด้วย `initialDelaySeconds`, `periodSeconds`, `timeoutSeconds`, `failureThreshold`, และ `successThreshold` การไม่ใส่ readiness probe แปลว่า traffic จะเข้าถึง container ทันทีที่ start ซึ่งเป็นสาเหตุยอดฮิตของ error หลัง rollout
 </Callout>
 
 export const quizProbes = [
@@ -133,7 +133,7 @@ export const quizProbes = [
     q: 'startup probe มีไว้เพื่ออะไร',
     options: [
       'มาแทนที่ readiness probe ไปเลย',
-      'ให้เวลา container ที่ start ช้าได้ boot จนเสร็จ ด้วยการปิด liveness กับ readiness ไว้จนกว่ามันจะผ่าน',
+      'ให้เวลา container ที่ start ช้าได้ boot จนเสร็จ ด้วยการปิด liveness กับ readiness ไว้จนกว่าจะผ่าน',
       'เช็คพื้นที่ disk ก่อน container จะ start',
       'restart container ตามตารางเวลาที่กำหนดไว้',
     ],

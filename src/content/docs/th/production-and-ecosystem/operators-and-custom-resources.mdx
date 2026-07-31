@@ -1,6 +1,6 @@
 ---
 title: 'Operator และ Custom Resource'
-description: 'วิธีที่ CustomResourceDefinition ต่อขยาย Kubernetes API และวิธีที่ Operator pattern จับคู่มันกับ controller เพื่อ automate ความรู้เชิง operation'
+description: 'วิธีที่ CustomResourceDefinition ต่อขยาย Kubernetes API และวิธีที่ Operator pattern จับคู่ CRD เข้ากับ controller เพื่อ automate ความรู้เชิง operation'
 sidebar:
   order: 2
 ---
@@ -12,11 +12,11 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-**CustomResourceDefinition** ต่อขยาย Kubernetes API ด้วย object Kind ใหม่ ส่วน **Operator** คือ CRD นั้นจับคู่กับ controller ที่คอย reconcile สถานะจริงให้ตรงกับมันตลอดเวลา
+**CustomResourceDefinition** ต่อขยาย Kubernetes API ด้วย object Kind ใหม่ ส่วน **Operator** คือ CRD นั้นจับคู่กับ controller ที่คอย reconcile สถานะจริงให้ตรงกับที่ประกาศไว้ตลอดเวลา
 
 ## CustomResourceDefinition: สอน API server ให้รู้จัก Kind ใหม่
 
-**CustomResourceDefinition (CRD)** ลงทะเบียน object Kind ใหม่เข้ากับ Kubernetes API server พอติดตั้งแล้ว instance ของ Kind นั้นจะทำงานเหมือน built-in object ทุกอย่าง `kubectl get`/`kubectl apply` ใช้ได้ตามปกติ มันถูกเก็บใน etcd เหมือนของอื่น ๆ และ watch ผ่าน API ได้เหมือน Pod หรือ Deployment ตัว CRD เองกำหนด schema ของ Kind นั้นด้วย OpenAPI v3 schema ทำให้ API server validate instance ตอนเขียนได้
+**CustomResourceDefinition (CRD)** ลงทะเบียน object Kind ใหม่เข้ากับ Kubernetes API server พอติดตั้งแล้ว instance ของ Kind นั้นจะทำงานเหมือน built-in object ทุกอย่าง `kubectl get`/`kubectl apply` ใช้ได้ตามปกติ object เหล่านี้ถูกเก็บใน etcd เหมือนของอื่น ๆ และ watch ผ่าน API ได้เหมือน Pod หรือ Deployment ตัว CRD เองกำหนด schema ของ Kind นั้นด้วย OpenAPI v3 schema ทำให้ API server validate instance ตอนเขียนได้
 
 ```yaml
 apiVersion: apiextensions.k8s.io/v1
@@ -67,13 +67,13 @@ kubectl get databases
 kubectl get db orders-db -o yaml
 ```
 
-## CRD เดี่ยว ๆ คือแค่ schema controller ต่างหากที่ทำให้มันเป็น Operator
+## CRD เดี่ยว ๆ คือแค่ schema controller ต่างหากที่ทำให้กลายเป็น Operator
 
-การ apply object `Database` นั้นไม่ทำอะไรด้วยตัวมันเอง API server แค่เก็บมันลง etcd แล้ว validate โครงสร้าง แต่ไม่มีอะไรไป provision database จริงให้ CRD เพิ่มแค่ schema กับที่เก็บสำหรับ Kind ใหม่ ไม่มี behavior ใด ๆ **Operator pattern** คือ CRD นั้นจับคู่กับ **controller** ที่คอย watch instance ของ custom resource แล้วขับเคลื่อน infrastructure จริงให้ตรงกับสิ่งที่มันอธิบายไว้ ใช้ reconciliation loop แบบเดียวกัน (watch, diff, act) ที่ built-in controller ของ Kubernetes เองใช้กับ Deployment กับ ReplicaSet เพียงแต่เล็งไปที่ความรู้เฉพาะแอปหรือเฉพาะงาน operation แทนที่จะเป็นการ schedule Pod ทั่วไป database Operator อาจ provision database instance จริงตอนที่ resource `Database` ถูกสร้าง ทำ backup เป็นระยะเพราะ resource บอกไว้แบบนั้น และจัดการ failover อัตโนมัติเมื่อ replica ตัวไหนไม่ healthy ถ้าไม่มี controller ตัวนี้ CRD ก็เป็นแค่รูปแบบที่ `kubectl` ยอมรับเท่านั้นเอง
+การ apply object `Database` นั้นไม่ทำอะไรด้วยตัวเอง API server แค่เก็บลง etcd แล้ว validate โครงสร้าง แต่ไม่มีอะไรไป provision database จริงให้ CRD เพิ่มแค่ schema กับที่เก็บสำหรับ Kind ใหม่ ไม่มี behavior ใด ๆ **Operator pattern** คือ CRD นั้นจับคู่กับ **controller** ที่คอย watch instance ของ custom resource แล้วขับเคลื่อน infrastructure จริงให้ตรงกับสิ่งที่อธิบายไว้ ใช้ reconciliation loop แบบเดียวกัน (watch, diff, act) ที่ built-in controller ของ Kubernetes เองใช้กับ Deployment กับ ReplicaSet เพียงแต่เล็งไปที่ความรู้เฉพาะแอปหรือเฉพาะงาน operation แทนที่จะเป็นการ schedule Pod ทั่วไป database Operator อาจ provision database instance จริงตอนที่ resource `Database` ถูกสร้าง ทำ backup เป็นระยะเพราะ resource บอกไว้แบบนั้น และจัดการ failover อัตโนมัติเมื่อ replica ตัวไหนไม่ healthy ถ้าไม่มี controller ตัวนี้ CRD ก็เป็นแค่รูปแบบที่ `kubectl` ยอมรับเท่านั้นเอง
 
 ## ทำไมตรงนี้ programmatic client ถึงคุ้มค่าจริง ๆ
 
-ที่อื่นในคอร์สนี้ `kubectl apply` เพียงพออยู่แล้วเพราะมนุษย์รันมันครั้งเดียวแล้ว built-in controller ก็ทำต่อเอง controller ของ Operator ต่างออกไป มันต้องรันต่อเนื่อง ตอบสนองต่อทุก add, update, delete ของ custom resource ตราบเท่าที่ cluster ยังอยู่ นี่คือสถานการณ์ที่คำสั่ง CLI ครั้งเดียวรองรับไม่ได้ แต่ client แบบ programmatic ที่ watch อยู่ตลอดรองรับได้ การใช้ class `Watch` ของ `@kubernetes/client-node` เล็งไปที่ API path ของ custom resource เป็นวิธีที่สมจริงในการสร้าง reconciliation loop ซึ่งเป็นหัวใจของ Operator
+ที่อื่นในคอร์สนี้ `kubectl apply` เพียงพออยู่แล้วเพราะมนุษย์รันครั้งเดียวแล้ว built-in controller ก็ทำต่อเอง ส่วน controller ของ Operator ต่างออกไป คือต้องรันต่อเนื่อง ตอบสนองต่อทุก add, update, delete ของ custom resource ตราบเท่าที่ cluster ยังอยู่ นี่คือสถานการณ์ที่คำสั่ง CLI ครั้งเดียวรองรับไม่ได้ แต่ client แบบ programmatic ที่ watch อยู่ตลอดรองรับได้ การใช้ class `Watch` ของ `@kubernetes/client-node` เล็งไปที่ API path ของ custom resource เป็นวิธีที่สมจริงในการสร้าง reconciliation loop ที่เป็นหัวใจของ Operator
 
 ```typescript
 import * as k8s from '@kubernetes/client-node';
@@ -113,7 +113,7 @@ const req = await watch.watch(
 // req.abort();
 ```
 
-ทุก event `ADDED` หรือ `MODIFIED` จะรัน reconcile step ใหม่อีกครั้ง ซึ่งเป็นแก่นของ Operator pattern เลย คือคอยเทียบ desired state (custom resource) กับ real state (infrastructure จริง) แล้วแก้ส่วนต่างไปเรื่อย ๆ โดยไม่ต้องให้มนุษย์มารันคำสั่งซ้ำ
+ทุก event `ADDED` หรือ `MODIFIED` จะรัน reconcile step ใหม่อีกครั้ง ที่เป็นแก่นของ Operator pattern เลย คือคอยเทียบ desired state (custom resource) กับ real state (infrastructure จริง) แล้วแก้ส่วนต่างไปเรื่อย ๆ โดยไม่ต้องให้มนุษย์มารันคำสั่งซ้ำ
 
 <Mermaid title="custom resource ป้อนเข้า watch-diff-act loop ของ Operator ซึ่งขับเคลื่อน database instance จริง" code={operatorLoopDiagram} />
 
@@ -163,10 +163,10 @@ export const quizOperators = [
   {
     q: 'ใน Operator reconciliation loop หลังจาก controller diff desired state กับ real state แล้วจะเกิดอะไรขึ้น',
     options: [
-      'มันจะลบ custom resource ทุกครั้ง',
-      'ถ้า real state ไม่ตรงกับ spec มันจะ act เพื่อแก้ส่วนต่าง ถ้าตรงแล้วก็ไม่ทำอะไรใน cycle นั้น',
-      'มันจะ restart API server ทันที',
-      'มันรอให้มนุษย์อนุมัติทุกการเปลี่ยนแปลงด้วยมือ',
+      'จะลบ custom resource ทุกครั้ง',
+      'ถ้า real state ไม่ตรงกับ spec จะ act เพื่อแก้ส่วนต่าง ถ้าตรงแล้วก็ไม่ทำอะไรใน cycle นั้น',
+      'จะ restart API server ทันที',
+      'รอให้มนุษย์อนุมัติทุกการเปลี่ยนแปลงด้วยมือ',
     ],
     answer: 1,
   },

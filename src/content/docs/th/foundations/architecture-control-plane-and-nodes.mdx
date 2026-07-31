@@ -18,8 +18,8 @@ control plane ของ cluster ตัดสินใจและเก็บ st
 
 control plane คือ component ชุดเล็ก ๆ ที่มักรันอยู่ด้วยกัน และร่วมกันตัดสินใจว่า cluster ควรทำอะไร พร้อมจดจำสิ่งที่ตัดสินใจไปแล้ว
 
-- **kube-apiserver** คือประตูหน้าของ cluster มันเปิด REST API ที่ทุก component อื่น รวมถึงทุกคำสั่ง `kubectl` ที่คุณรัน ต้องคุยด้วย มันตรวจสอบและ authenticate request และเป็น component เดียวเท่านั้นที่คุยกับ etcd โดยตรง
-- **etcd** คือ distributed key-value store ที่มีความ consistent เก็บ cluster state ทั้งหมด ทุก object ที่คุณสร้าง สถานะปัจจุบันของมัน ทุกอย่าง ถ้า etcd หายไปโดยไม่มี backup ความจำของ cluster ก็หายไปด้วย
+- **kube-apiserver** คือประตูหน้าของ cluster เปิด REST API ที่ทุก component อื่น รวมถึงทุกคำสั่ง `kubectl` ที่คุณรัน ต้องคุยด้วย ทำหน้าที่ตรวจสอบและ authenticate request และเป็น component เดียวเท่านั้นที่คุยกับ etcd โดยตรง
+- **etcd** คือ distributed key-value store ที่มีความ consistent เก็บ cluster state ทั้งหมด ทุก object ที่คุณสร้าง สถานะปัจจุบันของตัวเอง ทุกอย่าง ถ้า etcd หายไปโดยไม่มี backup ความจำของ cluster ก็หายไปด้วย
 - **kube-scheduler** คอยดู Pod ที่เพิ่งสร้างใหม่และยังไม่มี node กำหนด แล้วตัดสินใจว่าแต่ละตัวควรรันบน node ไหน โดยดูจาก resource requirement, constraint และ load ปัจจุบันของ cluster
 - **kube-controller-manager** รัน controller ในตัวทั้งหมดเป็น process เดียว เช่น node controller (สังเกตเมื่อ node เข้าไม่ถึง) replication controller (รักษาจำนวน Pod replica ให้ถูกต้อง) endpoint controller (อัปเดต endpoint ของ Service ให้ทันสมัย) และอื่น ๆ ตรงนี้คือที่ที่ reconciliation loop จากบทก่อนหน้าทำงานจริง
 - **cloud-controller-manager** เป็น optional และมีเฉพาะบน managed cloud cluster ทำหน้าที่เชื่อม concern ระดับ cluster เช่น load balancer และ node lifecycle เข้ากับ API ของ cloud provider
@@ -34,8 +34,8 @@ kubectl get pods -n kube-system
 
 ทุก node ใน cluster รันสามอย่างนี้
 
-- **kubelet** คือ node agent เป็น component ที่ทำให้ container ตาม Pod spec ที่ assign มาให้ node นี้รันอยู่จริงและ healthy มันเริ่ม container, restart เมื่อมันตาย, รัน probe ของมัน และรายงานสถานะของ node กับ Pod กลับไปยัง API server ไม่มีอะไรรันบน node ได้ ถ้าไม่มี kubelet เป็นคนสั่ง
-- **kube-proxy** ดูแล network rule บน node ที่ทำให้ Service ทำงานได้ คือ route traffic ที่ยิงไปยัง virtual IP ของ Service ไปหา Pod ตัวใดตัวหนึ่งที่ match ไม่ว่ามันจะรันอยู่ที่ไหน
+- **kubelet** คือ node agent เป็น component ที่ทำให้ container ตาม Pod spec ที่ assign มาให้ node นี้รันอยู่จริงและ healthy kubelet เริ่ม container, restart เมื่อ container ตาย, รัน probe ของตัวเอง และรายงานสถานะของ node กับ Pod กลับไปยัง API server ไม่มีอะไรรันบน node ได้ ถ้าไม่มี kubelet เป็นคนสั่ง
+- **kube-proxy** ดูแล network rule บน node ที่ทำให้ Service ทำงานได้ คือ route traffic ที่ยิงไปยัง virtual IP ของ Service ไปหา Pod ตัวใดตัวหนึ่งที่ match ไม่ว่าจะรันอยู่ที่ไหน
 - **container runtime** เช่น containerd หรือ CRI-O คือตัวที่ pull image และรัน container จริง ๆ โดยคุยกับ kubelet ผ่าน **Container Runtime Interface (CRI)**
 
 ตรวจสอบ component และสถานะของ node โดยตรงได้ด้วย
@@ -46,7 +46,7 @@ kubectl describe node <node-name>
 
 ## ทุกอย่างคุยกับ etcd ผ่าน API server เท่านั้น
 
-นี่คือข้อเท็จจริงเชิง architecture ที่ควรจำ **kube-scheduler, kube-controller-manager, kubelet และทุกอย่างอื่น ไม่เคยแตะ etcd โดยตรง** ทุกตัวอ่านและเขียน cluster state ผ่านการเรียก API server เท่านั้น ซึ่งเป็น single source of truth และเป็นผู้มีอำนาจเดียวของทั้ง cluster สิ่งนี้ทำให้ Kubernetes มีจุดเดียวที่สม่ำเสมอสำหรับ authentication, authorization, validation และ watch notification controller ทุกตัวและ kubelet ทุกตัว จริง ๆ แล้วก็แค่เป็น client ของ REST API ตัวเดียวกับที่คุณใช้กับ `kubectl`
+นี่คือข้อเท็จจริงเชิง architecture ที่ควรจำ **kube-scheduler, kube-controller-manager, kubelet และทุกอย่างอื่น ไม่เคยแตะ etcd โดยตรง** ทุกตัวอ่านและเขียน cluster state ผ่านการเรียก API server เท่านั้น ที่เป็น single source of truth และเป็นผู้มีอำนาจเดียวของทั้ง cluster ทำให้ Kubernetes มีจุดเดียวที่สม่ำเสมอสำหรับ authentication, authorization, validation และ watch notification controller ทุกตัวและ kubelet ทุกตัว จริง ๆ แล้วก็แค่เป็น client ของ REST API ตัวเดียวกับที่คุณใช้กับ `kubectl`
 
 <Mermaid title="Control plane and node components, and the single path to etcd" code={architectureDiagram} />
 
@@ -69,7 +69,7 @@ export const architectureDiagram = `flowchart TB
   proxy --> api`;
 
 <Callout title="The one-line takeaway">
-**control plane** — **kube-apiserver**, **etcd**, **kube-scheduler** และ **kube-controller-manager** (บวก **cloud-controller-manager** ที่เป็น optional) — ตัดสินใจว่าควรเกิดอะไรขึ้นและจดจำ cluster state ทั้งหมด ส่วนแต่ละ **node** รัน **kubelet** (ตัวที่เริ่มและเฝ้าดู container จริง) **kube-proxy** (ตัวที่ทำให้ Service เข้าถึงได้) และ **container runtime** ที่คุยผ่าน **CRI** ทุก component เหล่านี้ ไม่มีข้อยกเว้น อ่านและเขียน state ผ่าน **API server** เท่านั้น ซึ่งเป็นประตูเดียวสู่ **etcd**
+**control plane** — **kube-apiserver**, **etcd**, **kube-scheduler** และ **kube-controller-manager** (บวก **cloud-controller-manager** ที่เป็น optional) — ตัดสินใจว่าควรเกิดอะไรขึ้นและจดจำ cluster state ทั้งหมด ส่วนแต่ละ **node** รัน **kubelet** (ตัวที่เริ่มและเฝ้าดู container จริง) **kube-proxy** (ตัวที่ทำให้ Service เข้าถึงได้) และ **container runtime** ที่คุยผ่าน **CRI** ทุก component เหล่านี้ ไม่มีข้อยกเว้น อ่านและเขียน state ผ่าน **API server** เท่านั้น ที่เป็นประตูเดียวสู่ **etcd**
 </Callout>
 
 export const quizArchitecture = [
@@ -86,9 +86,9 @@ export const quizArchitecture = [
   {
     q: 'kubelet รับผิดชอบอะไรบน node',
     options: [
-      'route traffic ระหว่าง Service กับ Pod ของมัน',
+      'route traffic ระหว่าง Service กับ Pod ของตัวเอง',
       'ตัดสินใจว่า Pod ใหม่ควรถูก schedule ไปที่ node ไหน',
-      'ทำให้ container ตาม Pod spec ที่ถูก assign มาที่ node ของมันรันอยู่และ healthy แล้วรายงาน status กลับ',
+      'ทำให้ container ตาม Pod spec ที่ถูก assign มาที่ node ของตัวเองรันอยู่และ healthy แล้วรายงาน status กลับ',
       'เก็บ manifest ของ cluster ที่ส่งเข้ามาด้วย kubectl apply',
     ],
     answer: 2,
@@ -107,7 +107,7 @@ export const quizArchitecture = [
     q: 'ทำไม API server ถึงเป็น component เดียวที่คุยกับ etcd โดยตรง',
     options: [
       'etcd รับ connection จาก client ได้ทีละหนึ่งเท่านั้น',
-      'มันเป็น path เดียวที่ authenticate แล้วและเชื่อถือได้ไปยัง state ทั้งหมดของ cluster ทำให้ component อื่นทุกตัวอ่านและเขียนผ่าน interface เดียวที่ consistent',
+      'เป็น path เดียวที่ authenticate แล้วและเชื่อถือได้ไปยัง state ทั้งหมดของ cluster ทำให้ component อื่นทุกตัวอ่านและเขียนผ่าน interface เดียวที่ consistent',
       'etcd ถูก deprecated แล้ว เก็บไว้แค่สำหรับ backup',
       'kube-scheduler ต้องการสิทธิ์ write แบบ exclusive ถึงจะทำงานได้',
     ],

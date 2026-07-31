@@ -16,7 +16,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## StatefulSet: identity คงที่และ storage ต่อ Pod
 
-ในขณะที่ Pod ของ Deployment สลับกันได้ Pod ของ StatefulSet ได้ **ordinal name** ที่คาดเดาได้ — `db-0`, `db-1`, `db-2` — และแต่ละ ordinal ก็เก็บ PersistentVolumeClaim **ของตัวเอง** ที่ create จาก `volumeClaimTemplates` ไว้ข้ามการ restart และ reschedule `db-1` จะกลับมาพร้อม volume เดิมเสมอ ไม่ว่าจะไปลงที่ node ไหนก็ตาม StatefulSet ยังต้องมี **headless Service** (`clusterIP: None`) ด้วย เพื่อให้ Pod แต่ละตัวได้ DNS name คงที่ของตัวเอง แทนที่ Service จะ load-balance กระจายไปทุกตัว
+Pod ของ Deployment สลับกันได้ ส่วน Pod ของ StatefulSet ได้ **ordinal name** ที่คาดเดาได้ — `db-0`, `db-1`, `db-2` — และแต่ละ ordinal ก็เก็บ PersistentVolumeClaim **ของตัวเอง** ที่ create จาก `volumeClaimTemplates` ไว้ข้ามการ restart และ reschedule `db-1` จะกลับมาพร้อม volume เดิมเสมอ ไม่ว่าจะไปลงที่ node ไหนก็ตาม StatefulSet ยังต้องมี **headless Service** (`clusterIP: None`) ด้วย เพื่อให้ Pod แต่ละตัวได้ DNS name คงที่ของตัวเอง แทนที่ Service จะ load-balance กระจายไปทุกตัว
 
 ```yaml
 apiVersion: v1
@@ -85,7 +85,7 @@ kubectl scale statefulset/db --replicas=2
 
 ## DaemonSet: หนึ่ง Pod บนทุก node
 
-**DaemonSet** ไม่มีค่า `replicas` เลย แต่จะ schedule Pod ที่ตรงเงื่อนไขพอดีหนึ่งตัวลงทุก node ใน cluster (หรือบางส่วน ถ้าจำกัดขอบเขตด้วย node selector หรือ affinity rule) พอ node ใหม่เข้าร่วม cluster DaemonSet controller ก็จะ schedule Pod ของมันลง node นั้นให้อัตโนมัติ พอ node ออกไป Pod ก็หายไปด้วย นี่คือรูปแบบสำหรับ agent ระดับ node เช่น log collector, monitoring และ metrics agent และ network plugin
+**DaemonSet** ไม่มีค่า `replicas` เลย แต่จะ schedule Pod ที่ตรงเงื่อนไขพอดีหนึ่งตัวลงทุก node ใน cluster (หรือบางส่วน ถ้าจำกัดขอบเขตด้วย node selector หรือ affinity rule) พอ node ใหม่เข้าร่วม cluster DaemonSet controller ก็จะ schedule Pod ของตัวเองลง node นั้นให้อัตโนมัติ พอ node ออกไป Pod ก็หายไปด้วย นี่คือรูปแบบสำหรับ agent ระดับ node เช่น log collector, monitoring และ metrics agent และ network plugin
 
 ```yaml
 apiVersion: apps/v1
@@ -134,7 +134,7 @@ export const statefulDaemonDiagram = `flowchart TB
 
 ## สาม controller สามความกังวลที่ต่างกัน
 
-Deployment ไม่สนใจว่า replica แต่ละตัวจะไปลง node ไหน และ Pod ของมันถูกออกแบบให้สลับกันได้ StatefulSet สนใจ **identity คงที่ต่อ ordinal** ชื่อเดิม storage เดิมทุกครั้ง DaemonSet สนใจ **coverage ระดับ node** หนึ่ง Pod ต่อหนึ่ง node จำนวนที่คุณไม่ต้องตั้งเองเพราะมันตามจำนวน node ของ cluster ไปเอง
+Deployment ไม่สนใจว่า replica แต่ละตัวจะไปลง node ไหน และ Pod ของตัวเองถูกออกแบบให้สลับกันได้ StatefulSet สนใจ **identity คงที่ต่อ ordinal** ชื่อเดิม storage เดิมทุกครั้ง DaemonSet สนใจ **coverage ระดับ node** หนึ่ง Pod ต่อหนึ่ง node จำนวนที่คุณไม่ต้องตั้งเองเพราะตามจำนวน node ของ cluster ไปเอง
 
 <Callout title="สรุปหนึ่งบรรทัด">
 **StatefulSet** ให้ Pod มี ordinal name คงที่ (`db-0`, `db-1`, ...) มี PersistentVolumeClaim ของตัวเองต่อ Pod ผ่าน `volumeClaimTemplates` มีลำดับตอน rollout/scaling/deletion และต้องมี **headless Service** เพื่อให้แต่ละ Pod มี DNS ของตัวเอง **DaemonSet** schedule Pod ที่ตรงเงื่อนไขพอดีหนึ่งตัวลงทุก node (node ใหม่ได้ Pod อัตโนมัติ) โดยไม่มีค่า `replicas` ให้ตั้ง สรุปคือ Deployment = replica สลับกันได้ StatefulSet = identity ต่อ ordinal DaemonSet = coverage แบบหนึ่งต่อ node
@@ -177,7 +177,7 @@ export const quizStatefulDaemon = [
       'replica Pod แต่ละตัวจะไป node ไหนหรือมี identity คงที่แบบไหน replica สลับกันได้',
       'image ของ container ที่ใช้',
       'จำนวน replica',
-      'label selector ที่ match กับ Pod ของมัน',
+      'label selector ที่ match กับ Pod ของตัวเอง',
     ],
     answer: 0,
   },

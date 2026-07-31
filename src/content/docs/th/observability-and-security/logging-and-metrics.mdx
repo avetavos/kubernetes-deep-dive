@@ -16,7 +16,7 @@ Kubernetes ให้ logging กับ metrics มาแค่พอ debug Pod �
 
 ## kubectl logs: หน้าต่างของตอนนี้ ไม่ใช่หนังสือประวัติศาสตร์
 
-`kubectl logs` อ่าน stdout/stderr ของ container ตรงจากโหนดที่มันรันอยู่ เป็นวิธีเร็วที่สุดที่จะดูว่า Pod กำลังทำอะไรอยู่ ณ วินาทีนี้
+`kubectl logs` อ่าน stdout/stderr ของ container ตรงจากโหนดที่รันอยู่ เป็นวิธีเร็วที่สุดที่จะดูว่า Pod กำลังทำอะไรอยู่ ณ วินาทีนี้
 
 ```bash
 # Stream logs live as they are written
@@ -31,7 +31,7 @@ kubectl logs my-pod --previous
 
 `--previous` คือ flag ที่คนมักลืมแล้วดันเป็นตัวที่ต้องใช้ที่สุด เวลา container crash-loop log ของ container ตัว *ปัจจุบัน* จะว่างเปล่าตั้งแต่เริ่ม แต่ `--previous` จะโชว์ log ของ instance ที่เพิ่ง crash ไป ซึ่งปกติก็ตรงจุดที่มี stack trace อยู่พอดี
 
-ข้อจำกัดสำคัญคือ Kubernetes เองไม่ได้ aggregate หรือเก็บ log พวกนี้ให้ ถ้า Pod ถูกลบ log ของมันก็มักหายไปด้วย ไม่มี "ค้นหา log ข้ามทุก Pod ใน cluster" มาให้ในตัว งานนี้เป็นหน้าที่ของ logging stack แยกต่างหาก โดยทั่วไปจะเป็น node-level agent อย่าง **Fluent Bit** (หรือ Fluentd/Vector) ที่คอย tail log file ของทุก container แล้วส่งต่อไปยัง backend อย่าง **Loki** หรือ **Elasticsearch** ที่ค้นหาและเก็บข้อมูลระยะยาวได้
+ข้อจำกัดสำคัญคือ Kubernetes เองไม่ได้ aggregate หรือเก็บ log พวกนี้ให้ ถ้า Pod ถูกลบ log ของตัวเองก็มักหายไปด้วย ไม่มี "ค้นหา log ข้ามทุก Pod ใน cluster" มาให้ในตัว งานนี้เป็นหน้าที่ของ logging stack แยกต่างหาก โดยทั่วไปจะเป็น node-level agent อย่าง **Fluent Bit** (หรือ Fluentd/Vector) ที่คอย tail log file ของทุก container แล้วส่งต่อไปยัง backend อย่าง **Loki** หรือ **Elasticsearch** ที่ค้นหาและเก็บข้อมูลระยะยาวได้
 
 ```yaml
 # A minimal illustration: Fluent Bit runs as a DaemonSet so one agent per node
@@ -63,7 +63,7 @@ spec:
 
 ## metrics-server: พอสำหรับ kubectl top กับ autoscaling แค่นั้น
 
-**metrics-server** เป็น cluster add-on เบา ๆ ที่เก็บ CPU กับ memory usage จากทุก kubelet แล้วเก็บไว้ **ในหน่วยความจำเท่านั้น** ไม่มีประวัติ ไม่มีการ persist ไม่มี alerting มันมีไว้เพื่อขับเคลื่อนแค่สองอย่างนี้
+**metrics-server** เป็น cluster add-on เบา ๆ ที่เก็บ CPU กับ memory usage จากทุก kubelet แล้วเก็บไว้ **ในหน่วยความจำเท่านั้น** ไม่มีประวัติ ไม่มีการ persist ไม่มี alerting มีไว้เพื่อขับเคลื่อนแค่สองอย่างนี้
 
 ```bash
 kubectl top nodes
@@ -93,13 +93,13 @@ spec:
           averageUtilization: 70
 ```
 
-metrics-server ไม่ใช่ monitoring solution ชัดเจน ถ้าถามว่า "CPU usage เมื่อสามชั่วโมงก่อนเป็นยังไง" หรือ "แจ้งเตือนตอน memory เกิน 90%" metrics-server ตอบไม่ได้เลย มันรู้แค่ snapshot ปัจจุบันเท่านั้น
+metrics-server ไม่ใช่ monitoring solution ชัดเจน ถ้าถามว่า "CPU usage เมื่อสามชั่วโมงก่อนเป็นยังไง" หรือ "แจ้งเตือนตอน memory เกิน 90%" metrics-server ตอบไม่ได้เลย เพราะรู้แค่ snapshot ปัจจุบันเท่านั้น
 
 ## Prometheus + Grafana: stack observability มาตรฐานที่ใช้กันจริง
 
 สำหรับ observability จริง ๆ ที่ต้องมีข้อมูลย้อนหลัง dashboard และ alerting ตัวมาตรฐานที่ใช้กันคือคู่ **Prometheus** กับ **Grafana**
 
-Prometheus ทำงานด้วยการ **scrape** คือดึง metrics เป็นระยะจาก HTTP endpoint `/metrics` ที่ workload เปิดไว้ในรูปแบบ text ของ Prometheus เอง แอปและ sidecar หลายตัวเปิด endpoint นี้เอง ส่วนสำหรับสถานะของ object ระดับ cluster (จำนวน replica ของ Deployment, phase ของ Pod, condition ของ node และอื่น ๆ) Prometheus จะ scrape **kube-state-metrics** ซึ่งเป็น service แยกที่แปลง object ของ Kubernetes API ให้กลายเป็น metrics ของ Prometheus
+Prometheus ทำงานด้วยการ **scrape** คือดึง metrics เป็นระยะจาก HTTP endpoint `/metrics` ที่ workload เปิดไว้ในรูปแบบ text ของ Prometheus เอง แอปและ sidecar หลายตัวเปิด endpoint นี้เอง ส่วนสำหรับสถานะของ object ระดับ cluster (จำนวน replica ของ Deployment, phase ของ Pod, condition ของ node และอื่น ๆ) Prometheus จะ scrape **kube-state-metrics** ที่เป็น service แยกที่แปลง object ของ Kubernetes API ให้กลายเป็น metrics ของ Prometheus
 
 ```yaml
 apiVersion: v1

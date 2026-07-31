@@ -9,7 +9,7 @@ import Callout from '../../../../components/Callout.astro';
 
 **Kubernetes** คือ container orchestrator แบบ declarative คุณอธิบาย state ที่ต้องการ — จำนวน replica, image ไหน, เปิด port อะไร — แล้ว control loop จะทำงานต่อเนื่องเพื่อดัน state จริงของ cluster เข้าหา state นั้น คอร์สนี้เขียนขึ้น**สำหรับ developer** — คนที่ deploy workload ขึ้น cluster, debug ว่าทำไม Pod ไม่ยอมขึ้น และต้องทำให้ Kubernetes ทำงานถูกต้องบน production
 
-ทุก manifest ในคอร์สนี้ใช้ API group ที่ stable ซึ่งคุณจะเจอใน cluster จริง — `apps/v1` สำหรับ Deployment/StatefulSet/DaemonSet, `batch/v1` สำหรับ Job/CronJob, `networking.k8s.io/v1` สำหรับ Ingress/NetworkPolicy, `autoscaling/v2` สำหรับ HorizontalPodAutoscaler และ `policy/v1` สำหรับ PodDisruptionBudget `kubectl` และ YAML เหมือนกันทุกภาษา ตัวอย่าง CLI และ manifest ทุกอันจึงไม่ผูกกับภาษาโปรแกรม ส่วนบทเรียนที่มี programmatic API client จะใช้ **TypeScript** ด้วย **`@kubernetes/client-node`** ซึ่งเป็น JavaScript client ที่เป็นทางการ
+ทุก manifest ในคอร์สนี้ใช้ API group ที่ stable ซึ่งคุณจะเจอใน cluster จริง — `apps/v1` สำหรับ Deployment/StatefulSet/DaemonSet, `batch/v1` สำหรับ Job/CronJob, `networking.k8s.io/v1` สำหรับ Ingress/NetworkPolicy, `autoscaling/v2` สำหรับ HorizontalPodAutoscaler และ `policy/v1` สำหรับ PodDisruptionBudget `kubectl` และ YAML เหมือนกันทุกภาษา ตัวอย่าง CLI และ manifest ทุกอันจึงไม่ผูกกับภาษาโปรแกรม ส่วนบทเรียนที่มี programmatic API client จะใช้ **TypeScript** ด้วย **`@kubernetes/client-node`** ที่เป็น JavaScript client ที่เป็นทางการ
 
 ## สิ่งที่คอร์สนี้ครอบคลุม
 

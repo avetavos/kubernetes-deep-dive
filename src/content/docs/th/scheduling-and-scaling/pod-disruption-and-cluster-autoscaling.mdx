@@ -12,20 +12,20 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-**PodDisruptionBudget** จำกัดว่า replica ของ workload ถูก evict พร้อมกันได้กี่ตัวระหว่าง **voluntary disruption** — มันไม่มีอำนาจเหนือ **involuntary disruption** เลย
+**PodDisruptionBudget** จำกัดว่า replica ของ workload ถูก evict พร้อมกันได้กี่ตัวระหว่าง **voluntary disruption** — ไม่มีอำนาจเหนือ **involuntary disruption** เลย
 
 ## Voluntary กับ involuntary disruption
 
 การเสีย Pod ไม่ได้เป็น event แบบเดียวกันเสมอไป และความต่างนี้สำคัญต่อสิ่งที่คุณวางแผนรับมือได้จริง
 
 - **Voluntary disruption** คือสิ่งที่ operator หรือ automation ตั้งใจสั่งเอง จึงควบคุม เลื่อน หรือจำกัดอัตราได้ เช่น `kubectl drain` ตอน upgrade node, `kubectl cordon` ตามด้วย rolling replacement หรือ Cluster Autoscaler ที่ลบ Node ที่ใช้งานต่ำ
-- **Involuntary disruption** คือสิ่งที่ไม่มีใครสั่ง เช่น hardware ล่ม kernel panic หรือ Node หายไปเฉย ๆ ไม่มี budget หรือ setting ไหนป้องกันเรื่องนี้ได้ — พอมันเกิดขึ้น Node ก็หายไปแล้ว
+- **Involuntary disruption** คือสิ่งที่ไม่มีใครสั่ง เช่น hardware ล่ม kernel panic หรือ Node หายไปเฉย ๆ ไม่มี budget หรือ setting ไหนป้องกันเรื่องนี้ได้ — พอเกิดขึ้นแล้ว Node ก็หายไปเลย
 
 PodDisruptionBudget มีผลแค่กับกลุ่มแรกเท่านั้น
 
 ## PodDisruptionBudget: พื้นล่างของ voluntary eviction
 
-**PodDisruptionBudget** (`policy/v1`) ประกาศ `minAvailable` หรือ `maxUnavailable` สำหรับกลุ่ม Pod ที่เลือกด้วย label และทุกเส้นทาง voluntary eviction — `kubectl drain`, Eviction API, Cluster Autoscaler ที่ scale ลด Node — ต้องเคารพมัน
+**PodDisruptionBudget** (`policy/v1`) ประกาศ `minAvailable` หรือ `maxUnavailable` สำหรับกลุ่ม Pod ที่เลือกด้วย label และทุกเส้นทาง voluntary eviction — `kubectl drain`, Eviction API, Cluster Autoscaler ที่ scale ลด Node — ต้องเคารพ budget นี้
 
 ```yaml
 apiVersion: policy/v1
@@ -46,21 +46,21 @@ kubectl drain node-3 --ignore-daemonsets --delete-emptydir-data
 kubectl get pdb web-app-pdb
 ```
 
-ด้วย `minAvailable: 2` บน Deployment ที่รัน `web-app` 3 replica การ drain จะ evict Pod ได้ทีละตัวเท่านั้น — มันรอให้ replacement ขึ้น Ready บน Node อื่นก่อนถึงจะ evict ตัวถัดไปได้ ถ้า hardware ล่มพา Node ที่มีสองในสาม replica นั้นหายไปพร้อมกัน PDB จะทำอะไรไม่ได้เลย เพราะมันไม่ได้ถูกสร้างมาเพื่อกันเรื่องนั้นตั้งแต่แรก มันปกป้องกรณีที่ operation เลือกจะเอาออกมากเกินไปพร้อมกัน ไม่ใช่กรณีที่โลกทำแบบนั้นใส่คุณเอง
+ด้วย `minAvailable: 2` บน Deployment ที่รัน `web-app` 3 replica การ drain จะ evict Pod ได้ทีละตัวเท่านั้น — คือรอให้ replacement ขึ้น Ready บน Node อื่นก่อนถึงจะ evict ตัวถัดไปได้ ถ้า hardware ล่มพา Node ที่มีสองในสาม replica นั้นหายไปพร้อมกัน PDB จะทำอะไรไม่ได้เลย เพราะไม่ได้ถูกสร้างมาเพื่อกันเรื่องนั้นตั้งแต่แรก PDB ปกป้องกรณีที่ operation เลือกจะเอาออกมากเกินไปพร้อมกัน ไม่ใช่กรณีที่โลกทำแบบนั้นใส่คุณเอง
 
 ## Cluster Autoscaler: เพิ่มและลบ Node ทั้งตัว
 
-ในขณะที่ HPA กับ VPA ทำงานระดับ Pod **Cluster Autoscaler** ทำงานสูงกว่าหนึ่งชั้น คือระดับ Node
+HPA กับ VPA ทำงานระดับ Pod ส่วน **Cluster Autoscaler** ทำงานสูงกว่าหนึ่งชั้น คือระดับ Node
 
-- มัน **เพิ่ม** Node เมื่อ Pod ค้างอยู่ที่ `Pending` เพราะไม่มี Node ไหนมี capacity ว่างพอจะ schedule มันได้
-- มัน **ลบ** Node เมื่อ Node นั้นถูกใช้งานต่ำมาก และ Pod ทุกตัวบนนั้น reschedule ไปที่อื่นได้ — แต่มันทำโดย drain Node นั้นก่อน โดยเคารพ PodDisruptionBudget ตลอดทาง เหมือนกับตอนทำ `kubectl drain` ด้วยมือทุกประการ
+- **เพิ่ม** Node เมื่อ Pod ค้างอยู่ที่ `Pending` เพราะไม่มี Node ไหนมี capacity ว่างพอจะ schedule Pod นั้นได้
+- **ลบ** Node เมื่อ Node นั้นถูกใช้งานต่ำมาก และ Pod ทุกตัวบนนั้น reschedule ไปที่อื่นได้ — แต่ทำโดย drain Node นั้นก่อน โดยเคารพ PodDisruptionBudget ตลอดทาง เหมือนกับตอนทำ `kubectl drain` ด้วยมือทุกประการ
 
 ```bash
 # Pods stuck here because nothing fits them is the classic trigger for Cluster Autoscaler to add a Node
 kubectl get pods --field-selector=status.phase=Pending
 ```
 
-ทางเลือกใหม่ที่ควรรู้จักคือ **Karpenter** ซึ่งข้ามโมเดล fixed node-group-template ไปเลย มัน provision Node ที่ขนาดพอดีตรง ๆ ตอบสนอง Pod ที่ schedule ไม่ได้ แทนที่จะ scale group ที่กำหนดไว้ล่วงหน้าขึ้นลง
+ทางเลือกใหม่ที่ควรรู้จักคือ **Karpenter** ซึ่งข้ามโมเดล fixed node-group-template ไปเลย โดย provision Node ที่ขนาดพอดีตรง ๆ ตอบสนอง Pod ที่ schedule ไม่ได้ แทนที่จะ scale group ที่กำหนดไว้ล่วงหน้าขึ้นลง
 
 <Mermaid title="A drain or Cluster Autoscaler scale-down respecting a PodDisruptionBudget before a Node is removed" code={pdbDrainDiagram} />
 
@@ -89,10 +89,10 @@ export const quizDisruption = [
   {
     q: 'การตั้ง minAvailable ของ PodDisruptionBudget ปกป้องอะไรจริง ๆ',
     options: [
-      'มันป้องกันไม่ให้ Pod crash เลยตลอดกาล',
-      'มันจำกัดว่า replica ถูก evict พร้อมกันได้กี่ตัวระหว่าง voluntary disruption อย่างการ drain แต่หยุด involuntary failure ไม่ได้',
-      'มันรับประกันว่า cluster จะไม่เสีย Node เลย',
-      'มันเพิ่ม resource limit ให้ Pod ที่ถูกปกป้อง',
+      'ป้องกันไม่ให้ Pod crash เลยตลอดกาล',
+      'จำกัดว่า replica ถูก evict พร้อมกันได้กี่ตัวระหว่าง voluntary disruption อย่างการ drain แต่หยุด involuntary failure ไม่ได้',
+      'รับประกันว่า cluster จะไม่เสีย Node เลย',
+      'เพิ่ม resource limit ให้ Pod ที่ถูกปกป้อง',
     ],
     answer: 1,
   },
@@ -109,10 +109,10 @@ export const quizDisruption = [
   {
     q: 'Karpenter ต่างจากแนวทาง Cluster Autoscaler แบบดั้งเดิมอย่างไร',
     options: [
-      'มันตัดความจำเป็นของ PodDisruptionBudget ออกไปเลย',
-      'มัน provision Node ขนาดพอดีตรง ๆ ตอบสนอง Pod ที่ schedule ไม่ได้ แทนที่จะ scale fixed node-group template',
-      'มันทำงานได้กับ StatefulSet เท่านั้น',
-      'มันมาแทน HorizontalPodAutoscaler',
+      'ตัดความจำเป็นของ PodDisruptionBudget ออกไปเลย',
+      'provision Node ขนาดพอดีตรง ๆ ตอบสนอง Pod ที่ schedule ไม่ได้ แทนที่จะ scale fixed node-group template',
+      'ทำงานได้กับ StatefulSet เท่านั้น',
+      'มาแทน HorizontalPodAutoscaler',
     ],
     answer: 1,
   },

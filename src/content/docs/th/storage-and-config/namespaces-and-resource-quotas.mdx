@@ -12,7 +12,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-**Namespace** แบ่ง object และชื่อของ cluster เดียวให้หลาย user, ทีม หรือโปรเจกต์ใช้ร่วมกัน แต่มันไม่ได้แบ่ง network ให้ด้วย ต้องใช้ NetworkPolicy ถึงจะทำได้
+**Namespace** แบ่ง object และชื่อของ cluster เดียวให้หลาย user, ทีม หรือโปรเจกต์ใช้ร่วมกัน แต่ไม่ได้แบ่ง network ให้ด้วย ต้องใช้ NetworkPolicy ถึงจะทำได้
 
 ## Namespace scope อะไรจริง ๆ
 
@@ -34,7 +34,7 @@ kubectl config set-context --current --namespace=team-a
 
 ## ไม่ใช่ทุก object จะอยู่ใน namespace
 
-บาง object เป็น **cluster-scoped** คืออยู่นอก namespace ไหนเลย เพราะมันอธิบายแนวคิดระดับ cluster ไม่ใช่สิ่งที่ทีมใดทีมหนึ่งเป็นเจ้าของ **Node**, **PersistentVolume** และ **ClusterRole** ล้วนเป็น cluster-scoped ส่วน object ที่ใช้กันบ่อย ๆ อย่าง Pod, Deployment, Service, ConfigMap, PersistentVolumeClaim เป็น namespaced
+บาง object เป็น **cluster-scoped** คืออยู่นอก namespace ไหนเลย เพราะอธิบายแนวคิดระดับ cluster ไม่ใช่สิ่งที่ทีมใดทีมหนึ่งเป็นเจ้าของ **Node**, **PersistentVolume** และ **ClusterRole** ล้วนเป็น cluster-scoped ส่วน object ที่ใช้กันบ่อย ๆ อย่าง Pod, Deployment, Service, ConfigMap, PersistentVolumeClaim เป็น namespaced
 
 ```bash
 # List objects that live outside any namespace
@@ -103,7 +103,7 @@ export const namespaceQuotaDiagram = `flowchart LR
   end`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**Namespace** scope ชื่อของ object และมักเป็นขอบเขตที่ RBAC ถูก apply แต่มันไม่ได้ให้ **network isolation** ด้วยตัวมันเอง ต้องพึ่ง NetworkPolicy บาง object อย่าง **Node**, **PersistentVolume** และ **ClusterRole** เป็น **cluster-scoped** อยู่นอก namespace ใด ๆ ในขณะที่ object ที่ใช้บ่อยส่วนใหญ่เป็น namespaced **ResourceQuota** จำกัด CPU/memory รวมและจำนวน object ของทั้ง namespace ส่วน **LimitRange** กำหนดค่า default, ขั้นต่ำ และขั้นสูงของ Pod และ container แต่ละตัว ถ้าไม่มี LimitRange Pod ที่ไม่ถูกจำกัดตัวเดียวอาจกิน quota ทั้ง namespace ไปคนเดียวได้
+**Namespace** scope ชื่อของ object และมักเป็นขอบเขตที่ RBAC ถูก apply แต่ไม่ได้ให้ **network isolation** ด้วยตัวเอง ต้องพึ่ง NetworkPolicy บาง object อย่าง **Node**, **PersistentVolume** และ **ClusterRole** เป็น **cluster-scoped** อยู่นอก namespace ใด ๆ ส่วน object ที่ใช้บ่อยส่วนใหญ่เป็น namespaced **ResourceQuota** จำกัด CPU/memory รวมและจำนวน object ของทั้ง namespace ส่วน **LimitRange** กำหนดค่า default, ขั้นต่ำ และขั้นสูงของ Pod และ container แต่ละตัว ถ้าไม่มี LimitRange Pod ที่ไม่ถูกจำกัดตัวเดียวอาจกิน quota ทั้ง namespace ไปคนเดียวได้
 </Callout>
 
 export const quizNamespaceQuota = [

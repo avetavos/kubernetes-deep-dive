@@ -16,7 +16,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ReplicaSet: จำนวน Pod ที่ตรงเงื่อนไขคงที่
 
-หน้าที่ของ ReplicaSet แคบมาก คือรับ Pod template กับ label selector มา แล้วทำให้มี Pod ที่ตรงกับ selector นั้นอยู่พอดี `replicas` ตัวเสมอ ถ้า Pod ที่ตรง selector หายไป ReplicaSet จะ create ตัวใหม่มาแทน ถ้ามีเกินก็จะลบส่วนเกินทิ้ง ReplicaSet ยังสามารถ **adopt** Pod ที่มีอยู่แล้วซึ่งมันไม่ได้ create เองได้ด้วย ตราบใดที่ label ของ Pod นั้นตรงกับ selector
+หน้าที่ของ ReplicaSet แคบมาก คือรับ Pod template กับ label selector มา แล้วทำให้มี Pod ที่ตรงกับ selector นั้นอยู่พอดี `replicas` ตัวเสมอ ถ้า Pod ที่ตรง selector หายไป ReplicaSet จะ create ตัวใหม่มาแทน ถ้ามีเกินก็จะลบส่วนเกินทิ้ง ReplicaSet ยังสามารถ **adopt** Pod ที่มีอยู่แล้วซึ่งตัวเองไม่ได้ create ขึ้นมาได้ด้วย ตราบใดที่ label ของ Pod นั้นตรงกับ selector
 
 ```yaml
 apiVersion: apps/v1
@@ -73,7 +73,7 @@ spec:
             - containerPort: 8080
 ```
 
-chain ความเป็นเจ้าของจะเป็น **Deployment → ReplicaSet → Pod** เสมอ Deployment เป็นเจ้าของ ReplicaSet หนึ่งตัวหรือมากกว่านั้น (ตัวปัจจุบัน บวกกับตัวเก่าที่เก็บไว้เพื่อ rollback history) และ ReplicaSet แต่ละตัวก็เป็นเจ้าของ Pod ของมันเอง
+chain ความเป็นเจ้าของจะเป็น **Deployment → ReplicaSet → Pod** เสมอ Deployment เป็นเจ้าของ ReplicaSet หนึ่งตัวหรือมากกว่านั้น (ตัวปัจจุบัน บวกกับตัวเก่าที่เก็บไว้เพื่อ rollback history) และ ReplicaSet แต่ละตัวก็เป็นเจ้าของ Pod ของตัวเอง
 
 <Mermaid title="A Deployment shifts replicas from an old ReplicaSet to a new one during a rollout" code={deploymentsDiagram} />
 
@@ -125,7 +125,7 @@ export const quizDeployments = [
     q: 'ใช้งานปกติ คุณแก้ object ไหนตรง ๆ เพื่อเปลี่ยนสิ่งที่กำลังรันอยู่ ระหว่าง Deployment กับ ReplicaSet',
     options: [
       'ReplicaSet ตรง ๆ ส่วน Deployment เป็น read-only',
-      'Deployment มันจะ create และจัดการ ReplicaSet กับ Pod ให้คุณเอง',
+      'Deployment จะ create และจัดการ ReplicaSet กับ Pod ให้คุณเอง',
       'Pod ตรง ๆ controller เป็นทางเลือกเฉย ๆ',
       'ReplicaSet เป็นคนจัดการ Deployment ไม่ใช่ทางกลับกัน',
     ],
@@ -154,9 +154,9 @@ export const quizDeployments = [
   {
     q: 'ทำไมถึงเลือกใช้ strategy Recreate แทน RollingUpdate',
     options: [
-      'มันเร็วกว่าและไม่มี downtime เลย',
+      'เร็วกว่าและไม่มี downtime เลย',
       'ตอนที่ version เก่ากับใหม่ของ app รันคู่กันไม่ได้จริง ๆ ยอมรับ downtime เพื่อไม่ให้ version ปนกัน',
-      'มันจะ surge Pod เกินเพื่อไม่ให้มี downtime',
+      'จะ surge Pod เกินเพื่อไม่ให้มี downtime',
       'ทุก Deployment ต้องใช้ strategy นี้โดย default',
     ],
     answer: 1,

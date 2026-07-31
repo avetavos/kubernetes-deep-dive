@@ -12,7 +12,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียในหนึ่งประโยค
 
-**PersistentVolumeClaim** คือ request ขอ storage ที่ Pod เอาไป mount ใช้ และมันจะ bind กับ **PersistentVolume** ซึ่งเป็น storage ระดับ cluster ที่อยู่รอดข้าม Pod และตาม Pod ไปได้ข้าม node
+**PersistentVolumeClaim** คือ request ขอ storage ที่ Pod เอาไป mount ใช้ และจะ bind กับ **PersistentVolume** ที่เป็น storage ระดับ cluster ที่อยู่รอดข้าม Pod และตาม Pod ไปได้ข้าม node
 
 ## ช่องว่างที่ emptyDir กับ hostPath ปิดไม่ได้
 
@@ -22,7 +22,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 **PersistentVolume (PV)** คือ storage resource ระดับ cluster แนวคิดคล้าย Node ที่แทน compute capacity แต่ PV แทน storage capacity แทน admin ของ cluster provision PV แบบ static ล่วงหน้าได้ หรือจะให้ถูกสร้างแบบ dynamic ก็ได้ (อธิบายด้านล่าง)
 
-**PersistentVolumeClaim (PVC)** คือ request ที่ user หรือ application ยื่นขอ "ขอ storage ขนาดเท่านี้ ด้วย access mode แบบนี้" Kubernetes จะ bind PVC เข้ากับ PV ที่ตรงกับ request นั้น ที่สำคัญคือ **Pod reference แค่ PVC ไม่เคย reference PV ตรง ๆ** Pod ไม่ต้องรู้หรือสนใจว่ามันไป bind กับ PV ตัวไหนจริง ๆ
+**PersistentVolumeClaim (PVC)** คือ request ที่ user หรือ application ยื่นขอ "ขอ storage ขนาดเท่านี้ ด้วย access mode แบบนี้" Kubernetes จะ bind PVC เข้ากับ PV ที่ตรงกับ request นั้น ที่สำคัญคือ **Pod reference แค่ PVC ไม่เคย reference PV ตรง ๆ** Pod ไม่ต้องรู้หรือสนใจว่าไป bind กับ PV ตัวไหนจริง ๆ
 
 ```yaml
 apiVersion: v1
@@ -79,7 +79,7 @@ PV ประกาศว่ารองรับ access mode ไหนบ้า�
 - **`ReadWriteOnce` (RWO)** — mount แบบ read-write ได้ แต่แค่ Pod บน node เดียวในเวลาเดียวกันเท่านั้น
 - **`ReadOnlyMany` (ROX)** — mount แบบ read-only ได้จากหลาย node พร้อมกัน
 - **`ReadWriteMany` (RWX)** — mount แบบ read-write ได้จากหลาย node พร้อมกัน (มีแค่บาง storage backend ที่รองรับ)
-- **`ReadWriteOncePod` (RWOP)** — mode ใหม่กว่าและเข้มกว่า volume ถูกจำกัดให้ใช้ได้แค่ **Pod เดียว** ทั้ง cluster ไม่ใช่แค่จำกัดที่ node เดียว ในขณะที่ `ReadWriteOnce` ธรรมดายังเปิดให้หลาย Pod share volume กันได้ถ้าอยู่ node เดียวกัน `ReadWriteOncePod` มาปิดช่องว่างนี้เวลาต้องการ single-writer guarantee จริง ๆ
+- **`ReadWriteOncePod` (RWOP)** — mode ใหม่กว่าและเข้มกว่า volume ถูกจำกัดให้ใช้ได้แค่ **Pod เดียว** ทั้ง cluster ไม่ใช่แค่จำกัดที่ node เดียว ส่วน `ReadWriteOnce` ธรรมดายังเปิดให้หลาย Pod share volume กันได้ถ้าอยู่ node เดียวกัน `ReadWriteOncePod` มาปิดช่องว่างนี้เวลาต้องการ single-writer guarantee จริง ๆ
 
 ## Dynamic provisioning ด้วย StorageClass
 
@@ -118,7 +118,7 @@ kubectl get pvc dynamic-claim -w
 
 ## Reclaim policy ตัดสินชะตากรรมหลัง PVC หายไป
 
-**reclaim policy** กำหนดว่า storage เบื้องหลังจะเป็นยังไงหลัง PVC ของมันถูกลบ
+**reclaim policy** กำหนดว่า storage เบื้องหลังจะเป็นยังไงหลัง PVC ของตัวเองถูกลบ
 
 - **`Delete`** — PV และ storage เบื้องหลัง (disk จริง) ถูกลบไปพร้อม PVC เป็นค่า default ของ StorageClass แบบ dynamic provisioning ส่วนใหญ่
 - **`Retain`** — PV และข้อมูลยังอยู่ต่อหลัง PVC ถูกลบ admin เลยกู้คืนหรือเคลียร์ข้อมูลเองได้ก่อนที่ storage เบื้องหลังจะถูกปล่อยจริง ๆ
@@ -137,7 +137,7 @@ export const pvcDiagram = `flowchart LR
 
 export const quizPvPvc = [
   {
-    q: 'ตอน Pod ต้องการ persistent storage มันไป reference อะไรใน spec.volumes',
+    q: 'ตอน Pod ต้องการ persistent storage ต้อง reference อะไรใน spec.volumes',
     options: [
       'PersistentVolume ตรง ๆ โดยระบุชื่อ',
       'PersistentVolumeClaim ซึ่ง bind กับ PersistentVolume ไว้แล้ว',
@@ -160,7 +160,7 @@ export const quizPvPvc = [
     q: 'ReadWriteOncePod จำกัดอะไรที่ ReadWriteOnce ธรรมดาไม่จำกัด',
     options: [
       'จำกัดให้ใช้ได้แค่ node เดียว เหมือน ReadWriteOnce',
-      'จำกัดให้ใช้ได้แค่ Pod เดียวทั้ง cluster ในขณะที่ ReadWriteOnce จำกัดแค่ node เดียวเท่านั้น',
+      'จำกัดให้ใช้ได้แค่ Pod เดียวทั้ง cluster ส่วน ReadWriteOnce จำกัดแค่ node เดียวเท่านั้น',
       'ทำให้ volume เป็น read-only',
       'เปิดให้หลาย node เขียนพร้อมกันได้',
     ],
@@ -170,7 +170,7 @@ export const quizPvPvc = [
     q: 'ความต่างเชิงปฏิบัติระหว่าง reclaim policy แบบ Delete กับ Retain คืออะไร',
     options: [
       'พฤติกรรมเหมือนกันทุกอย่าง ต่างแค่ label',
-      'Delete เก็บ PersistentVolumeClaim ไว้ใช้ต่อ Retain ลบมันทิ้ง',
+      'Delete เก็บ PersistentVolumeClaim ไว้ใช้ต่อ Retain ลบทิ้ง',
       'Delete ลบ storage เบื้องหลังตอน PVC ถูกลบ ส่วน Retain เก็บ storage ไว้ให้กู้คืนหรือเคลียร์เองด้วยมือ',
       'Retain สร้าง backup ให้อัตโนมัติ Delete ไม่สร้าง',
     ],

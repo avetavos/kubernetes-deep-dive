@@ -16,14 +16,14 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## สิ่งที่ container ใน Pod เดียวกันแชร์กัน
 
-container ทุกตัวใน Pod เดียวกันได้ **IP address** เดียวกันและ **network namespace** เดียวกัน หมายความว่า container สองตัวใน Pod เดียวกันคุยกันผ่าน `localhost` ได้เลย ที่ port ไหนก็ได้ที่อีกตัวเปิดรอ ไม่ต้องผ่าน networking ของ cluster เลย container ใน Pod เดียวกันยังแชร์ **volume** เดียวกันได้ด้วย ซึ่งเป็นวิธีที่ sidecar อ่านไฟล์ที่ container หลักเขียนไว้
+container ทุกตัวใน Pod เดียวกันได้ **IP address** เดียวกันและ **network namespace** เดียวกัน หมายความว่า container สองตัวใน Pod เดียวกันคุยกันผ่าน `localhost` ได้เลย ที่ port ไหนก็ได้ที่อีกตัวเปิดรอ ไม่ต้องผ่าน networking ของ cluster เลย container ใน Pod เดียวกันยังแชร์ **volume** เดียวกันได้ด้วย นั่นคือวิธีที่ sidecar อ่านไฟล์ที่ container หลักเขียนไว้
 
 ```bash
 # From inside the "app" container, a sidecar in the same Pod is reachable on localhost
 kubectl exec -it app-with-sidecar -c app -- curl -s http://localhost:9090/metrics
 ```
 
-การแชร์ namespace แบบนี้คือเหตุผลทั้งหมดที่ Pod มีอยู่เป็น concept แยกต่างหาก มันคือขอบเขตที่ทำให้ "container พวกนี้อยู่ node เดียวกันเสมอและคุยกันผ่าน localhost ได้" เป็นจริงเสมอ container ที่อยู่คนละ Pod ไม่ได้สิ่งนี้ฟรี ๆ ต้องผ่าน Service และ address ที่ route ได้เท่านั้น
+การแชร์ namespace แบบนี้คือเหตุผลทั้งหมดที่ Pod มีอยู่เป็น concept แยกต่างหาก Pod คือขอบเขตที่ทำให้ "container พวกนี้อยู่ node เดียวกันเสมอและคุยกันผ่าน localhost ได้" เป็นจริงเสมอ container ที่อยู่คนละ Pod ไม่ได้สิ่งนี้ฟรี ๆ ต้องผ่าน Service และ address ที่ route ได้เท่านั้น
 
 ## Multi-container pattern: sidecar และ init container
 
@@ -84,10 +84,10 @@ kubectl describe pod app-with-sidecar
 
 ## ทำไมถึงไม่รัน Pod เปล่า ๆ ตรง ๆ ในทางปฏิบัติ
 
-Pod ถูกออกแบบมาให้เป็น ephemeral และแทบไม่มีใคร create มันตรง ๆ ถ้า `kubectl apply` Pod เปล่า ๆ แล้ว node ของมันล่ม หรือ container ข้างในพัง เกินกว่าที่ `restartPolicy` จะช่วยได้ **ไม่มีอะไรมา recreate Pod นั้นให้** มันหายไปเฉย ๆ ในทางปฏิบัติคุณแทบจะ create Deployment, StatefulSet หรือ DaemonSet แทนเสมอ controller เหล่านั้นถือ Pod template ไว้ คอย watch state จริงของ cluster และ recreate Pod ทุกครั้งที่ของจริงเบี่ยงไปจากจำนวนที่ต้องการ ส่วนที่เหลือของ module นี้คือ controller พวกนั้น
+Pod ถูกออกแบบมาให้เป็น ephemeral และแทบไม่มีใคร create Pod ตรง ๆ ถ้า `kubectl apply` Pod เปล่า ๆ แล้ว node ที่ Pod นั้นอยู่ล่ม หรือ container ข้างในพัง เกินกว่าที่ `restartPolicy` จะช่วยได้ **ไม่มีอะไรมา recreate Pod นั้นให้** คือหายไปเฉย ๆ ในทางปฏิบัติคุณแทบจะ create Deployment, StatefulSet หรือ DaemonSet แทนเสมอ controller เหล่านั้นถือ Pod template ไว้ คอย watch state จริงของ cluster และ recreate Pod ทุกครั้งที่ของจริงเบี่ยงไปจากจำนวนที่ต้องการ ส่วนที่เหลือของ module นี้คือ controller พวกนั้น
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**Pod** คือ container หนึ่งตัวหรือมากกว่าที่แชร์ network namespace เดียวกัน (IP เดียว คุยกันผ่าน **localhost** ได้) และแชร์ volume ได้ถ้าต้องการ **init container** รันจนจบตามลำดับก่อนที่ **sidecar** และ container หลักตัวอื่นจะเริ่ม phase ของ Pod (`Pending`/`Running`/`Succeeded`/`Failed`/`Unknown`) และ `restartPolicy` (`Always`/`OnFailure`/`Never`) คุม lifecycle ของมัน แต่ **Pod เปล่า ๆ ที่ตายไปแล้วจะไม่ถูก recreate** งานนั้นเป็นของ controller ที่จะเรียนต่อไป
+**Pod** คือ container หนึ่งตัวหรือมากกว่าที่แชร์ network namespace เดียวกัน (IP เดียว คุยกันผ่าน **localhost** ได้) และแชร์ volume ได้ถ้าต้องการ **init container** รันจนจบตามลำดับก่อนที่ **sidecar** และ container หลักตัวอื่นจะเริ่ม phase ของ Pod (`Pending`/`Running`/`Succeeded`/`Failed`/`Unknown`) และ `restartPolicy` (`Always`/`OnFailure`/`Never`) คุม lifecycle ของตัวเอง แต่ **Pod เปล่า ๆ ที่ตายไปแล้วจะไม่ถูก recreate** งานนั้นเป็นของ controller ที่จะเรียนต่อไป
 </Callout>
 
 export const quizPods = [
@@ -112,12 +112,12 @@ export const quizPods = [
     answer: 1,
   },
   {
-    q: 'Pod เปล่า ๆ (create ตรง ๆ ไม่มี controller) container ตัวเดียวข้างในพังซ้ำ ๆ แล้ว node ของมันก็ล่มไปเลย เกิดอะไรขึ้นกับ Pod',
+    q: 'Pod เปล่า ๆ (create ตรง ๆ ไม่มี controller) container ตัวเดียวข้างในพังซ้ำ ๆ แล้ว node ของตัวเองก็ล่มไปเลย เกิดอะไรขึ้นกับ Pod',
     options: [
-      'Kubernetes recreate มันบน node ที่ยังใช้งานได้โดยอัตโนมัติ',
-      'ไม่มีอะไร recreate มันให้ Pod เปล่า ๆ ที่หายไปแล้วก็หายไปเลย นี่คือเหตุผลที่ต้องใช้ controller แทน',
-      'มันกลายเป็น DaemonSet โดยอัตโนมัติ',
-      'scheduler จะพยายาม create มันใหม่ไปเรื่อย ๆ ไม่มีสิ้นสุด',
+      'Kubernetes recreate Pod นั้นบน node ที่ยังใช้งานได้โดยอัตโนมัติ',
+      'ไม่มีอะไร recreate ให้ Pod เปล่า ๆ ที่หายไปแล้วก็หายไปเลย นี่คือเหตุผลที่ต้องใช้ controller แทน',
+      'กลายเป็น DaemonSet โดยอัตโนมัติ',
+      'scheduler จะพยายาม create Pod นั้นใหม่ไปเรื่อย ๆ ไม่มีสิ้นสุด',
     ],
     answer: 1,
   },

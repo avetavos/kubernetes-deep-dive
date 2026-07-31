@@ -99,7 +99,7 @@ kubectl create job nightly-report-manual --from=cronjob/nightly-report
 เพราะ schedule ของ CronJob ยิงซ้ำได้หลายรอบ `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` เลยสำคัญในทางปฏิบัติ ถ้าไม่ตั้งไว้ Job และ Pod object เก่าจะสะสมไปเรื่อย ๆ ทุกคืน
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**Job** รัน Pod จนจบงาน ไม่ใช่รันตลอดไป `completions` กำหนดว่าต้องสำเร็จกี่ครั้ง `parallelism` กำหนดว่ารันพร้อมกันได้กี่ตัว `backoffLimit` กำหนดว่ายอมพังได้กี่ครั้ง และ Pod template ของมันต้องใช้ `restartPolicy: OnFailure` หรือ `Never` **CronJob** create Job ตาม `schedule` โดยมี `concurrencyPolicy` (`Allow`/`Forbid`/`Replace`) คุม run ที่ทับซ้อนกัน และ `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` จำกัดว่าจะเก็บ history ไว้แค่ไหน
+**Job** รัน Pod จนจบงาน ไม่ใช่รันตลอดไป `completions` กำหนดว่าต้องสำเร็จกี่ครั้ง `parallelism` กำหนดว่ารันพร้อมกันได้กี่ตัว `backoffLimit` กำหนดว่ายอมพังได้กี่ครั้ง และ Pod template ของตัวเองต้องใช้ `restartPolicy: OnFailure` หรือ `Never` **CronJob** create Job ตาม `schedule` โดยมี `concurrencyPolicy` (`Allow`/`Forbid`/`Replace`) คุม run ที่ทับซ้อนกัน และ `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` จำกัดว่าจะเก็บ history ไว้แค่ไหน
 </Callout>
 
 export const quizJobs = [
@@ -107,7 +107,7 @@ export const quizJobs = [
     q: 'workload model ของ Job ต่างจาก Deployment ยังไง',
     options: [
       'Job รัน Pod จนจบงานที่มีขอบเขตแน่นอน ส่วน Deployment ปล่อยให้ Pod รันไม่มีกำหนด',
-      'มันเหมือนกันเป๊ะ Job แค่เป็นชื่อเก่าของ Deployment',
+      'เหมือนกันเป๊ะ Job แค่เป็นชื่อเก่าของ Deployment',
       'Job ไม่เคย create Pod เลย มีแต่ Deployment เท่านั้นที่ create',
       'Job ต้องมี headless Service ส่วน Deployment ไม่ต้อง',
     ],
@@ -139,7 +139,7 @@ export const quizJobs = [
       'รันทุก Job ตาม schedule พร้อมกันหมด ไม่สนใจ run ก่อนหน้า',
       'ข้าม run ใหม่ตาม schedule ถ้า Job ที่ CronJob นี้ create ไว้ก่อนหน้ายังรันอยู่',
       'ห้าม CronJob create Job เลยตลอดไป',
-      'ลบ Job เก่าทันทีหลังจากมันรันจบ',
+      'ลบ Job เก่าทันทีหลังจากรันจบ',
     ],
     answer: 1,
   },

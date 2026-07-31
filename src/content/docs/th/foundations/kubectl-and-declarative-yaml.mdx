@@ -12,7 +12,7 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ## ไอเดียหลักในหนึ่งประโยค
 
-`kubectl` คือวิธีที่คุณส่ง desired state ให้ cluster และตรวจดูว่ามันกำลังทำอะไรอยู่ และเกือบทุกอย่างที่คุณส่งให้มันคือ YAML manifest ที่สร้างจากสี่ field หลักชุดเดียวกัน
+`kubectl` คือวิธีที่คุณส่ง desired state ให้ cluster และตรวจดูว่ากำลังทำอะไรอยู่ และเกือบทุกอย่างที่คุณส่งให้ cluster คือ YAML manifest ที่สร้างจากสี่ field หลักชุดเดียวกัน
 
 ## พื้นฐาน kubectl คือ context, namespace และ verb
 
@@ -36,7 +36,7 @@ kubectl exec -it web-7d9f8c6b7-abcde -- sh
 
 ## Manifest ทุกอันมีสี่ field หลัก
 
-ไม่ว่าจะสร้าง object แบบไหน Pod, Deployment, Service หรืออะไรก็ตาม YAML ของมันมีโครงเดียวกัน
+ไม่ว่าจะสร้าง object แบบไหน Pod, Deployment, Service หรืออะไรก็ตาม YAML ของตัวเองมีโครงเดียวกัน
 
 ```yaml
 apiVersion: v1
@@ -53,18 +53,18 @@ spec:
         - containerPort: 80
 ```
 
-`apiVersion` กับ `kind` บอกว่าคุณหมายถึง API group และ object type ไหน `metadata` เก็บตัวตนและข้อมูลบัญชี เช่น `name`, `namespace` (ถ้ามี) และ `labels` กับ `annotations` ที่คุณติดเอง `spec` คือ desired state ที่คุณเขียนขึ้น ทุกอย่างข้างบนคือ `spec` ของ Pod ตัวนี้ Kubernetes เพิ่ม field ที่ห้าให้เองคือ `status` เมื่อ object ถูกสร้างแล้ว field นี้คุณไม่เคยเขียนเอง อ่านได้อย่างเดียว เพราะมันสะท้อนสิ่งที่สังเกตเห็นจริง ไม่ใช่สิ่งที่คุณขอ
+`apiVersion` กับ `kind` บอกว่าคุณหมายถึง API group และ object type ไหน `metadata` เก็บตัวตนและข้อมูลบัญชี เช่น `name`, `namespace` (ถ้ามี) และ `labels` กับ `annotations` ที่คุณติดเอง `spec` คือ desired state ที่คุณเขียนขึ้น ทุกอย่างข้างบนคือ `spec` ของ Pod ตัวนี้ Kubernetes เพิ่ม field ที่ห้าให้เองคือ `status` เมื่อ object ถูกสร้างแล้ว field นี้คุณไม่เคยเขียนเอง อ่านได้อย่างเดียว เพราะสะท้อนสิ่งที่สังเกตเห็นจริง ไม่ใช่สิ่งที่คุณขอ
 
 ## apply กับ create และ label คือกลไกเชื่อมโยง
 
-`kubectl apply -f file.yaml` เป็นแบบ declarative มัน diff ไฟล์ของคุณกับ last-applied configuration ของ object (ที่ถูก track ไว้ใน annotation) แล้ว patch เฉพาะส่วนที่เปลี่ยน และสร้าง object ให้ถ้ายังไม่มี ทำให้รันคำสั่งเดิมซ้ำ ๆ ได้อย่างปลอดภัย ซึ่งเป็นสิ่งที่ต้องการพอดีใน script และ CI ส่วน `kubectl create -f file.yaml` เป็นแบบ imperative แทน มันสร้าง object ครั้งเดียวและจะ error ถ้ามี object นั้นอยู่แล้ว คอร์สนี้ใช้ `apply` ตลอดทั้งเล่ม
+`kubectl apply -f file.yaml` เป็นแบบ declarative โดย diff ไฟล์ของคุณกับ last-applied configuration ของ object (ที่ถูก track ไว้ใน annotation) แล้ว patch เฉพาะส่วนที่เปลี่ยน และสร้าง object ให้ถ้ายังไม่มี ทำให้รันคำสั่งเดิมซ้ำ ๆ ได้อย่างปลอดภัย นั่นคือสิ่งที่ต้องการพอดีใน script และ CI ส่วน `kubectl create -f file.yaml` เป็นแบบ imperative แทน คือสร้าง object ครั้งเดียวและจะ error ถ้ามี object นั้นอยู่แล้ว คอร์สนี้ใช้ `apply` ตลอดทั้งเล่ม
 
 ```bash
 kubectl apply -f pod.yaml
 kubectl create -f pod.yaml
 ```
 
-label คือคู่ key-value ตามใจที่คุณติดไว้บน object เช่น `app: web` ใน Pod ด้านบน ตัวมันเองไม่ทำอะไร พลังของมันมาจาก **selector** ซึ่งเป็นสิ่งที่ object อื่นใช้หา Pod ที่ถูกติด label แบบนั้น Service ที่มี `selector: { app: web }` จะ route traffic ไปยังทุก Pod ที่มี label นั้น ส่วน ReplicaSet ของ Deployment ใช้ `matchLabels` selector เพื่อรู้ว่า Pod ไหนคือ Pod "ของมัน" ที่ต้องรักษาให้อยู่ตาม replica count ที่ต้องการ pattern label-กับ-selector นี้คือวิธีพื้นฐานที่สุดที่ object ใน Kubernetes ใช้หากันเจอ และคุณจะเห็นมันอีกในเกือบทุก module ถัดไป
+label คือคู่ key-value ตามใจที่คุณติดไว้บน object เช่น `app: web` ใน Pod ด้านบน ตัว label เองไม่ทำอะไรเลย พลังของ label มาจาก **selector** นั่นคือสิ่งที่ object อื่นใช้หา Pod ที่ถูกติด label แบบนั้น Service ที่มี `selector: { app: web }` จะ route traffic ไปยังทุก Pod ที่มี label นั้น ส่วน ReplicaSet ของ Deployment ใช้ `matchLabels` selector เพื่อรู้ว่า Pod ไหนคือ Pod "ของตัวเอง" ที่ต้องรักษาให้อยู่ตาม replica count ที่ต้องการ pattern label-กับ-selector นี้คือวิธีพื้นฐานที่สุดที่ object ใน Kubernetes ใช้หากันเจอ และคุณจะเห็น pattern นี้อีกในเกือบทุก module ถัดไป
 
 <Mermaid title="A declarative apply flows through the API server into etcd" code={kubectlYamlDiagram} />
 
@@ -91,10 +91,10 @@ export const quizKubectlYaml = [
   {
     q: 'จริง ๆ แล้ว label selector ทำอะไร',
     options: [
-      'มัน encrypt traffic ระหว่าง Pod',
-      'มันทำให้ object หนึ่ง เช่น Service หรือ ReplicaSet หา Pod ชุดที่ match label แบบ key-value ที่กำหนดเจอ เพื่อจะ route ไปหาหรือจัดการมันได้',
-      'มันตั้ง request และ limit ของ CPU กับ memory ให้ Pod',
-      'มัน pin Pod ให้รันบน node เฉพาะตัว',
+      'encrypt traffic ระหว่าง Pod',
+      'ทำให้ object หนึ่ง เช่น Service หรือ ReplicaSet หา Pod ชุดที่ match label แบบ key-value ที่กำหนดเจอ เพื่อจะ route ไปหาหรือจัดการ Pod เหล่านั้นได้',
+      'ตั้ง request และ limit ของ CPU กับ memory ให้ Pod',
+      'pin Pod ให้รันบน node เฉพาะตัว',
     ],
     answer: 1,
   },
