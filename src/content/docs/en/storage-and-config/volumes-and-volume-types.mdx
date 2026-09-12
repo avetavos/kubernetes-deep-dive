@@ -48,7 +48,7 @@ spec:
         - name: shared-logs
           mountPath: /var/log/app
     - name: log-shipper
-      image: fluent-bit:2.2
+      image: fluent-bit:5.1
       volumeMounts:
         - name: shared-logs
           mountPath: /var/log/app
@@ -70,7 +70,7 @@ spec:
         type: Directory
   containers:
     - name: node-exporter
-      image: prom/node-exporter:v1.7.0
+      image: prom/node-exporter:v1.12.1
       volumeMounts:
         - name: proc
           mountPath: /host/proc

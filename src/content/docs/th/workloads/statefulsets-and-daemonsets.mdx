@@ -50,7 +50,7 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: myregistry/postgres:16
+          image: myregistry/postgres:18
           ports:
             - containerPort: 5432
               name: postgres
@@ -74,7 +74,7 @@ spec:
 kubectl get pods -l app=db -o wide
 
 # Each Pod has its own stable DNS name via the headless Service
-kubectl run -it --rm debug --image=busybox:1.36 --restart=Never -- \
+kubectl run -it --rm debug --image=busybox:1.38 --restart=Never -- \
   nslookup db-0.db.default.svc.cluster.local
 
 # Scaling and deletion are ordered too: highest ordinal first

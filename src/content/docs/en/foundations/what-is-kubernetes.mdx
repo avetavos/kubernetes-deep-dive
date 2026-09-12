@@ -52,12 +52,12 @@ spec:
     spec:
       containers:
         - name: web
-          image: nginx:1.27
+          image: nginx:1.31
           ports:
             - containerPort: 80
 ```
 
-You send this manifest to the cluster once. From then on, if a replica crashes, gets evicted, or the node it was on disappears, a controller creates a new Pod to bring the count back to three — with no further action from you. Rolling out a new image is just as declarative: change `image: nginx:1.27` to a newer tag and re-apply; the Deployment controller replaces Pods gradually, on its own.
+You send this manifest to the cluster once. From then on, if a replica crashes, gets evicted, or the node it was on disappears, a controller creates a new Pod to bring the count back to three — with no further action from you. Rolling out a new image is just as declarative: change `image: nginx:1.31` to a newer tag and re-apply; the Deployment controller replaces Pods gradually, on its own.
 
 ## Clusters: control plane and nodes
 

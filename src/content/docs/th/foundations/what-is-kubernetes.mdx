@@ -52,12 +52,12 @@ spec:
     spec:
       containers:
         - name: web
-          image: nginx:1.27
+          image: nginx:1.31
           ports:
             - containerPort: 80
 ```
 
-คุณส่ง manifest นี้ให้ cluster แค่ครั้งเดียว จากนั้นถ้า replica ตัวไหน crash ถูก evict หรือ node ที่อยู่หายไป controller จะสร้าง Pod ใหม่ขึ้นมาให้จำนวนกลับเป็น 3 โดยคุณไม่ต้องทำอะไรเพิ่ม การ roll out image ใหม่ก็ declarative เหมือนกัน แค่เปลี่ยน `image: nginx:1.27` เป็น tag ใหม่แล้ว apply ซ้ำ Deployment controller จะทยอยแทนที่ Pod ให้เองทีละส่วน
+คุณส่ง manifest นี้ให้ cluster แค่ครั้งเดียว จากนั้นถ้า replica ตัวไหน crash ถูก evict หรือ node ที่อยู่หายไป controller จะสร้าง Pod ใหม่ขึ้นมาให้จำนวนกลับเป็น 3 โดยคุณไม่ต้องทำอะไรเพิ่ม การ roll out image ใหม่ก็ declarative เหมือนกัน แค่เปลี่ยน `image: nginx:1.31` เป็น tag ใหม่แล้ว apply ซ้ำ Deployment controller จะทยอยแทนที่ Pod ให้เองทีละส่วน
 
 ## Cluster ประกอบด้วย control plane และ node
 
