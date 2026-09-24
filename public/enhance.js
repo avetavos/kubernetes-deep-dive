@@ -29,7 +29,15 @@
   function theme() {
     return document.documentElement.dataset.theme === 'light' ? 'default' : 'dark';
   }
-  async function render() {
+  // Serialise renders: the theme MutationObserver can fire while the first pass is still
+  // awaiting mermaid; two interleaved passes leave later diagrams as empty <svg><g/></svg>.
+  let rendering = null, dirty = false;
+  function render() {
+    if (rendering) { dirty = true; return rendering; }
+    rendering = renderOnce().finally(() => { rendering = null; if (dirty) { dirty = false; render(); } });
+    return rendering;
+  }
+  async function renderOnce() {
     const nodes = Array.from(document.querySelectorAll('pre.mermaid'));
     if (!nodes.length) return;
     if (!mermaid) {
