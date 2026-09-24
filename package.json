@@ -8,7 +8,8 @@
     "build": "astro build",
     "preview": "astro preview",
     "astro": "astro",
-    "test": "echo \"no tests\" && exit 0"
+    "test": "echo \"no tests\" && exit 0",
+    "check": "node tools/check-parity.mjs"
   },
   "dependencies": {
     "@astrojs/preact": "^5.1.5",

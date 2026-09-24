@@ -35,7 +35,13 @@ metadata:
   name: orders-api
 spec:
   replicas: 3
+  selector:
+    matchLabels:
+      app: orders-api
   template:
+    metadata:
+      labels:
+        app: orders-api
     spec:
       affinity:
         podAntiAffinity:

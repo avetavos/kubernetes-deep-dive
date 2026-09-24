@@ -49,7 +49,7 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
     ทุกหัวข้อเริ่มจาก model — reconciliation loop, Pod, Service, scheduler — พอเข้าใจแล้วพฤติกรรมของ Kubernetes จะกลายเป็นกลไกที่คุณเข้าใจ ไม่ใช่ YAML ที่ copy-paste ตามกัน
   </Card>
   <Card title="verify กับ API group ปัจจุบัน" icon="random">
-    เขียนบน API group ที่ stable และใช้งานจริงใน production ทุกวันนี้ — `apps/v1`, `batch/v1`, `networking.k8s.io/v1`, `autoscaling/v2`, `policy/v1` — และตรวจสอบกับ official docs ผ่าน context7
+    เขียนบน API group ที่ stable และใช้งานจริงใน production ทุกวันนี้ — `apps/v1`, `batch/v1`, `networking.k8s.io/v1`, `autoscaling/v2`, `policy/v1` — และตรวจสอบกับ official docs ผ่าน context7 ตรวจล่าสุดกับ **Kubernetes 1.37** (kubectl client 1.36, kind 0.33), **Helm 4.3** และ Gateway API v1 ปัจจุบัน ณ กันยายน 2026
   </Card>
   <Card title="เน้น guarantee ไม่ใช่แค่ YAML" icon="approve-check">
     ไม่ใช่แค่ "นี่คือ Deployment" แต่เป็น "rolling update การันตีอะไรจริง ๆ และตรงไหนที่ readiness probe หรือ PodDisruptionBudget ที่ขาดไปยังทำให้พังได้" คุณจะ reason เรื่อง cluster ได้อย่างมั่นใจ

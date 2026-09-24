@@ -49,7 +49,7 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
     Every topic starts from a model — the reconciliation loop, the Pod, the Service, the scheduler — so Kubernetes's behavior becomes mechanism you understand, not YAML you copy-paste.
   </Card>
   <Card title="Verified against current API groups" icon="random">
-    Written against the stable API groups in wide production use today — `apps/v1`, `batch/v1`, `networking.k8s.io/v1`, `autoscaling/v2`, `policy/v1` — and checked against the official docs via context7.
+    Written against the stable API groups in wide production use today — `apps/v1`, `batch/v1`, `networking.k8s.io/v1`, `autoscaling/v2`, `policy/v1` — and checked against the official docs via context7. Last verified against **Kubernetes 1.37** (kubectl 1.36 client, kind 0.33), **Helm 4.3**, and current Gateway API v1, as of September 2026.
   </Card>
   <Card title="Guarantees, not just YAML" icon="approve-check">
     Not "here's a Deployment" but "here's what a rolling update actually guarantees, and what a missing readiness probe or PodDisruptionBudget can still let go wrong." You'll reason about a cluster with confidence.

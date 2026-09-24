@@ -43,13 +43,17 @@ spec:
     - name: wait-for-db
       image: busybox:1.38
       command: ['sh', '-c', 'until nc -z db 5432; do sleep 1; done']
+    - name: log-shipper
+      image: myregistry/log-shipper:2.1.0
+      restartPolicy: Always
+      volumeMounts:
+        - name: logs
+          mountPath: /var/log/app
   containers:
     - name: app
       image: myregistry/app:1.4.0
       ports:
         - containerPort: 8080
-    - name: log-shipper
-      image: myregistry/log-shipper:2.1.0
       volumeMounts:
         - name: logs
           mountPath: /var/log/app
@@ -58,7 +62,7 @@ spec:
       emptyDir: {}
 ```
 
-`wait-for-db` จะบล็อกไม่ให้ Pod เริ่มทำงานจนกว่าจะเชื่อมต่อ database ได้ แล้ว exit สำเร็จ จากนั้น `app` กับ `log-shipper` ถึงจะเริ่ม โดยแชร์ network namespace และ volume `logs` ของ Pod ร่วมกัน
+`wait-for-db` จะบล็อกไม่ให้ Pod เริ่มทำงานจนกว่าจะเชื่อมต่อ database ได้ แล้ว exit สำเร็จ จากนั้น `initContainers` ตัวที่เหลือและ `containers` หลักถึงจะเริ่มตามลำดับ สังเกตว่า `log-shipper` ก็อยู่ใต้ `initContainers` เหมือนกัน ไม่ได้อยู่ใน `containers` แต่มันตั้ง `restartPolicy: Always` ให้ตัวเอง แค่ field เดียวนี้แหละที่ทำให้มันกลายเป็น **native sidecar** แทนที่จะเป็น init container ธรรมดา kubelet จะ start มัน (แล้ว restart ให้ถ้า exit) ก่อน `app` จะเริ่ม และตอน Pod กำลังจะ terminate ก็จะสั่งหยุด `app` ก่อนแล้วค่อยหยุด sidecar ตัวนี้ทีหลัง log shipper เลย stream log บรรทัดสุดท้าย ๆ ได้ครบโดยไม่ถูกฆ่าทิ้งก่อนเวลา ฟีเจอร์นี้เป็น **stable/GA ตั้งแต่ Kubernetes v1.33** (เริ่มมีตั้งแต่ v1.28) ก่อนหน้านี้วิธีเดียวที่จะรัน sidecar คือใส่เป็น container ธรรมดาใน `containers` ซึ่งไม่มี guarantee เรื่องลำดับ start/stop เทียบกับ container หลักเลย `app` กับ `log-shipper` แชร์ network namespace และ volume `logs` ของ Pod ร่วมกัน ซึ่งเป็นวิธีที่ `log-shipper` อ่านไฟล์ที่ `app` เขียนได้
 
 <Mermaid title="One Pod: an init container runs first, then the main container and a sidecar share one network namespace" code={podsDiagram} />
 
@@ -87,7 +91,7 @@ kubectl describe pod app-with-sidecar
 Pod ถูกออกแบบมาให้เป็น ephemeral และแทบไม่มีใคร create Pod ตรง ๆ ถ้า `kubectl apply` Pod เปล่า ๆ แล้ว node ที่ Pod นั้นอยู่ล่ม หรือ container ข้างในพัง เกินกว่าที่ `restartPolicy` จะช่วยได้ **ไม่มีอะไรมา recreate Pod นั้นให้** คือหายไปเฉย ๆ ในทางปฏิบัติคุณแทบจะ create Deployment, StatefulSet หรือ DaemonSet แทนเสมอ controller เหล่านั้นถือ Pod template ไว้ คอย watch state จริงของ cluster และ recreate Pod ทุกครั้งที่ของจริงเบี่ยงไปจากจำนวนที่ต้องการ ส่วนที่เหลือของ module นี้คือ controller พวกนั้น
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**Pod** คือ container หนึ่งตัวหรือมากกว่าที่แชร์ network namespace เดียวกัน (IP เดียว คุยกันผ่าน **localhost** ได้) และแชร์ volume ได้ถ้าต้องการ **init container** รันจนจบตามลำดับก่อนที่ **sidecar** และ container หลักตัวอื่นจะเริ่ม phase ของ Pod (`Pending`/`Running`/`Succeeded`/`Failed`/`Unknown`) และ `restartPolicy` (`Always`/`OnFailure`/`Never`) คุม lifecycle ของตัวเอง แต่ **Pod เปล่า ๆ ที่ตายไปแล้วจะไม่ถูก recreate** งานนั้นเป็นของ controller ที่จะเรียนต่อไป
+**Pod** คือ container หนึ่งตัวหรือมากกว่าที่แชร์ network namespace เดียวกัน (IP เดียว คุยกันผ่าน **localhost** ได้) และแชร์ volume ได้ถ้าต้องการ **init container** รันจนจบตามลำดับก่อนที่ container หลักจะเริ่ม และถ้า `initContainers` ตัวไหนตั้ง `restartPolicy: Always` มันจะกลายเป็น **native sidecar** (GA ตั้งแต่ v1.33) ที่รันอยู่ตลอดอายุ Pod โดย kubelet คุมลำดับ start/stop ให้ phase ของ Pod (`Pending`/`Running`/`Succeeded`/`Failed`/`Unknown`) และ `restartPolicy` (`Always`/`OnFailure`/`Never`) คุม lifecycle ของตัวเอง แต่ **Pod เปล่า ๆ ที่ตายไปแล้วจะไม่ถูก recreate** งานนั้นเป็นของ controller ที่จะเรียนต่อไป
 </Callout>
 
 export const quizPods = [

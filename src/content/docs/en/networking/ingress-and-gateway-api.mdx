@@ -109,7 +109,9 @@ spec:
           port: 80
 ```
 
-That split matters in practice: a platform team can own and lock down the `Gateway` (which ports and TLS certs are exposed) while individual application teams safely own their own `HTTPRoute` objects without needing access to the shared listener at all. `Gateway`, `GatewayClass`, and `HTTPRoute` (along with `GRPCRoute`) have reached General Availability at `gateway.networking.k8s.io/v1`, and Gateway API is the direction the ecosystem is moving for new, more advanced routing needs — but `Ingress` remains extremely widely deployed, fully supported, and perfectly adequate for straightforward host/path routing. Neither is going away soon.
+That split matters in practice: a platform team can own and lock down the `Gateway` (which ports and TLS certs are exposed) while individual application teams safely own their own `HTTPRoute` objects without needing access to the shared listener at all. `Gateway`, `GatewayClass`, and `HTTPRoute` (along with `GRPCRoute`) have reached General Availability at `gateway.networking.k8s.io/v1`, and this is now the Kubernetes project's own recommendation, not just an ecosystem trend: the [Ingress API is frozen](https://kubernetes.io/docs/concepts/services-networking/ingress/) — generally available and not going away, but receiving no further features — and the docs explicitly say to use Gateway API instead of Ingress for anything new.
+
+That recommendation has teeth. **ingress-nginx**, historically the most widely deployed Ingress controller, [announced its own retirement in November 2025](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/): best-effort maintenance only until **March 2026**, with no further releases, bugfixes, or security updates after that. Existing installations keep working and the Helm charts/images stay published, but a new cluster today should pick a Gateway API implementation rather than standing up ingress-nginx.
 
 <Mermaid title="External traffic through an Ingress controller to internal Services and Pods" code={ingressRoutingDiagram} />
 
@@ -120,7 +122,7 @@ export const ingressRoutingDiagram = `flowchart LR
   ing --> svcB["Service: frontend-svc"] --> podB["Pods"]`;
 
 <Callout title="The one-line takeaway">
-**Ingress** declares Layer-7 host and path routing rules, but does nothing without a running **Ingress controller** to implement them, and `IngressClass` picks which controller handles a given Ingress when several are installed. **Gateway API** is the newer, role-oriented successor — `GatewayClass` (implementation), `Gateway` (a listener, usually platform-owned), and `HTTPRoute`/`GRPCRoute` (routing rules, usually app-team-owned) — whose core resources are now GA, while Ingress remains widely used and fully supported.
+**Ingress** declares Layer-7 host and path routing rules, but does nothing without a running **Ingress controller** to implement them, and `IngressClass` picks which controller handles a given Ingress when several are installed. **Gateway API** is the newer, role-oriented successor — `GatewayClass` (implementation), `Gateway` (a listener, usually platform-owned), and `HTTPRoute`/`GRPCRoute` (routing rules, usually app-team-owned) — whose core resources are now GA. The Ingress API itself is frozen (stable, but no new features), and its most popular controller, ingress-nginx, is retiring (EOL March 2026), so new clusters should reach for Gateway API.
 </Callout>
 
 export const quizIngressGateway = [

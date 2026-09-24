@@ -43,13 +43,17 @@ spec:
     - name: wait-for-db
       image: busybox:1.38
       command: ['sh', '-c', 'until nc -z db 5432; do sleep 1; done']
+    - name: log-shipper
+      image: myregistry/log-shipper:2.1.0
+      restartPolicy: Always
+      volumeMounts:
+        - name: logs
+          mountPath: /var/log/app
   containers:
     - name: app
       image: myregistry/app:1.4.0
       ports:
         - containerPort: 8080
-    - name: log-shipper
-      image: myregistry/log-shipper:2.1.0
       volumeMounts:
         - name: logs
           mountPath: /var/log/app
@@ -58,7 +62,7 @@ spec:
       emptyDir: {}
 ```
 
-`wait-for-db` blocks the Pod's startup until the database is reachable, then exits successfully; only then do `app` and `log-shipper` start, sharing the Pod's network namespace and the `logs` volume.
+`wait-for-db` blocks the Pod's startup until the database is reachable, then exits successfully; only then do the rest of the `initContainers` and the main `containers` start, in order. Notice that `log-shipper` also lives under `initContainers`, not `containers` — but it sets `restartPolicy: Always` on itself. That single field is what makes it a **native sidecar** instead of a regular init container: kubelet starts it (and keeps restarting it if it exits) before `app` starts, and on Pod termination it stops `app` first and this sidecar last, so a log shipper draining the final lines of output is not killed out from under the container it is shipping logs for. This has been a **stable, GA feature since Kubernetes v1.33** (first available in v1.28) — before it existed, the only way to run a sidecar was as an ordinary entry in `containers`, which has none of these startup- or shutdown-ordering guarantees relative to the main container. `app` and `log-shipper` share the Pod's network namespace and the `logs` volume, which is how `log-shipper` can read the files `app` writes.
 
 <Mermaid title="One Pod: an init container runs first, then the main container and a sidecar share one network namespace" code={podsDiagram} />
 
@@ -87,7 +91,7 @@ kubectl describe pod app-with-sidecar
 A Pod is ephemeral by design and it is rarely something you create directly. If you `kubectl apply` a bare Pod and its node fails, or the container inside it crashes past what `restartPolicy` will fix, **nothing recreates that Pod** — it is simply gone. In practice you almost always create a Deployment, StatefulSet, or DaemonSet instead: those controllers own a Pod template, watch the actual state of the cluster, and recreate Pods whenever reality drifts from the desired count. The rest of this module is those controllers.
 
 <Callout title="The one-line takeaway">
-A **Pod** is one or more containers sharing a network namespace (one IP, reachable over **localhost**) and optionally volumes; **init containers** run to completion in order before **sidecar** and other main containers start; a Pod's phase (`Pending`/`Running`/`Succeeded`/`Failed`/`Unknown`) and its `restartPolicy` (`Always`/`OnFailure`/`Never`) govern its lifecycle, but a **bare Pod that dies is not recreated** — that job belongs to the controllers covered next.
+A **Pod** is one or more containers sharing a network namespace (one IP, reachable over **localhost**) and optionally volumes; **init containers** run to completion in order before main containers start, and a plain `initContainers` entry with `restartPolicy: Always` becomes a **native sidecar** (GA since v1.33) that keeps running for the Pod's whole life with kubelet-managed startup/shutdown ordering; a Pod's phase (`Pending`/`Running`/`Succeeded`/`Failed`/`Unknown`) and its `restartPolicy` (`Always`/`OnFailure`/`Never`) govern its lifecycle, but a **bare Pod that dies is not recreated** — that job belongs to the controllers covered next.
 </Callout>
 
 export const quizPods = [

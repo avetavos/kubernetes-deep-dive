@@ -109,7 +109,9 @@ spec:
           port: 80
 ```
 
-การแยกแบบนี้มีประโยชน์จริง ทีม platform เป็นเจ้าของและคุม `Gateway` ได้ (ว่าเปิด port ไหน TLS certificate ไหน) ส่วนแต่ละทีม application เป็นเจ้าของ `HTTPRoute` ของตัวเองได้อย่างปลอดภัย โดยไม่ต้องมีสิทธิ์เข้าถึง listener ที่ใช้ร่วมกันเลย `Gateway`, `GatewayClass` และ `HTTPRoute` (พร้อมกับ `GRPCRoute`) เข้าสู่ General Availability แล้วที่ `gateway.networking.k8s.io/v1` และ Gateway API คือทิศทางที่ ecosystem กำลังมุ่งไปสำหรับความต้องการ routing ที่ซับซ้อนขึ้น แต่ `Ingress` ก็ยังถูกใช้กันแพร่หลายมาก ยังได้รับ support เต็มที่ และเหมาะมากพอสำหรับการ route แบบ host/path ตรงไปตรงมา ไม่มีตัวไหนกำลังจะหายไปในเร็ว ๆ นี้
+การแยกแบบนี้มีประโยชน์จริง ทีม platform เป็นเจ้าของและคุม `Gateway` ได้ (ว่าเปิด port ไหน TLS certificate ไหน) ส่วนแต่ละทีม application เป็นเจ้าของ `HTTPRoute` ของตัวเองได้อย่างปลอดภัย โดยไม่ต้องมีสิทธิ์เข้าถึง listener ที่ใช้ร่วมกันเลย `Gateway`, `GatewayClass` และ `HTTPRoute` (พร้อมกับ `GRPCRoute`) เข้าสู่ General Availability แล้วที่ `gateway.networking.k8s.io/v1` และนี่ไม่ใช่แค่เทรนด์ของ ecosystem แต่เป็นคำแนะนำอย่างเป็นทางการจากโปรเจกต์ Kubernetes เอง — [Ingress API ถูก "แช่แข็ง" แล้ว](https://kubernetes.io/docs/concepts/services-networking/ingress/) (ยังเป็น GA ใช้ได้ ไม่ได้ถูกถอดออก แต่จะไม่มีฟีเจอร์ใหม่เพิ่มอีก) และเอกสารทางการก็บอกตรง ๆ ให้ใช้ Gateway API แทน Ingress สำหรับงานใหม่
+
+คำแนะนำนี้ไม่ใช่แค่พูดลอย ๆ **ingress-nginx** ซึ่งเป็น Ingress controller ที่ถูกใช้แพร่หลายที่สุด [ประกาศ retire ตัวเองไปเมื่อพฤศจิกายน 2025](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/) จะดูแลแบบ best-effort ถึงแค่ **มีนาคม 2026** เท่านั้น หลังจากนั้นจะไม่มี release, bugfix หรือแพตช์ความปลอดภัยใหม่อีก การติดตั้งเดิมยังทำงานต่อได้ และ Helm chart/image ยังอยู่ครบ แต่ cluster ใหม่วันนี้ควรเลือก Gateway API implementation แทนการติดตั้ง ingress-nginx
 
 <Mermaid title="Traffic ภายนอกผ่าน Ingress controller ไปยัง Service และ Pod ภายใน" code={ingressRoutingDiagram} />
 
@@ -120,7 +122,7 @@ export const ingressRoutingDiagram = `flowchart LR
   ing --> svcB["Service: frontend-svc"] --> podB["Pods"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**Ingress** ประกาศ rule การ route แบบ Layer-7 ตาม host กับ path แต่ไม่ทำอะไรเลยถ้าไม่มี **Ingress controller** รันอยู่เพื่อ implement rule เหล่านั้น และ `IngressClass` เลือกว่า controller ตัวไหนจัดการ Ingress ตัวไหนเวลามีติดตั้งหลายตัว **Gateway API** คือตัวต่อยอดใหม่กว่าที่แยก role ชัดเจน `GatewayClass` (implementation), `Gateway` (listener ปกติดูแลโดย platform), และ `HTTPRoute`/`GRPCRoute` (rule การ route ปกติดูแลโดยทีม application) ซึ่ง resource หลักตอนนี้ GA แล้ว ส่วน Ingress ก็ยังถูกใช้กันแพร่หลายและได้รับ support เต็มที่
+**Ingress** ประกาศ rule การ route แบบ Layer-7 ตาม host กับ path แต่ไม่ทำอะไรเลยถ้าไม่มี **Ingress controller** รันอยู่เพื่อ implement rule เหล่านั้น และ `IngressClass` เลือกว่า controller ตัวไหนจัดการ Ingress ตัวไหนเวลามีติดตั้งหลายตัว **Gateway API** คือตัวต่อยอดใหม่กว่าที่แยก role ชัดเจน `GatewayClass` (implementation), `Gateway` (listener ปกติดูแลโดย platform), และ `HTTPRoute`/`GRPCRoute` (rule การ route ปกติดูแลโดยทีม application) ซึ่ง resource หลักตอนนี้ GA แล้ว ส่วน Ingress API เองก็ถูกแช่แข็งแล้ว (เสถียร แต่ไม่มีฟีเจอร์ใหม่) และ controller ที่ใช้กันมากที่สุดอย่าง ingress-nginx ก็กำลัง retire (EOL มีนาคม 2026) ดังนั้น cluster ใหม่ควรมองไปที่ Gateway API
 </Callout>
 
 export const quizIngressGateway = [
