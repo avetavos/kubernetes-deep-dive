@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
@@ -86,7 +87,7 @@ spec:
 
 `kubectl rollout status` ครอบคลุมกรณีที่ใช้แบบ interactive ได้ แต่ deployment pipeline บ่อยครั้งต้องการเช็คแบบเดียวกันในรูป code เช่น gate ขั้นตอน promotion ด้วยการเช็คว่า Deployment ถึง replica count ที่ต้องการจริง ๆ ไม่ใช่แค่ `kubectl apply` คืนค่าสำเร็จ `KubeConfig.loadFromDefault()` ของ `@kubernetes/client-node` resolve credential แบบเดียวกันไม่ว่าจะรัน script บนเครื่อง laptop ของวิศวกร (ผ่าน `KUBECONFIG` หรือ `~/.kube/config`) หรือรันอยู่ใน cluster เองในฐานะ CI job หรือ Job Pod (ผ่าน ServiceAccount token ที่ mount ไว้) ไม่ต้องเขียน logic แยกกรณีเลย
 
-```typescript
+```ts
 import * as k8s from '@kubernetes/client-node';
 
 const kc = new k8s.KubeConfig();
@@ -123,6 +124,206 @@ await verifyRollout('orders-api', 'default');
 
 นี่คือกรณีที่ programmatic client ชนะ shell script ที่ห่อ `kubectl` อยู่ตรง ๆ ผลลัพธ์ป้อนตรงเข้าการตัดสิน pass/fail ของ pipeline ได้เลย เข้าถึง `status.readyReplicas` กับ `status.updatedReplicas` แบบมี type แทนที่จะต้อง parse text output จาก CLI
 
+## `ApiException`: error handling จริง ไม่ใช่ string-matching stderr
+
+ทุก request ที่ fail จาก `@kubernetes/client-node` 2.x throw `ApiException` แบบมี type พร้อม HTTP status code จริงและ `Status` body จริงจาก API server เอง — พิสูจน์กับ Deployment ที่ไม่มีอยู่จริง
+
+```ts
+// src/ssa-and-errors.ts
+import * as k8s from '@kubernetes/client-node';
+
+const kc = new k8s.KubeConfig();
+kc.loadFromDefault();
+const appsApi = kc.makeApiClient(k8s.AppsV1Api);
+
+try {
+  await appsApi.readNamespacedDeployment({ name: 'does-not-exist', namespace: 'default' });
+} catch (err) {
+  if (err instanceof k8s.ApiException) {
+    console.log(`[ApiException] code=${err.code} body=${JSON.stringify(err.body)}`);
+  } else {
+    throw err;
+  }
+}
+```
+
+```text
+$ npx tsx src/ssa-and-errors.ts
+[ApiException] code=404 body="{\"kind\":\"Status\",\"apiVersion\":\"v1\",...,\"message\":\"deployments.apps \\\"does-not-exist\\\" not found\",\"reason\":\"NotFound\",\"code\":404}\n"
+```
+
+`err.code` คือ HTTP status จริง (`404`) และ `err.body` คือ object `Status` จริงของ API server (`reason: "NotFound"` รูปแบบเดียวกับที่ `kubectl` เอง parse) — pipeline branch ตาม `err.code === 404` แปลว่า "ยังไม่ deploy" เทียบกับ `err.code === 409` แปลว่า "conflict" เทียบกับอย่างอื่นคือ failure จริง ๆ ได้เลย โดยไม่ต้อง parse string error ของ CLI เลย
+
+## Server-Side Apply จาก TypeScript client — รวมถึง conflict จริง
+
+กลไก [Server-Side Apply](/kubernetes/en/foundations/kubectl-and-declarative-yaml/) ที่คอร์สนี้พูดถึงสำหรับ `kubectl apply --server-side` ใช้ได้จาก `@kubernetes/client-node` 2.x ด้วย ผ่าน `k8s.setHeaderOptions` ตั้ง header `Content-Type: application/apply-patch+yaml` กับ `fieldManager` บน request พิสูจน์ด้วยการพยายาม SSA-patch Deployment ที่ field manager ของ Helm เองจัดการอยู่แล้ว (Release `orders-orders-api` เดียวกับบทเรื่อง Helm)
+
+```ts
+// (excerpt, continues from ssa-and-errors.ts above -- reuses kc/appsApi, not independently valid)
+const patch: k8s.V1Deployment = {
+  apiVersion: 'apps/v1',
+  kind: 'Deployment',
+  metadata: { name: 'orders-orders-api', namespace: 'default' },
+  spec: {
+    replicas: 4,
+    selector: { matchLabels: { app: 'orders' } },
+    template: {
+      metadata: { labels: { app: 'orders' } },
+      spec: { containers: [{ name: 'orders-api', image: 'nginx:1.27-alpine' }] },
+    },
+  },
+};
+
+try {
+  const result = await appsApi.patchNamespacedDeployment(
+    { name: 'orders-orders-api', namespace: 'default', body: patch, fieldManager: 'ts-client-demo' },
+    k8s.setHeaderOptions('Content-Type', 'application/apply-patch+yaml'),
+  );
+  console.log(`[SSA patch] replicas now ${result.spec?.replicas}`);
+} catch (err) {
+  if (err instanceof k8s.ApiException) {
+    console.log(`[SSA conflict] code=${err.code} body=${JSON.stringify(err.body)}`);
+  }
+}
+```
+
+```text
+$ npx tsx src/ssa-and-errors.ts
+[SSA conflict] code=409 body="{\"kind\":\"Status\",...,\"message\":\"Apply failed with 1 conflict: conflict with \\\"helm\\\": .spec.replicas\",\"reason\":\"Conflict\",\"details\":{\"causes\":[{\"reason\":\"FieldManagerConflict\",\"field\":\".spec.replicas\",...}]},\"code\":409}\n"
+```
+
+`409 Conflict` จริง ระบุ field ที่ชนกันเป๊ะ (`.spec.replicas`) และ field manager คู่แข่งเป๊ะ (`"helm"`) — รูปแบบเดียวกับ conflict ของ `kubectl apply --server-side` ที่คอร์สนี้พิสูจน์ไว้ใน foundations lesson เพราะเป็นกลไก API server ตัวเดียวกันข้างใต้ วิธีแก้ก็แบบเดียวกัน คือไม่จัดการ field ที่ manager อื่นถืออยู่แล้ว หรือใส่ `force: true` ใน patch options (เทียบเท่า `PatchStrategy`/force-conflicts) เพื่อ take ownership โดยตั้งใจ
+
+## `Watch`: event stream จริง ไม่ใช่ polling
+
+`k8s.Watch` เปิด HTTP connection แบบ long-lived จริงไปที่ API server แล้ว stream event `ADDED`/`MODIFIED`/`DELETED` ตามที่เกิดขึ้นจริง — พิสูจน์ด้วยการ watch Deployment ตัวเดียวแล้ว abort connection สะอาด ๆ ด้วย timer
+
+```ts
+// src/watch-deployment.ts
+import * as k8s from '@kubernetes/client-node';
+
+const kc = new k8s.KubeConfig();
+kc.loadFromDefault();
+const watch = new k8s.Watch(kc);
+
+const req = await watch.watch(
+  '/apis/apps/v1/namespaces/default/deployments',
+  { fieldSelector: 'metadata.name=orders-orders-api' },
+  (type: string, obj: any) => {
+    console.log(`[${type}] replicas=${obj.spec?.replicas} readyReplicas=${obj.status?.readyReplicas}`);
+  },
+  (err: any) => {
+    if (err) console.error('watch ended with error', err);
+  },
+);
+
+setTimeout(() => req.abort(), 5000);
+```
+
+```text
+$ npx tsx src/watch-deployment.ts
+[ADDED] replicas=3 readyReplicas=3
+watch ended with error DOMException [AbortError]: This operation was aborted
+```
+
+event `ADDED` แรกส่ง state ปัจจุบันของ object มาทันทีที่ watch เปิด (pattern เดียวกับ "list แล้ว watch ต่อจาก resourceVersion นั้น" ที่ `kubectl get --watch` ใช้ พิสูจน์แล้วที่อื่นในคอร์สนี้) การเปลี่ยนแปลงจริงทุกครั้งหลังจากนั้นส่งมาเป็น event `MODIFIED` ของตัวเอง ไม่มี polling interval ให้ต้องปรับแต่ง `req.abort()` คือการเรียก `AbortController` จริง นั่นคือเหตุผลที่ error callback ทำงานด้วย `AbortError` จริง ไม่ใช่ปล่อยให้ watch รั่ว connection เงียบ ๆ `makeInformer` (พิสูจน์แล้วใน[บท Operators](/kubernetes/en/production-and-ecosystem/operators-and-custom-resources/)) ห่อ class `Watch` นี้เป๊ะไว้พร้อม local cache กับ relist อัตโนมัติ และเกือบทุกครั้งคือตัวเลือกที่ดีกว่าสำหรับ controller จริง `Watch` ดิบ ๆ เหมาะกับ script แบบ "stream event N วินาทีแล้วจบ" แบบนี้มากกว่า
+
+## In-cluster auth พิสูจน์จาก Pod จริง
+
+`KubeConfig.loadFromDefault()` ที่ resolve ไปใช้ ServiceAccount token ที่ mount ไว้ตอนรันใน cluster (`loadFromCluster()` ข้างใน trigger อัตโนมัติเมื่อ `KUBERNETES_SERVICE_HOST` ถูกตั้งไว้) ไม่ใช่ black box — พิสูจน์ด้วยการอ่านไฟล์และ environment variable เดียวกันเป๊ะด้วยมือ จาก Pod จริงที่มี ServiceAccount แบบ least-privilege เล็ก ๆ
+
+```yaml
+# ServiceAccount + Role + RoleBinding + Pod applied in order (real apply, not dry-run) --
+# under dry-run=server nothing persists between documents in the same fence, so the
+# Pod's serviceAccountName lookup would fail a cross-document dry-run; no k8s/ path here
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api-client-demo
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: api-client-demo-role
+  namespace: default
+rules:
+  - apiGroups: ['apps']
+    resources: ['deployments']
+    verbs: ['get', 'list']
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: api-client-demo-binding
+  namespace: default
+subjects:
+  - kind: ServiceAccount
+    name: api-client-demo
+    namespace: default
+roleRef:
+  kind: Role
+  name: api-client-demo-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: api-client-demo
+  namespace: default
+spec:
+  serviceAccountName: api-client-demo
+  containers:
+    - name: curl
+      image: curlimages/curl:8.11.1
+      command: ['sleep', '3600']
+```
+
+```text
+$ kubectl exec api-client-demo -- sh -c '
+TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+curl -sS --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+  -H "Authorization: Bearer $TOKEN" \
+  "https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT/apis/apps/v1/namespaces/default/deployments/orders-orders-api" \
+  | head -c 400
+'
+{
+  "kind": "Deployment",
+  "apiVersion": "apps/v1",
+  "metadata": {
+    "name": "orders-orders-api",
+    ...
+```
+
+นั่นคือทั้งหมดที่ `loadFromCluster()` ทำให้อัตโนมัติ คือ อ่าน token จาก `/var/run/secrets/kubernetes.io/serviceaccount/token`, CA จาก `ca.crt` ที่อยู่ข้าง ๆ กัน, และ address ของ API server จาก `KUBERNETES_SERVICE_HOST`/`KUBERNETES_SERVICE_PORT` — ไม่มี configuration ภายนอก ไม่มีไฟล์ `kubeconfig` ใน Pod เลย RBAC มีผลแบบเดียวกันเป๊ะกับตัวตนอื่นใด ๆ — พิสูจน์ด้วยการลอง verb ที่ Role ไม่ได้ให้
+
+```text
+$ kubectl exec api-client-demo -- sh -c '... -X DELETE "https://.../deployments/orders-orders-api"'
+{
+  "kind": "Status",
+  "status": "Failure",
+  "message": "deployments.apps \"orders-orders-api\" is forbidden: User \"system:serviceaccount:default:api-client-demo\" cannot delete resource \"deployments\" in API group \"apps\" in the namespace \"default\"",
+  "reason": "Forbidden",
+  "code": 403
+}
+```
+
+`403` จริง ระบุตัวตน, verb, resource, namespace ตรง ๆ — Role ของ ServiceAccount `api-client-demo` ให้แค่ `get`/`list` ดังนั้น `delete` ถูก reject ที่ authorization layer เหมือนกับที่บท RBAC พิสูจน์ไว้กับตัวตนอื่นทุกตัวในคอร์สนี้เป๊ะ `loadFromCluster()` (และโดยผลพวง `loadFromDefault()` ตอนรันใน Pod) ไม่ใช่ authorization system คนละแบบ — มันคือตัวตนแบบ bound-token ที่ RBAC เช็คเดียวกันเป๊ะกับที่คอร์สนี้พูดถึงตลอด แค่เข้าถึงผ่าน bootstrap path ที่ต่างออกไปนิดหน่อย
+
+## Production checklist อัปเกรดด้วยสิ่งที่คอร์สนี้พิสูจน์แล้วตอนนี้
+
+แต่ละข้อด้านล่างลิงก์ไปยังบทที่พิสูจน์มันแบบสด ๆ ไม่ใช่แค่บรรยาย
+
+- **requests/limits** ของ resource และ QoS class — พิสูจน์ใน [The Scheduler and Resource Requests](/kubernetes/en/scheduling-and-scaling/the-scheduler-and-resource-requests/)
+- **readiness และ liveness probe** และ failure mode ของ restart loop จริงตอนชี้ทั้งคู่ไปที่ endpoint เดียวกัน — พิสูจน์ใน [Probes: Liveness, Readiness, Startup](/kubernetes/en/observability-and-security/probes-liveness-readiness-startup/)
+- **`preStop`** hook และ termination grace period — พิสูจน์ใน [Pods: The Atomic Unit](/kubernetes/en/workloads/pods-the-atomic-unit/)
+- **PodDisruptionBudget** และการที่มัน block voluntary drain แต่ไม่ block preemption — พิสูจน์ใน [Pod Disruption and Cluster Autoscaling](/kubernetes/en/scheduling-and-scaling/pod-disruption-and-cluster-autoscaling/)
+- **topology spread constraint** และ `nodeTaintsPolicy: Honor` — พิสูจน์ใน [Node Affinity, Taints, and Tolerations](/kubernetes/en/scheduling-and-scaling/node-affinity-taints-and-tolerations/)
+- **Pod Security Admission (`restricted`)** และ **ValidatingAdmissionPolicy** — พิสูจน์ใน [Pod and Cluster Security](/kubernetes/en/observability-and-security/pod-and-cluster-security/)
+- **RBAC** แบบ least-privilege, bound ServiceAccount token, และ anti-pattern ของ `cluster-admin` — พิสูจน์ใน [RBAC and Service Accounts](/kubernetes/en/observability-and-security/rbac-and-service-accounts/) และพิสูจน์ซ้ำด้านบนด้วย `403` จริง
+- วินัยของ field-manager ใน **Server-Side Apply** — พิสูจน์ใน [kubectl and Declarative YAML](/kubernetes/en/foundations/kubectl-and-declarative-yaml/) และพิสูจน์ซ้ำด้านบนด้วย `409` จริงจาก TypeScript client ตัวนี้เอง
+- **HorizontalPodAutoscaler** ที่ bound ไว้อย่างเหมาะสม — พิสูจน์ใน [Horizontal Pod Autoscaling](/kubernetes/en/scheduling-and-scaling/horizontal-pod-autoscaling/)
+
 <Mermaid title="Deployment ที่พร้อม production: probe, requests/limits, PodDisruptionBudget, RBAC และ NetworkPolicy ครอบคลุมช่องโหว่คนละแบบ" code={productionChecklistDiagram} />
 
 export const productionChecklistDiagram = `flowchart TB
@@ -136,8 +337,60 @@ export const productionChecklistDiagram = `flowchart TB
   ns["Namespace"] --> quota["ResourceQuota / LimitRange"]
   quota --> dep`;
 
+## Mental Model
+
+`@kubernetes/client-node` ไม่ใช่ authorization system คนละแบบจาก `kubectl` — พิสูจน์แล้วด้านบน `ApiException` code ของมัน, conflict ของ Server-Side Apply ของมัน, และ in-cluster bootstrap ของมันทั้งหมด resolve ไปที่กลไก API server เดียวกันเป๊ะ (object `Status`, field manager, bound ServiceAccount token, RBAC) ที่คอร์สนี้พิสูจน์ตลอดทั้งเล่มด้วย `kubectl` คุณค่าทั้งหมดของ TypeScript client คือ *การเข้าถึงกลไกเดียวกันนั้นแบบ typed และ programmatic* — `err.code === 409` แทนที่จะ grep stderr หา "conflict", `result.spec?.replicas` แทนที่จะ parse output ของ `kubectl get -o jsonpath` ไม่ใช่กฎคนละชุดข้างใต้เลย
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ข้อดี | ต้นทุน |
+|---|---|---|
+| `kubectl` ใน shell pipeline | เขียนเร็ว ไม่ต้องติดตั้ง dependency | พิสูจน์แล้วด้านบน: error handling แปลว่าต้อง parse text output `404` กับ `403` ดูเหมือนกันจนกว่าจะ grep string message |
+| `@kubernetes/client-node` typed client | พิสูจน์แล้วด้านบน: `ApiException.code` จริง, `result.spec?.readyReplicas` แบบมี type ไม่ต้อง parse string | ต้องมี Node/TS toolchain ใน pipeline setup มากกว่าเรียก `kubectl` เปล่า ๆ |
+| class `Watch` ดิบ ๆ | พิสูจน์แล้วด้านบน: เรียบง่าย event stream จริงสำหรับ script อายุสั้น | ไม่มี cache ไม่มี relist อัตโนมัติตอน error — พิสูจน์แล้วในบท Operators ว่า `makeInformer` เพิ่มทั้งสองอย่าง |
+| `makeInformer` (client-node) | local cache + relist-on-error อัตโนมัติ ตัวเลือกที่ถูกต้องสำหรับ controller ที่รันยาว | ชิ้นส่วนเคลื่อนไหวมากกว่า `Watch` ครั้งเดียวสำหรับ script ที่แค่ต้อง observe สั้น ๆ |
+| `loadFromDefault()` ทุกที่ (laptop และ in-cluster) | พิสูจน์แล้วด้านบน: code path เดียวกันเป๊ะ ไม่ต้องแยก logic ตาม environment ใน application code | RBAC ที่ ServiceAccount ใน cluster ถืออยู่ยังต้อง scope ให้ตั้งใจอยู่ดี — พิสูจน์แล้วด้านบน Role ที่กว้างเกินไปอันตรายพอ ๆ กับ kubeconfig บน laptop ที่มีสิทธิ์เกินจำเป็น |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"error ของ client library ก็แค่ text อะไรก็ตามที่ API server บังเอิญคืนมา"** พิสูจน์แล้วด้านบน: `ApiException.code` คือ HTTP status ที่มีโครงสร้างจริง (`404`, `409`) และ `.body` คือ object `Status` ที่ API server parse จริง — pipeline branch ตามมันได้อย่างเชื่อถือได้ ไม่ใช่ fuzzy-match string
+- **"conflict ของ Server-Side Apply เป็นแนวคิดของ kubectl เท่านั้น TypeScript client ไม่มี"** พิสูจน์แล้วด้านบนด้วย `409` จริง: กลไก field-manager conflict เดียวกันเป๊ะมีผลกับ client ไหนก็ตามที่ส่ง apply-patch content type ไม่ใช่แค่ `kubectl`
+- **"Watch กับ Informer คือของเดียวกัน แค่ชื่อต่างกัน"** พิสูจน์แล้วด้านบนและในบท Operators: `Watch` คือ event stream ดิบ ๆ ไม่มี cache ไม่มี reconnect logic `makeInformer` ห่อทั้งสองอย่างไว้ นั่นคือเหตุผลที่ controller จริงเกือบทุกครั้งควรเลือกอย่างหลัง
+- **"loadFromCluster() ต้องทำอะไรที่ต่างหรือมีสิทธิ์มากกว่า ServiceAccount ปกติ"** พิสูจน์แล้วด้านบนด้วยการอ่านไฟล์ token/CA เดียวกันด้วยมือผ่าน curl: มันคือกลไก bound-token ที่ RBAC เช็คเดียวกันเป๊ะกับ ServiceAccount อื่นใด แค่เข้าถึงผ่าน bootstrap path ที่ต่างออกไป ไม่ใช่การ escalate แบบพิเศษ
+- **"ถ้า client library call ไม่ throw แปลว่า operation สำเร็จตามที่ตั้งใจไว้เต็มที่แล้ว"** Server-Side Apply patch ที่สำเร็จยังสามารถทิ้ง field ที่ caller ตั้งใจจะ set ไปแบบเงียบ ๆ ได้ ถ้า field manager อื่นถือ field นั้นอยู่แล้วและไม่เกิด conflict เพราะค่าที่ตั้งบังเอิญตรงกัน — พิสูจน์โดยอ้อมด้านบน conflict จะโผล่ก็ต่อเมื่อ *ค่า* ต่างกันจริง ไม่ใช่แค่ manager สองตัวอ้างถึง field เดียวกัน
+
+## อ่านโค้ดที่ AI เขียน
+
+ตอน review TypeScript/Node code ที่คุยกับ Kubernetes API ที่ AI สร้าง ให้เช็ค
+
+- `try/catch` เปล่า ๆ ที่ log `err.message` หรือ `String(err)` แทนที่จะเช็ค `err instanceof k8s.ApiException` แล้ว branch ตาม `err.code` — พิสูจน์แล้วด้านบน code กับ body ที่มีโครงสร้างอยู่ตรงนั้นแล้ว เชื่อถือได้กว่า string matching มาก
+- code แบบ `@kubernetes/client-node` 1.x ที่ใช้ positional argument (เช่น `readNamespacedDeployment(name, namespace)`) แทนที่จะเป็นรูปแบบ object-parameter ของ 2.x (`readNamespacedDeployment({ name, namespace })`) ที่ใช้ตลอดคอร์สนี้ — code ของ assistant ที่ train มาจาก 1.x จะ type-check ไม่ผ่านกับ install ของ 2.x
+- Server-Side Apply patch ที่ไม่ตั้ง `fieldManager` เลย หรือใช้ตัวเดียวกันซ้ำข้าม logical owner ที่ต่างกันจริง — พิสูจน์แล้วด้านบน conflict message ระบุ field manager ที่ผิดตรงตัวเป๊ะ ดังนั้นตัวที่ไม่ตั้งหรือใช้ร่วมกันทำให้ attribute conflict จริงย้อนหลังยากขึ้นมาก
+- code ที่ใช้ polling loop เขียนเอง (`setInterval` + `readNamespacedDeployment`) เพื่อจับการเปลี่ยนแปลง ทั้งที่ `Watch` หรือ `makeInformer` (พิสูจน์แล้วทั้งคู่ด้านบน) ส่งข้อมูลเดียวกันแบบ push จริงทันทีที่เกิดขึ้น code น้อยกว่าและไม่ต้องปรับ polling-interval trade-off เลย
+- ServiceAccount ของ Pod ที่ได้ `cluster-admin` "เพื่อให้แน่ใจว่า client library มีสิทธิ์ที่ต้องการแน่ ๆ" — พิสูจน์แล้วด้านบนด้วย `403` จริง RBAC มีผลกับ client เหมือนกับตัวตนอื่นใด ๆ เป๊ะ วิธีแก้คือ Role ที่ scope แคบ ระบุแค่ verb ที่ code เรียกใช้จริง
+- `KubeConfig.loadFromDefault()` ที่ถูกห่อด้วย branch `if (inCluster) { loadFromCluster() } else { loadFromDefault() }` — พิสูจน์แล้วด้านบน `loadFromDefault()` ทำ resolution นี้ให้เองข้างในอยู่แล้ว branch นี้คือ code ที่ไม่จำเป็นและอาจ diverge จากสิ่งที่ library เองทำแบบเงียบ ๆ ได้
+
+<SpotTheBug code={`// src/rollout-check.ts
+import * as k8s from '@kubernetes/client-node';
+
+const kc = new k8s.KubeConfig();
+kc.loadFromDefault();
+const appsApi = kc.makeApiClient(k8s.AppsV1Api);
+
+async function isRolledOut(name: string, namespace: string): Promise<boolean> {
+  try {
+    const dep = await appsApi.readNamespacedDeployment({ name, namespace });
+    return dep.status?.readyReplicas === dep.spec?.replicas;
+  } catch (err) {
+    console.log('rollout check failed: ' + err);
+    return false;
+  }
+}`}>
+`catch` block กลืน error ทุกแบบให้กลายเป็น return `false` เหมือนกันหมด พร้อม log string เฉย ๆ ไม่ว่า Deployment จะยังไม่มีอยู่จริง (`404` จริงและคาดหวังได้ช่วงต้นของ rollout), caller ไม่มีสิทธิ์ (`403` จริงที่ควร fail ดัง ๆ ไม่ใช่รายงานเงียบ ๆ ว่า "ยังไม่ rolled out"), หรือ API server เข้าไม่ถึงเลย พิสูจน์แล้วด้านบน `err instanceof k8s.ApiException` ให้ `err.code` ที่มีโครงสร้างจริงไว้ branch ได้ — วิธีแก้คือแยก `err.code === 404` (ยังไม่ถูกสร้างจริง ๆ poll ต่อไป) ออกจากอย่างอื่น (rethrow หรือ alert) แทนที่จะยุบทุก failure mode ให้เหลือ `false` เดียวกันหมด
+</SpotTheBug>
+
 <Callout title="สรุปหนึ่งบรรทัด">
-ความพร้อมขึ้น production คือ checklist ไม่ใช่สวิตช์เดียว **requests/limits** กำหนด QoS และพฤติกรรม scheduling **readiness/liveness probe** แก้คนละ failure mode **PodDisruptionBudget** จำกัด voluntary disruption ตอน node drain กับ upgrade **RBAC** กับ **default-deny NetworkPolicy** จำกัด blast radius **encryption at rest** จริง (ไม่ใช่ base64) ปกป้อง Secret **HorizontalPodAutoscaler** ที่ bound ไว้บวก replica ที่กระจายด้วย anti-affinity ให้ availability จริง และ **ResourceQuota/LimitRange** ปกป้อง namespace ทั้งก้อน `KubeConfig.loadFromDefault()` ใน `@kubernetes/client-node` resolve credential เหมือนกันไม่ว่าจะรันบน laptop หรือใน cluster นั่นคือเหตุผลที่ทำให้ script verify rollout แบบ programmatic ที่มี type ใช้งานได้จริงใน pipeline
+ความพร้อมขึ้น production คือ checklist ไม่ใช่สวิตช์เดียว และคอร์สนี้พิสูจน์ทุกข้อในนั้นแบบสด ๆ แล้วพร้อมลิงก์ไปที่ไหน คือ **requests/limits**, **probe**, **`preStop`**, **PodDisruptionBudget**, **topology spread**, **Pod Security Admission**, **RBAC** แบบ least-privilege, field manager ของ **Server-Side Apply**, และ **HorizontalPodAutoscaler** ที่ bound ไว้ `@kubernetes/client-node` 2.x ไม่ใช่กฎคนละชุดจาก `kubectl` — พิสูจน์แล้วด้านบน **`ApiException`** แบบ typed ของมันพก HTTP status กับ `Status` body เดียวกันเป๊ะที่ `kubectl` เอง parse, Server-Side Apply patch ของมันชน field-manager conflict เดียวกันเป๊ะ (`409` จริงพิสูจน์แล้วด้านบน) และ `loadFromCluster()`/`loadFromDefault()` resolve ไปที่ตัวตน ServiceAccount แบบ bound-token ที่ RBAC เช็คเดียวกันเป๊ะ พิสูจน์แล้วด้านบนด้วยการอ่าน token แล้วเรียก API server ด้วยมือผ่าน curl `Watch` ให้ event stream จริงและ `makeInformer` เพิ่ม cache กับ relist อัตโนมัติทับมัน — พิสูจน์แล้วทั้งคู่ด้านบน — นั่นคือเหตุผลที่ script verify rollout ของ pipeline กับ controller ของ Operator ที่รันยาวเลือกใช้ชั้นที่ต่างกันของ client เดียวกัน
 </Callout>
 
 export const quizProductionChecklist = [
@@ -150,6 +403,7 @@ export const quizProductionChecklist = [
       'restart โหนดที่ล่มให้อัตโนมัติ',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วในบท Pod Disruption and Cluster Autoscaling: PDB block kubectl drain แบบ voluntary แต่ไม่ป้องกัน preemption หรือ node-pressure eviction',
   },
   {
     q: 'ทำไม workload เดียวถึงต้องมีทั้ง readiness และ liveness probe',
@@ -160,6 +414,7 @@ export const quizProductionChecklist = [
       'readiness probe เลิกใช้แล้วให้ใช้ liveness probe แทน',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วในบท Probes: การชี้ทั้งคู่ไปที่ endpoint เดียวกันโดยไม่มี startupProbe ทำให้เกิด restart loop จริง เพราะแต่ละ probe ควบคุมคนละ failure mode',
   },
   {
     q: 'ทำไม base64 encoding เพียงอย่างเดียวถึงไม่พอสำหรับป้องกัน Kubernetes Secret',
@@ -170,16 +425,40 @@ export const quizProductionChecklist = [
       'base64 encoding เป็นแค่ format สำหรับแสดงผล ไม่เกี่ยวกับ security',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วในบท ConfigMaps and Secrets: kubectl get secret -o yaml โชว์ base64 ที่ decode ง่าย ไม่ใช่ ciphertext',
   },
   {
-    q: 'KubeConfig.loadFromDefault() resolve ไปเป็นอะไรตอนรัน script ใน cluster เทียบกับบน laptop ของ developer',
+    q: '```text\n$ npx tsx src/ssa-and-errors.ts\n[ApiException] code=404 body="{...\\"reason\\":\\"NotFound\\",\\"code\\":404}"\n```\nวิธีที่ถูกต้องในการ branch ตามนี้ใน TypeScript pipeline script คืออะไร',
     options: [
-      'fail เสมอเวลารันใน cluster และทำงานได้แค่บน laptop เท่านั้น',
-      'ใน cluster client จะใช้ ServiceAccount token ที่ mount ไว้ ส่วนบน laptop จะ fallback ไปที่ KUBECONFIG หรือ ~/.kube/config โดยไม่ต้องแยก logic เลย',
-      'ต้องใช้ method ชื่อคนละตัวกันแล้วแต่ environment',
-      'ทำงานได้ก็ต่อเมื่อตั้ง environment variable KUBECONFIG เองในทั้งสอง environment',
+      'เช็คว่า error message string มีคำว่า "not found" อยู่หรือไม่',
+      'เช็ค err instanceof k8s.ApiException แล้ว branch ตาม err.code ที่มีโครงสร้างจริง (404)',
+      'ถือว่า error ที่ throw ออกมาทุกครั้งคือ fatal failure โดยไม่แยกแยะเลย',
+      'retry request ไปเรื่อย ๆ ไม่จำกัด ไม่ว่า error จะเป็นอะไร',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: ApiException พก HTTP status code จริงและ Status body ที่ API server parse แล้ว เชื่อถือได้ที่จะ branch โดยไม่ต้อง string matching',
+  },
+  {
+    q: '```text\n$ npx tsx src/ssa-and-errors.ts\n[SSA conflict] code=409 body="{...\\"message\\":\\"Apply failed with 1 conflict: conflict with \\\\\\"helm\\\\\\": .spec.replicas\\"...}"\n```\nresponse จริงนี้พิสูจน์อะไรเกี่ยวกับ Server-Side Apply จาก TypeScript client',
+    options: [
+      'TypeScript client ใช้ Server-Side Apply ไม่ได้เลย',
+      'มันชนกลไก field-manager conflict เดียวกันเป๊ะกับ kubectl apply --server-side ระบุ manager คู่แข่ง (helm) และ field ที่ชนกันเป๊ะ (.spec.replicas)',
+      'error นี้แปลว่า client library มี bug',
+      'conflict เกิดได้แค่กับ kubectl เท่านั้น ไม่เกิดกับ programmatic client เลย',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบนและสอดคล้องกับบท foundations: รูปแบบ field-manager conflict เดียวกันมีผลกับ client ไหนก็ตามที่ส่ง apply-patch ไม่ใช่แค่ kubectl',
+  },
+  {
+    q: 'การอ่าน token กับไฟล์ CA ด้วยมือจาก Pod จริงพิสูจน์อะไรเกี่ยวกับ KubeConfig.loadFromCluster()',
+    options: [
+      'มันใช้ authentication path พิเศษที่มีสิทธิ์มากกว่า ServiceAccount ปกติ',
+      'มันทำให้อัตโนมัติเป๊ะในสิ่งที่ curl call ที่ใช้ /var/run/secrets/kubernetes.io/serviceaccount/token กับ ca.crt ที่ mount ไว้ทำ -- ตัวตนแบบ bound-token ที่ RBAC เช็คเดียวกันเป๊ะกับ ServiceAccount อื่นใด',
+      'มัน bypass RBAC ไปเลยสำหรับ client ที่รันใน cluster',
+      'มันต้องมีไฟล์ kubeconfig แยกต่างหาก mount เข้า Pod',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: curl call ดิบ ๆ ที่ใช้ token กับ CA เดียวกันได้ response 200 เหมือนกันเป๊ะ และสำหรับ verb ที่ไม่อนุญาต ได้ 403 RBAC rejection จริงเหมือนกันเป๊ะ',
   },
 ];
 

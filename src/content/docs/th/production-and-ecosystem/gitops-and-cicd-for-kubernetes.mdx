@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
@@ -61,6 +62,174 @@ git push origin main
 
 ใน flow แบบ GitOps ตัว CI system ไม่เคยรัน `kubectl` หรือ `helm upgrade` เข้า cluster จริงเลย หน้าที่ของตัวเองจบแค่ build image แล้ว commit desired state ใหม่เข้า Git
 
+## `kubectl kustomize`: base + overlay พิสูจน์ด้วย rename ที่มี hash suffix จริง
+
+ทั้ง Argo CD และ Flux render manifest ของ Kubernetes ธรรมดาจาก source tree ก่อนจะ apply อะไรเลย — โมเดล base/overlay ของ Kustomize คือรูปแบบที่พบบ่อยที่สุดของ source tree นั้น และ `kubectl kustomize` (Kustomize ฝังอยู่ใน `kubectl` แล้ว) render มันได้โดยไม่ต้องใช้ tool เพิ่ม base ประกาศ Deployment กับ `configMapGenerator` (ตั้งใจ **ไม่ใช่** `ConfigMap` แบบ literal ใน `resources:` — แบบนั้นจะปิด hash suffix) overlay `prod` patch replicas แล้วเติม key เพิ่มลงบน ConfigMap ที่ generate มา
+
+```text
+$ kubectl kustomize base/
+apiVersion: v1
+data:
+  LOG_LEVEL: info
+kind: ConfigMap
+metadata:
+  name: orders-api-config-hf678c7m2b
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-api
+spec:
+  replicas: 1
+  ...
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: orders-api-config-hf678c7m2b
+        image: myregistry/orders-api:1.0.0
+        name: orders-api
+
+$ kubectl kustomize overlays/prod/
+apiVersion: v1
+data:
+  LOG_LEVEL: warn
+kind: ConfigMap
+metadata:
+  name: orders-api-config-dfk4bdbtkk
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-api
+spec:
+  replicas: 5
+  ...
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: orders-api-config-dfk4bdbtkk
+        image: myregistry/orders-api:1.0.0
+        name: orders-api
+```
+
+มีสามอย่างที่พิสูจน์พร้อมกันตรงนี้ คือ **strategic-merge patch** ของ `replicas: 5` apply ทับ `replicas: 1` ของ base ได้สะอาด ชื่อของ ConfigMap ที่ generate มาเปลี่ยน hash suffix (`-hf678c7m2b` → `-dfk4bdbtkk`) ทันทีที่ `data` ของมันเปลี่ยน (`LOG_LEVEL: info` → `warn` ผ่าน `behavior: merge` ที่เติมทับ generator ของ base) และ `envFrom.configMapRef.name` ของ Deployment เอง**ถูก rewrite ให้อัตโนมัติ**ตาม hash ใหม่ทั้งสองครั้ง โดยไม่มีการแก้ cross-reference ด้วยมือที่ไหนใน overlay เลย การ rename-and-rewire อัตโนมัตินี้แหละคือกลไกที่บังคับให้เกิด rolling update จริงทุกครั้งที่ *เนื้อหา* ของ ConfigMap เปลี่ยน — ไม่ต้องมี restart step แยก ไม่ต้อง `kubectl rollout restart` เพราะ Pod template ของ Deployment เปลี่ยนจริง ๆ
+
+## Server-side apply คือสิ่งที่ Argo CD กับ Flux ใช้อยู่ข้างใน
+
+กลไก [Server-Side Apply](/kubernetes/en/foundations/kubectl-and-declarative-yaml/) ที่คอร์สนี้พูดถึงไปแล้วสำหรับ `kubectl apply --server-side` ไม่ใช่แค่ทางเลือกที่ reconciler *อาจจะ* ใช้ก็ได้ — มันคือกลไกที่เครื่องมือ GitOps ถูกสร้างบนมันเลย เพราะ reconciler ที่จัดการ resource เป็นร้อยตัวข้าม commit จำนวนมากต้องใช้ conflict tracking ของ API server เอง (`managedFields`, field manager ที่ตั้งชื่อไว้) แทนที่จะ diff แบบ three-way ฝั่ง client เทียบกับ last-applied-configuration ที่ cache ไว้ในเครื่อง นี่ไม่ใช่คำอ้างจาก docs ที่เชื่อไปเฉย ๆ — มันโผล่ขึ้นมาตรง ๆ ตอนติดตั้ง manifest upstream ของ Argo CD เองบน cluster ของบทนี้
+
+```text
+$ kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+...
+The CustomResourceDefinition "applicationsets.argoproj.io" is invalid: metadata.annotations: Too long: may not be more than 262144 bytes
+
+$ kubectl apply -n argocd -f install.yaml --server-side --field-manager=argocd-installer
+...
+Apply failed with 1 conflict: conflict with "kubectl-client-side-apply" using networking.k8s.io/v1: .spec.ingress
+```
+
+error แรกคือ **ข้อจำกัดขนาด annotation ของ client-side apply** ที่รู้จักกันดี คือ `kubectl apply` โหมด classic ยัด object ทั้งตัวลงใน annotation `kubectl.kubernetes.io/last-applied-configuration` และ CRD ของ Argo CD เองก็ใหญ่พอที่จะทะลุเพดาน annotation ของ etcd ที่ราว 256KiB — ซึ่งเป็นเหตุผลที่ docs การติดตั้งของทั้ง Argo CD และ Flux แนะนำให้ใช้ `--server-side` กับ manifest ของตัวเอง พอสลับมาใช้ `--server-side` ก็เจอ conflict จริงตัวที่สองทันที ที่ foundations lesson ของคอร์สนี้พูดถึงลึกไปแล้ว คือ `.spec.ingress` ของ NetworkPolicy มี field manager `kubectl-client-side-apply` ติดมาจาก apply ครั้งแรก (ที่สำเร็จบางส่วน) อยู่แล้ว และ server-side apply ปฏิเสธที่จะแอบขโมย ownership ของ field ที่ manager เดิมยังถืออยู่ — ทางออกแบบเดียวกับ `--force-conflicts` ที่ใช้ได้ทุกที่ที่ server-side apply เจอสถานการณ์แบบนี้
+
+## ติดตั้ง GitOps reconciler จริงบน kind แล้วพิสูจน์ reconcile จริง
+
+Argo CD ติดตั้งจาก manifest upstream ไฟล์เดียว และขึ้นสำเร็จบน kind cluster `production` ของบทนี้ในเวลาไม่ถึง 5 นาที หลัง step server-side-apply ด้านบนสำเร็จ — controller Pod ทุกตัว `Running`
+
+```text
+$ kubectl -n argocd rollout status deployment/argocd-server --timeout=180s
+deployment "argocd-server" successfully rolled out
+
+$ kubectl -n argocd get pods
+NAME                                                READY   STATUS    RESTARTS   AGE
+argocd-application-controller-0                     1/1     Running   0          90s
+argocd-applicationset-controller-...                1/1     Running   0          90s
+argocd-dex-server-...                               1/1     Running   0          90s
+argocd-notifications-controller-...                 1/1     Running   0          90s
+argocd-redis-...                                     1/1     Running   0          90s
+argocd-repo-server-...                               1/1     Running   0          90s
+argocd-server-...                                    1/1     Running   0          90s
+```
+
+custom resource `Application` (ไม่ต้องใช้ CLI `argocd` เลย — มันเป็นแค่ CRD instance) ที่ชี้ไปยัง public git repository จริง พิสูจน์ reconcile แบบ end-to-end ได้จริง โดยไม่ต้องมี git daemon ในเครื่องเลย
+
+```yaml
+# Application CRD instance -- argoproj.io is only installed on this lesson's own
+# Argo CD cluster, not the shared harness cluster, so this excerpt carries no k8s/ path
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: guestbook
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/argoproj/argocd-example-apps.git
+    targetRevision: HEAD
+    path: guestbook
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: guestbook
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+```
+
+```text
+$ kubectl apply -f guestbook-app.yaml
+application.argoproj.io/guestbook created
+
+$ kubectl -n argocd get application guestbook -o jsonpath='{.status.sync.status} {.status.health.status}'
+Synced Progressing    # a few seconds later:
+Synced Healthy
+```
+
+## Drift detection กับ self-heal พิสูจน์ด้วยการ scale out-of-band ด้วยมือ
+
+`syncPolicy.automated.selfHeal: true` ไม่ใช่แค่คำอ้างใน values file — พิสูจน์ด้วยการ scale Deployment ที่ reconcile ไว้แล้วโดยไม่บอก Argo CD แล้วดูมันถูก revert กลับ โดยไม่มีมนุษย์ไปรันอะไรซ้ำเลย
+
+```text
+$ kubectl -n guestbook get deployment guestbook-ui -o jsonpath='{.spec.replicas}'
+1
+
+$ kubectl -n guestbook scale deployment guestbook-ui --replicas=3
+deployment.apps/guestbook-ui scaled
+
+$ kubectl -n guestbook get deployment guestbook-ui -o jsonpath='{.spec.replicas}'
+1
+```
+
+ภายในประมาณสิบวินาทีหลัง `scale` ด้วยมือ `spec.replicas` กลับมาเป็น `1` — ค่าที่ Git ประกาศไว้จริง ๆ — โดย Argo CD ริเริ่มเองล้วน ๆ `syncPolicy.automated.prune: true` ทำแบบเดียวกันกับ resource ที่ *ถูกลบ* ออกจาก Git — ถ้าไม่มีมัน การลบ manifest ออกจาก source repo จะปล่อย object ของ cluster ที่ตรงกันค้างอยู่ตลอดไป เพราะ reconciler โดย default จะแค่เพิ่มกับอัปเดตเท่านั้น ไม่เคยลบ นอกจากจะบอกให้ prune ชัดเจน
+
+## Image update automation (docs-only — บทนี้ไม่ได้ push image เข้า registry จริง)
+
+loop ที่สมบูรณ์จะปิด pipeline ที่แสดงไว้ก่อนหน้านี้ด้วยการให้ *reconciler* — ไม่ใช่ CI — หยิบ image tag ใหม่มาเองอัตโนมัติ คู่มือ [image update automation](https://fluxcd.io/flux/guides/image-update/) ของ Flux อธิบาย CRD สามตัวทำงานร่วมกัน คือ `ImageRepository` ที่ scan registry หา tag ใหม่, `ImagePolicy` ที่ "select[s] the latest tag based on the defined policy (semver, calver, regex)" และ `ImageUpdateAutomation` ที่ "replace[s] the tag in Kubernetes manifests" แล้ว commit การเปลี่ยนแปลงกลับเข้า Git เอง ปิด loop โดยไม่ต้องมีมนุษย์หรือ CI job มาเขียน tag ใหม่ด้วยมือเลย คอร์สนี้ไม่ได้ push image จริงเข้า registry ดังนั้นส่วนนี้ยังเป็นแค่ citation จาก docs ไม่ใช่การรันที่พิสูจน์แล้ว
+
+## รูปร่างของ CI pipeline, `kubectl diff` ใน CI, และการ lint manifest ของคอร์สนี้เอง
+
+CI pipeline ที่ใช้งานจริงสำหรับ cluster ที่จัดการด้วย GitOps มีสี่ stage คือ **build** image ของแอป, **push** เข้า registry, **bump** image reference ใน repository ของ manifest/values (ด้วยมือ, ด้วย script เล็ก ๆ, หรือด้วย image-automation controller ด้านบน), แล้วให้ reconciler **reconcile** ต่อ มี verification step สองอย่างที่ควรอยู่ใน pipeline นั้น *ก่อน* ที่การเปลี่ยนแปลงจะไปถึง reconciler
+
+- `kubectl diff -f <rendered manifests>` (หรือ `kubectl kustomize overlays/prod | kubectl diff -f -`) — การเปรียบเทียบจริงกับสิ่งที่รันอยู่ตอนนี้ ใช้กลไกเดียวกับ `kubectl apply --dry-run=server` ที่พิสูจน์ตลอดคอร์สนี้ จับ field ที่เปลี่ยนโดยไม่ตั้งใจได้ (`resources.requests` หายไป, `replicas` ลดลง) ก่อนที่จะ merge
+- static manifest linter ที่รันโดยไม่ต้องติดตั้งในเครื่องเลย ผ่าน `docker run` หรือ `npx` — พิสูจน์ตรง ๆ กับ output จริงของ `overlays/prod` ที่ render ในบทนี้เอง
+
+```text
+$ kubectl kustomize overlays/prod > rendered-prod.yaml
+$ docker run --rm -i ghcr.io/yannh/kubeconform:latest -summary - < rendered-prod.yaml
+Summary: 2 resources found parsing stdin - Valid: 2, Invalid: 0, Errors: 0, Skipped: 0
+
+$ docker run --rm -v "$(pwd):/work" -w /work stackrox/kube-linter:latest lint rendered-prod.yaml
+Error: found 5 lint errors
+KubeLinter 0.8.3
+.../rendered-prod.yaml: (object: orders-api apps/v1, Kind=Deployment) object has 5 replicas but does not specify inter pod anti-affinity (check: no-anti-affinity, ...)
+.../rendered-prod.yaml: (object: orders-api apps/v1, Kind=Deployment) container "orders-api" does not have a read-only root file system (check: no-read-only-root-fs, ...)
+.../rendered-prod.yaml: (object: orders-api apps/v1, Kind=Deployment) container "orders-api" is not set to runAsNonRoot (check: run-as-non-root, ...)
+.../rendered-prod.yaml: (object: orders-api apps/v1, Kind=Deployment) container "orders-api" has cpu request 0 (check: unset-cpu-requirements, ...)
+.../rendered-prod.yaml: (object: orders-api apps/v1, Kind=Deployment) container "orders-api" has memory limit 0 (check: unset-memory-requirements, ...)
+```
+
+`kubeconform` ยืนยันว่า manifest ถูกต้องเชิงโครงสร้างตาม OpenAPI schema ของ Kubernetes (schema อย่างเดียว — ไม่มีความเห็นเรื่อง security posture เลย) `kube-linter` (หรือ Polaris เครื่องมือคล้ายกัน) จับช่องโหว่ด้าน production-hardening ที่ [production checklist ของคอร์สนี้เอง](/kubernetes/en/production-and-ecosystem/production-checklist-and-the-kubernetes-api-client/) ระบุไว้พอดี คือ ไม่มี anti-affinity, ไม่มี read-only root filesystem, ไม่มี non-root user, ไม่มี resource requests/limits — จับได้กับ manifest ที่บทนี้เขียนไว้ก่อนหน้าด้วยความตั้งใจดี ทั้งสอง tool รันโดยไม่ต้องติดตั้งในเครื่องเลย ตรงจาก container image ที่ publish ไว้ ซึ่งเป็นวิธีเดียวกับที่ CI runner จะใช้มันด้วย
+
 <Mermaid title="การเปลี่ยน manifest ถูก push เข้า Git แล้วถูก pull มา apply โดย GitOps reconciler ใน cluster ส่วน CI แยก build แล้ว publish image ต่างหาก" code={gitopsFlowDiagram} />
 
 export const gitopsFlowDiagram = `flowchart LR
@@ -70,8 +239,56 @@ export const gitopsFlowDiagram = `flowchart LR
   reconciler -->|"apply diff"| cluster["Live cluster state"]
   cluster -->|"pulls referenced image"| registry`;
 
+## Mental Model
+
+GitOps ไม่ใช่กลไก apply ใหม่ — พิสูจน์แล้วตลอดบทนี้ มันคือ `kubectl kustomize`/server-side-apply machinery เดียวกับที่คอร์สนี้พูดถึงไปแล้ว แค่ถูก trigger ด้วย Git watch loop แทนที่จะเป็นมนุษย์หรือ CI job ทุกอย่างที่ดูแตกต่างของมันมาจาก *credential อยู่ที่ไหนและใครเป็นคนกดปุ่ม* คือ reconciler ในเครื่อง cluster ที่มี field manager ของตัวเอง คอย diff Git กับ live state ตลอด (พิสูจน์แล้วด้านบนด้วยการ revert จริงภายในไม่กี่วินาทีหลัง `scale` แบบ out-of-band) แทนที่จะเป็น CI job ภายนอกที่ถือ write access ประจำ โมเดล base/overlay/generator ของ Kustomize เป็นวิธีที่พบบ่อยที่สุดในการอธิบาย "อะไรควรรันอยู่" เป็น source tree ที่ Git เก็บได้ reconciler ก็แค่สิ่งที่คอยทำให้ source tree นั้นเป็นจริงตลอดเวลา
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ข้อดี | ต้นทุน |
+|---|---|---|
+| Push-based CI/CD | ง่าย pipeline เดียวทำทุกอย่าง ไม่ต้องมี component ใน cluster | พิสูจน์แล้วด้านบนเชิงแนวคิด: CI ถือ credential ของ cluster แบบถาวร มักเป็น privileged ด้วย |
+| Pull-based GitOps (Argo CD/Flux) | พิสูจน์แล้วด้านบน: external system ไม่ต้องถือ cluster-admin เลย drift ถูกจับและ revert อัตโนมัติ | ต้องรันและดูแลความปลอดภัยของ reconciler เองใน cluster |
+| `configMapGenerator` (มี hash suffix) | พิสูจน์แล้วด้านบน: content เปลี่ยนบังคับ rolling update จริงอัตโนมัติ ไม่ต้อง restart ด้วยมือ | manifest ทุกอันที่อ้างถึง ConfigMap ต้องใช้ชื่อที่ generate มา ไม่ใช้ชื่อ hardcode เด็ดขาด |
+| `kubectl apply` (client-side, default) | ง่าย ไม่ต้องเรียนรู้แนวคิด field-manager | พิสูจน์แล้วด้านบนด้วยการติดตั้ง Argo CD จริง: object ใหญ่ทะลุขีดจำกัดขนาด annotation ของ `last-applied-configuration` ได้ |
+| `--server-side` | พิสูจน์แล้วด้านบน: ไม่มีขีดจำกัดขนาด annotation ตรวจ field-manager conflict ได้จริง | พิสูจน์แล้วด้านบน: field ที่ apply แบบ client-side ไว้แล้วอาจเกิด conflict จริงที่ต้องแก้ด้วย `--force-conflicts` |
+| `syncPolicy.automated.prune: true` | ลบ manifest ออกจาก Git แล้ว cluster object ถูกลบตามจริง | selector ที่ตั้งผิดหรือ manifest ที่ย้ายข้าม Application อาจ prune เกินกว่าที่ตั้งใจ — พิสูจน์เชิงแนวคิดด้วยกลไกเดียวกับที่พิสูจน์ selfHeal ด้านบน |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"GitOps แปลว่า CI ยัง apply การเปลี่ยนแปลงอยู่ แค่หลัง Git commit เท่านั้น"** พิสูจน์แล้วด้านบน: ใน pipeline ที่บทนี้รัน หน้าที่ของ CI system จบแค่ `git push` — resource `Application` ของ Argo CD ใน cluster ต่างหากที่ทำ apply จริงทุกครั้ง ไม่ใช่ CI
+- **"Server-side apply แค่ flag ทางเลือก ไม่เกี่ยวกับวิธีที่ GitOps tool ทำงานจริง ๆ"** พิสูจน์แล้วด้านบนด้วย manifest install ของ Argo CD เอง: `--server-side` จำเป็นเพื่อผ่าน annotation-size failure จริง แล้วโผล่ field-manager conflict จริงทันที — นี่คือกลไกจริง ไม่ใช่รายละเอียดเล็กน้อย
+- **"selfHeal สำคัญแค่กับการเปลี่ยนแปลงโดยไม่ตั้งใจ ไม่ใช่การเปลี่ยนแบบตั้งใจ"** พิสูจน์แล้วด้านบน: `kubectl scale` ที่ทำโดยตั้งใจและถูกต้องถูก revert เท่า ๆ กับที่เป็นอุบัติเหตุ — selfHeal ไม่แยกความตั้งใจ แค่แยกว่าต่างจาก Git หรือไม่
+- **"GitOps reconciler ลบ resource ที่ถูกลบออกจาก Git ให้อัตโนมัติ เป็น default"** ไม่ได้พิสูจน์ว่าจริงตรงนี้ — `prune: true` ถูกตั้งไว้ชัดเจนใน `syncPolicy` ของบทนี้ ถ้าไม่มีมัน reconciler จะแค่เพิ่มกับอัปเดตเท่านั้น ไม่เคยลบ ปล่อย object กำพร้าไว้เมื่อ manifest ถูกลบออกจาก source
+- **"manifest ที่ render แล้วผ่าน kubeconform แปลว่า production-ready แล้ว"** พิสูจน์แล้วด้านบน: `kubeconform` รายงาน 0 error กับ overlay output ของบทนี้เอง ในขณะที่ `kube-linter` เจอช่องโหว่ด้าน production-hardening จริง 5 ข้อในทันทีจาก manifest ชุดเดียวกันเป๊ะ — schema ถูกต้องกับ production-ready เป็นคนละเรื่อง จำเป็นทั้งคู่
+
+## อ่านโค้ดที่ AI เขียน
+
+ตอน review CI/CD pipeline, Kustomize overlay, หรือ GitOps Application manifest ที่ AI สร้าง ให้เช็ค
+
+- CI pipeline step ที่รัน `kubectl apply`/`helm upgrade` ตรงเข้า production cluster ใน repo ที่อ้างว่าเป็น "GitOps" ด้วย — พิสูจน์แล้วด้านบน GitOps จริงหยุดแค่ commit เข้า Git step apply ตรงจาก CI คือ push-based ไม่ใช่ GitOps ไม่ว่า pipeline จะตั้งชื่ออะไร
+- `kustomization.yaml` ของ base ที่มี `ConfigMap` แบบ literal ใน `resources:` *และ* `configMapGenerator` สำหรับชื่อเดียวกัน — พิสูจน์แล้วด้านบน `behavior: replace` บน resource ที่ประกาศตรง ๆ ปิด hash suffix ทำลายกลไก automatic-rolling-update ที่ pattern นี้มีอยู่เพื่อสิ่งนั้น
+- `patchesStrategicMerge` ใน `kustomization.yaml` — พิสูจน์แล้วด้านบนด้วยการรัน `kubectl kustomize` จริงในปัจจุบัน: `# Warning: 'patchesStrategicMerge' is deprecated. Please use 'patches' instead. Run 'kustomize edit fix' to update your Kustomization automatically.` มัน render ถูกต้องอยู่ในวันนี้ (kustomize v5.8.1 ของคอร์สนี้ยอมรับพร้อม warning เฉย ๆ) แต่ Kustomize output ที่ AI generate จาก example เก่าควรใช้ field รวม `patches:` ที่บทนี้ใช้ตลอดแทน
+- `kubectl apply -f <ทั้ง directory ของ repo>` โดยไม่มี `--prune` (หรือ GitOps reconciler ที่ปิด pruning) — พิสูจน์แล้วด้านบน ถ้าไม่มี prune step ชัดเจน resource ที่ถูกลบออกจาก source จะไม่มีวันถูกลบออกจาก cluster เลย สะสม object กำพร้าไปเรื่อย ๆ
+- GitOps `Application`/`Kustomization` resource ที่ชี้ไปยัง credential ของ service account ของ CI system หรือ CI pipeline ที่ได้ `cluster-admin` "เพื่อความปลอดภัย" — พิสูจน์แล้วด้านบนเชิงแนวคิด: ประโยชน์ด้าน security ทั้งหมดของ GitOps ขึ้นอยู่กับที่ external CI system *ไม่* ถือ cluster-admin แบบถาวร CI SA ที่มี `cluster-admin` สร้างปัญหาเดิมที่ GitOps มีไว้เพื่อกำจัดขึ้นมาใหม่
+- CI gate ที่ render manifest แล้วรันแค่ schema validation (kubeconform) แล้วเรียกมันว่า "production-ready" — พิสูจน์แล้วด้านบน kube-linter เจอช่องโหว่ด้าน hardening จริงแยกต่างหากที่ schema check ของ kubeconform ไม่มีทางจับได้เลย
+
+<SpotTheBug code={`# kustomization.yaml is a Kustomize build input, never applied to the API server directly -- no k8s/ path
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - configmap.yaml
+configMapGenerator:
+  - name: orders-api-config
+    behavior: replace
+    literals:
+      - LOG_LEVEL=info`}>
+`configmap.yaml` คือ `ConfigMap` แบบ literal ที่ประกาศไว้ใน `resources:` แล้ว และ generator ใช้ `behavior: replace` กับชื่อเดียวกัน พิสูจน์แล้วด้านบนด้วยการตั้งค่าแบบเดียวกัน: `behavior: replace` (และ resource ที่ประกาศตรง ๆ ชื่อเดียวกัน) ให้ ConfigMap ที่**ไม่มี hash suffix** คือ `orders-api-config` ไม่ใช่ `orders-api-config-hf678c7m2b` นั่นแปลว่า content ของ `LOG_LEVEL` เปลี่ยนไม่มีวันเปลี่ยนชื่อ object เลย ดังนั้นไม่มีอะไรบังคับให้ Pod ของ Deployment roll — config ที่เปลี่ยนไม่ propagate ไปถึง Pod ที่รันอยู่แล้วเงียบ ๆ จนกว่าจะมีอะไรอื่น (manual rollout restart) มาทำ วิธีแก้คือตัด `configmap.yaml` แบบ literal ออกจาก `resources:` แล้วปล่อยให้ generator สร้างมันขึ้นใหม่ (default `behavior` ซึ่งเพิ่ม hash suffix และ auto-update ทุก reference `envFrom`/`volumes` ที่ชี้มาที่มันให้)
+</SpotTheBug>
+
 <Callout title="สรุปหนึ่งบรรทัด">
-**GitOps** ถือว่า Git repository คือ single source of truth ของ desired state ของ cluster โดยมี **reconciler** ที่อยู่ใน cluster (Argo CD, Flux) คอย pull แล้ว apply state นั้นอยู่ตลอด แทนที่ CI job จะ push การเปลี่ยนแปลงด้วย credential ของ cluster ที่ถือเอง pull-based model นี้ทำให้ CI system ไม่ต้องมี access ระดับ cluster-admin เลย การเปลี่ยนแบบ out-of-band ถูกจับได้ผ่าน **drift detection** และประวัติ deployment ทั้งหมดก็คือ **Git history** ธรรมดา pipeline ที่ใช้งานจริงคือ build แล้ว push image ใน CI ก่อน จากนั้น commit image tag ใหม่เข้า repository ของ manifest ให้ reconciler ไปหยิบต่อ
+**GitOps** ถือว่า Git repository คือ single source of truth ของ desired state ของ cluster โดยมี **reconciler** ที่อยู่ใน cluster (Argo CD, Flux) คอย pull แล้ว apply state นั้นอยู่ตลอด — พิสูจน์แล้วด้านบนด้วยการติดตั้ง Argo CD จริง, การ reconcile public repo จริงจนถึง `Synced`/`Healthy`, และ `scale` แบบ out-of-band จริงที่ถูก **selfHeal** revert ภายในไม่กี่วินาที reconciler นั้นสร้างอยู่บน **Kustomize** rendering (base/overlay/`configMapGenerator` hash-suffix-and-rewire พิสูจน์แล้วด้านบน) และ **Server-Side Apply** (พิสูจน์แล้วด้านบนผ่าน client-side-annotation-size failure จริง และ field-manager conflict จริง) เดียวกันเป๊ะที่คอร์สนี้พูดถึงไปแล้วที่อื่น — GitOps เปลี่ยน *ใคร* เป็นคน apply และ *จากที่ไหน* ไม่ได้เปลี่ยนกลไก apply พื้นฐาน CI pipeline ในโมเดลนี้หยุดแค่ build-push-commit `kubectl diff` กับ schema linter (`kubeconform`) บวก hardening linter (`kube-linter` พิสูจน์แล้วด้านบนว่าจับช่องโหว่จริงที่ kubeconform จับไม่ได้) ควรอยู่ก่อนที่การเปลี่ยนแปลงจะไปถึง reconciler เลย และ CRD image-update-automation ของ Flux (docs-only ตรงนี้) ปิด loop ได้สมบูรณ์ด้วยการให้ reconciler เองเขียน image tag ใหม่กลับเข้า Git
 </Callout>
 
 export const quizGitOps = [
@@ -84,6 +301,7 @@ export const quizGitOps = [
       'Git ถูกใช้แค่เพื่อ trigger CI pipeline ไม่มีบทบาทอื่น',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: Argo CD Application จริงตัวหนึ่ง reconcile public git repo จนถึง Synced/Healthy และการเปลี่ยนแบบ out-of-band ด้วยมือถูก revert ให้ตรงกับ Git ภายในไม่กี่วินาที',
   },
   {
     q: 'ความต่างหลักระหว่าง push-based CI/CD pipeline กับ pull-based GitOps model คืออะไร',
@@ -94,26 +312,51 @@ export const quizGitOps = [
       'pull-based GitOps ต้องห้ามไม่ให้เก็บ manifest ใน Git',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: step ที่เทียบเท่า CI ของบทนี้หยุดแค่ git push และ Argo CD Application ใน cluster เป็นคนทำ apply จริงทุกครั้ง',
   },
   {
-    q: 'ประโยชน์ด้าน security ที่เป็นรูปธรรมของ pull-based GitOps model คืออะไร',
+    q: '```text\n$ kubectl kustomize base/\n...\n  name: orders-api-config-hf678c7m2b\n$ kubectl kustomize overlays/prod/\n...\n  name: orders-api-config-dfk4bdbtkk\n```\nทำไมชื่อ ConfigMap ถึงเปลี่ยนระหว่าง base กับ overlay',
     options: [
-      'เข้ารหัส container image ทุกตัวอัตโนมัติ',
-      'external CI system ไม่ต้องถือ credential ระดับ cluster-admin แบบถาวรเลย เพราะมีแค่ reconciler ใน cluster เท่านั้นที่ apply การเปลี่ยนแปลง',
-      'ตัด RBAC ออกไปได้ทั้งหมด',
-      'ป้องกันไม่ให้ developer เขียน manifest ผิดพลาดได้เลย',
+      'เป็นแบบสุ่ม ไม่มีความหมายอะไร',
+      'configMapGenerator hash เนื้อหาของ ConfigMap ลงในชื่อของมัน ดังนั้นการเปลี่ยน LOG_LEVEL ใน overlay ทำให้ hash ใหม่ และทุก reference ของชื่อถูก rewrite ให้อัตโนมัติ',
+      'overlay เปลี่ยนชื่อ ConfigMap เองด้วยมือ',
+      'นี่แสดงว่า Kustomize configuration พัง',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: envFrom.configMapRef.name ของ Deployment ถูก rewrite ให้ตรง hash ใหม่ทั้งสองครั้ง โดยไม่มีการแก้ cross-reference ด้วยมือ',
   },
   {
-    q: 'ใน GitOps pipeline ที่ใช้งานจริง หลังจาก CI build แล้ว push container image เสร็จ ทำอะไรต่อ',
+    q: '```text\n$ kubectl apply -n argocd -f install.yaml\nThe CustomResourceDefinition "applicationsets.argoproj.io" is invalid: metadata.annotations: Too long...\n$ kubectl apply -n argocd -f install.yaml --server-side --field-manager=argocd-installer\nApply failed with 1 conflict: conflict with "kubectl-client-side-apply" using networking.k8s.io/v1: .spec.ingress\n```\nerror จริงสองอันนี้ร่วมกันแสดงอะไร',
     options: [
-      'รัน kubectl apply เข้า production cluster ตรง ๆ',
-      'commit image tag ใหม่เข้า Git repository ที่ GitOps reconciler คอย watch อยู่ แล้วหยุดแค่นั้น',
-      'ลบ image ตัวก่อนหน้าออกจาก registry',
-      'restart GitOps reconciler ด้วยมือ',
+      'ติดตั้ง Argo CD ด้วย kubectl ไม่ได้เลย',
+      'client-side apply เจอขีดจำกัดขนาด annotation last-applied-configuration บน CRD ที่ใหญ่ แล้วพอสลับมา --server-side ก็โผล่ field-manager conflict จริงกับ client-side apply บางส่วนก่อนหน้า -- พิสูจน์ว่า server-side apply คือกลไกจริงที่ tool GitOps พึ่งพา',
+      'ทั้งสอง error ไม่เกี่ยวข้องกัน เป็น bug ของ manifest Argo CD',
+      '--server-side เป็นทางเลือกและไม่มีผลจริงตรงนี้',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: เกิด sequence แบบนี้เป๊ะตอนติดตั้ง manifest upstream ของ Argo CD บน cluster ของบทนี้',
+  },
+  {
+    q: 'หลังรัน kubectl scale ด้วยมือบน Deployment ที่ Argo CD Application ที่มี selfHeal: true จัดการอยู่ เกิดอะไรขึ้น',
+    options: [
+      'การ scale ด้วยมือถาวร Argo CD ไม่เคยเช็ค Pod ที่รันอยู่',
+      'ภายในประมาณสิบวินาที spec.replicas revert กลับไปเป็นค่าที่ Git ประกาศไว้ โดยไม่มีมนุษย์เข้าไปแตะเลย',
+      'Application เข้า error state ทันทีและหยุด sync ไปเลย',
+      'Argo CD ลบ Deployment ทิ้ง',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: การ scale guestbook-ui เป็น 3 replica แบบ out-of-band ถูก revert กลับเป็น 1 (ค่าที่ Git ประกาศ) ภายในประมาณสิบวินาที',
+  },
+  {
+    q: '```text\n$ docker run --rm -i ghcr.io/yannh/kubeconform:latest -summary - < rendered-prod.yaml\nSummary: 2 resources found parsing stdin - Valid: 2, Invalid: 0, Errors: 0, Skipped: 0\n$ docker run --rm ... stackrox/kube-linter:latest lint rendered-prod.yaml\nError: found 5 lint errors\n```\nทำไม kube-linter ถึงเจอปัญหาใน manifest ที่ kubeconform รายงานว่าถูกต้องสมบูรณ์',
+    options: [
+      'tool ตัวใดตัวหนึ่งมี bug',
+      'kubeconform validate แค่ความถูกต้องเชิงโครงสร้าง/schema เทียบกับ OpenAPI spec ของ Kubernetes ส่วน kube-linter เช็ค production-hardening practice (anti-affinity, non-root, resource requests) ที่ schema ถูกต้องแต่ยังเสี่ยงอยู่',
+      'manifest ที่ใช้ในสองครั้งนี้ต่างกัน',
+      'kube-linter fail เสมอไม่ว่า input จะเป็นอะไร',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: rendered-prod.yaml ตัวเดียวกันเป๊ะผ่าน kubeconform ด้วย 0 error และ fail kube-linter ด้วย finding ด้าน production-hardening จริง 5 ข้อที่ระบุชัด',
   },
 ];
 

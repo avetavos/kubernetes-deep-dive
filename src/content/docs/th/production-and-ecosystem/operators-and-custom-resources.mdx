@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
@@ -75,7 +76,7 @@ kubectl get db orders-db -o yaml
 
 ที่อื่นในคอร์สนี้ `kubectl apply` เพียงพออยู่แล้วเพราะมนุษย์รันครั้งเดียวแล้ว built-in controller ก็ทำต่อเอง ส่วน controller ของ Operator ต่างออกไป คือต้องรันต่อเนื่อง ตอบสนองต่อทุก add, update, delete ของ custom resource ตราบเท่าที่ cluster ยังอยู่ นี่คือสถานการณ์ที่คำสั่ง CLI ครั้งเดียวรองรับไม่ได้ แต่ client แบบ programmatic ที่ watch อยู่ตลอดรองรับได้ การใช้ class `Watch` ของ `@kubernetes/client-node` เล็งไปที่ API path ของ custom resource เป็นวิธีที่สมจริงในการสร้าง reconciliation loop ที่เป็นหัวใจของ Operator
 
-```typescript
+```ts
 import * as k8s from '@kubernetes/client-node';
 
 const kc = new k8s.KubeConfig();
@@ -115,6 +116,271 @@ const req = await watch.watch(
 
 ทุก event `ADDED` หรือ `MODIFIED` จะรัน reconcile step ใหม่อีกครั้ง ที่เป็นแก่นของ Operator pattern เลย คือคอยเทียบ desired state (custom resource) กับ real state (infrastructure จริง) แล้วแก้ส่วนต่างไปเรื่อย ๆ โดยไม่ต้องให้มนุษย์มารันคำสั่งซ้ำ
 
+รันจริงกับ `Widget` CRD ที่ใช้งานอยู่ (พิสูจน์ด้านล่าง) informer ให้ reconcile log จริง — ใช้ `makeInformer` จาก `@kubernetes/client-node` 2.x ไม่ใช่ `Watch` loop ที่เขียนเองทั้งหมด
+
+```text
+$ npx tsx src/widget-controller.ts
+[ADDED] gizmo
+[reconcile] Widget/gizmo size=medium resourceVersion=1579
+informer started, watching Widgets...
+patched gizmo.spec.size -> small
+[MODIFIED] gizmo
+[reconcile] Widget/gizmo size=small resourceVersion=1661
+demo complete, exiting
+```
+
+```ts
+// src/widget-controller.ts
+import * as k8s from '@kubernetes/client-node';
+
+const kc = new k8s.KubeConfig();
+kc.loadFromDefault();
+
+const customApi = kc.makeApiClient(k8s.CustomObjectsApi);
+
+const GROUP = 'example.com';
+const VERSION = 'v2';
+const PLURAL = 'widgets';
+const NAMESPACE = 'default';
+
+function reconcile(widget: any): void {
+  const name = widget.metadata?.name;
+  const size = widget.spec?.size;
+  const resourceVersion = widget.metadata?.resourceVersion;
+  console.log(`[reconcile] Widget/${name} size=${size} resourceVersion=${resourceVersion}`);
+}
+
+async function main(): Promise<void> {
+  const listFn = () =>
+    customApi.listNamespacedCustomObject({ group: GROUP, version: VERSION, namespace: NAMESPACE, plural: PLURAL });
+
+  const informer = k8s.makeInformer(
+    kc,
+    `/apis/${GROUP}/${VERSION}/namespaces/${NAMESPACE}/${PLURAL}`,
+    listFn as any,
+  );
+
+  informer.on('add', (obj: any) => reconcile(obj));
+  informer.on('update', (obj: any) => reconcile(obj));
+  informer.on('delete', (obj: any) => console.log(`[DELETED] ${obj.metadata?.name}`));
+  informer.on('error', (err: any) => {
+    console.error('[informer error]', err?.body ?? err);
+    setTimeout(() => informer.start(), 1000);
+  });
+
+  await informer.start();
+}
+
+main();
+```
+
+`makeInformer` ห่อ class `Watch` ดิบไว้พร้อม local cache และ **relist-on-error อัตโนมัติ** — error handler ด้านบน restart informer แทนที่จะปล่อยให้ process ตายตอน connection หลุด ซึ่งเป็น resiliency แบบเดียวกับที่ controller ของ Operator จริงต้องมีตอนรันโดยไม่มีคนดูแลตลอดอายุ cluster
+
+## CRD หลาย version: served, storage, และ version ที่ kubectl เลือกจริง
+
+CRD ระดับ production ไม่ค้างอยู่ที่ version เดียวตลอดไปหรอก `spec.versions[]` เป็น list และแต่ละตัวควบคุมแยกกันว่ามัน **`served`** ไหม (API request ใช้ version นี้ได้ไหม) กับเป็น **`storage`** ไหม (etcd เก็บ object ในรูปแบบของ version นี้ — ต้องมี version เดียวใน list ที่ `storage: true`)
+
+```yaml
+# k8s/operators-and-custom-resources/widget-crd.yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.example.com
+spec:
+  group: example.com
+  scope: Namespaced
+  names:
+    plural: widgets
+    singular: widget
+    kind: Widget
+    shortNames: ['wg']
+  versions:
+    - name: v1
+      served: true
+      storage: false
+      additionalPrinterColumns:
+        - name: Size
+          type: string
+          jsonPath: .spec.size
+        - name: Ready
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Ready")].status
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                size:
+                  type: string
+                  enum: ['small', 'medium', 'large']
+                replicas:
+                  type: integer
+              required: ['size']
+              x-kubernetes-validations:
+                - rule: "self.size != 'large' || has(self.replicas)"
+                  message: "replicas is required when size is 'large'"
+            status:
+              type: object
+              properties:
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type: { type: string }
+                      status: { type: string }
+      subresources:
+        status: {}
+    - name: v2
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Size
+          type: string
+          jsonPath: .spec.size
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                size:
+                  type: string
+                  enum: ['small', 'medium', 'large']
+              required: ['size']
+            status:
+              type: object
+              properties:
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type: { type: string }
+                      status: { type: string }
+      subresources:
+        status: {}
+  conversion:
+    strategy: None
+```
+
+### `conversion.strategy: None` พิสูจน์แล้ว: object เดียวกัน อ่านเป็นสอง version
+
+**`None`** ใช้ได้แค่ตอนที่ทุก version ที่ served share schema เดียวกันเป๊ะ (ตรงนี้ทั้ง `v1` กับ `v2` share รูปแบบ `spec.size` เดียวกัน) — API server "assumes the same schema for all versions and only sets the `apiVersion` field of custom resources to the proper value" ตาม [เอกสาร CRD versioning ของ Kubernetes](https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definition-versioning/) พิสูจน์ด้วยการสร้าง object เป็น `v1` แล้วอ่าน object เดียวกันกลับมาเป็น `v2` โดยไม่มี webhook รันอยู่เลย
+
+```text
+$ kubectl apply -f widget-instance.yaml   # apiVersion: example.com/v1
+widget.example.com/gizmo created
+
+$ kubectl get widget.v2.example.com gizmo -o yaml
+apiVersion: example.com/v2
+kind: Widget
+metadata:
+  name: gizmo
+  namespace: default
+  resourceVersion: "1421"
+  uid: 8365eba8-52b9-4a35-b491-48dc446e0ab7
+spec:
+  size: medium
+```
+
+ถ้า schema ของ version ต่าง ๆ ต่างกันจริง ๆ (field ที่เปลี่ยนชื่อ, `spec` ที่ปรับโครงสร้างใหม่) `None` round-trip ให้ถูกต้องไม่ได้ ต้องใช้ `conversion.strategy: Webhook` แทน คือ webhook server จริง อ้างจาก `spec.conversion.webhook.clientConfig` รับ request `ConversionReview` แล้วคืน object ที่แปลงเป็น version ที่ขอมาแล้ว คอร์สนี้ไม่ได้รัน webhook server ดังนั้นส่วนนี้เป็น docs-only — ดู [เอกสาร versioning เดียวกัน](https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definition-versioning/) สำหรับรูปแบบ request/response ของ `ConversionReview`
+
+### CEL rejection จริงจาก `x-kubernetes-validations`
+
+CEL rule ด้านบนถูกบังคับใช้โดย API server เอง ไม่ต้องมี webhook หรือ admission controller เลย — พิสูจน์ด้วย rejection จริง
+
+```text
+$ kubectl apply -f widget-bad.yaml   # spec: { size: large }  (no replicas)
+The Widget "bad-gizmo" is invalid: spec: Invalid value: replicas is required when size is 'large'
+```
+
+กว่าจะถึงตรงนั้นเจอ CEL error ตอน compile จริงก่อนหนึ่งครั้ง คือ `has(self.replicas)` compile ไม่ผ่านถ้า `replicas` ไม่ถูกประกาศไว้ใน schema จริง ๆ ที่ไหนสักที่
+
+```text
+$ kubectl apply -f widget-crd-broken.yaml
+The CustomResourceDefinition "widgets.example.com" is invalid: spec.versions[0].schema.openAPIV3Schema.properties[spec].x-kubernetes-validations[0].rule:
+Invalid value: ...: compilation failed: ERROR: <input>:1:28: undefined field 'replicas'
+ | self.size != 'large' || has(self.replicas)
+ | ...........................^
+```
+
+`has()` เช็คการมีอยู่ของ field ได้เฉพาะที่ OpenAPI schema รู้จักจริง ๆ เท่านั้น — CEL rule ที่อ้างถึง field ที่ไม่ได้ประกาศไว้จะถูก reject ตอน apply CRD เลย ก่อนที่ instance ไหนจะถูกสร้างด้วยซ้ำ ไม่ใช่แค่ถูกเมินเฉย ๆ
+
+### Printer column: gotcha จริงที่น่าแปลกใจ
+
+ทั้งสอง version ประกาศ `additionalPrinterColumns` แต่ `v1` มีสามคอลัมน์ (`Size`, `Ready`, `Age`) ส่วน `v2` — version ที่เป็น **storage** — มีแค่หนึ่งคอลัมน์ (`Size`) `kubectl get widgets` เฉย ๆ ไม่ได้ใช้คอลัมน์ของ storage version เลย
+
+```text
+$ kubectl explain widget
+GROUP:      example.com
+KIND:       Widget
+VERSION:    v2
+
+$ kubectl api-resources --api-group=example.com -o wide
+NAME      SHORTNAMES   APIVERSION       NAMESPACED   KIND     VERBS
+widgets   wg           example.com/v2   true         Widget   ...
+
+$ kubectl get widgets
+NAME    SIZE
+gizmo   medium
+
+$ kubectl get widget.v1.example.com
+NAME    SIZE     READY   AGE
+gizmo   medium   True    14s
+```
+
+`kubectl` resolve `widgets`/`widget` เปล่า ๆ ไปที่ `example.com/v2` — **ไม่ใช่** storage version — เพราะ CRD version priority สำหรับชื่อที่ตาม convention `vN`/`vNbetaM`/`vNalphaM` จัดอันดับด้วยตัวเลขล้วน ๆ (`v2` แซง `v1`) ไม่สนว่าตัวไหน `storage: true` **storage version กับ version ที่ `kubectl` เลือกเป็น default คือคนละแนวคิดกันเลย** พิสูจน์ตรงนี้ด้วย printer column ที่หายไปเฉย ๆ เมื่อ version ที่ served ตัวเลขสูงกว่าดันประกาศคอลัมน์น้อยกว่า — กับดักเงียบ ๆ ที่คนอ่านที่คิดว่า "storage version" คือ "version ที่ `kubectl get` โชว์" จะเจอง่ายมาก
+
+### `storedVersions`: สะสมเมื่อ flip storage แต่ไม่เคยเคลียร์เองเลย
+
+การ flip ว่า version ไหน `storage: true` ไม่ได้ rewrite object ที่มีอยู่แล้วใน etcd ย้อนหลัง — `status.storedVersions` track ทุก version ที่ยังมี object encode อยู่จริง และ API server ไม่เคยลบ entry ออกจากมันเองอัตโนมัติ
+
+```text
+$ kubectl apply -f widget-crd.yaml   # v1 storage:false, v2 storage:true (flipped)
+customresourcedefinition.apiextensions.k8s.io/widgets.example.com configured
+
+$ kubectl get crd widgets.example.com -o jsonpath='{.status.storedVersions}'
+["v1","v2"]
+
+$ kubectl label widget gizmo touch=1 --overwrite   # any write re-stores the object in the new storage version
+widget.example.com/gizmo labeled
+
+$ kubectl get crd widgets.example.com -o jsonpath='{.status.storedVersions}'
+["v1","v2"]
+```
+
+แม้หลังจาก object เดียวที่มีอยู่จะถูก rewrite เป็น encoding ของ `v2` จริง ๆ แล้ว `storedVersions` ก็ยังคง list `v1` อยู่ดี — [เอกสารของ Kubernetes](https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definition-versioning/) บอกชัดเจนว่านี่คือ manual cleanup step คือ "verify that the old version is no longer listed" หลังจากยืนยันแล้วเท่านั้น (โดย migrate object ทุกตัว เช่นด้วย `kubectl get <kind> -o json | kubectl replace -f -` กวาดทุก namespace) ว่าไม่มีอะไรเก็บอยู่ใน version นั้นอีกแล้ว แล้วค่อย patch field เองด้วยมือ
+
+```text
+$ kubectl patch crd widgets.example.com --subresource=status --type=merge -p '{"status":{"storedVersions":["v2"]}}'
+customresourcedefinition.apiextensions.k8s.io/widgets.example.com patched
+
+$ kubectl get crd widgets.example.com -o jsonpath='{.status.storedVersions}'
+["v2"]
+```
+
+ต้องยืนยันและเคลียร์ `storedVersions` ด้วยมือแบบนี้ก่อนเท่านั้นถึงจะปลอดภัยที่จะลบ version เก่าออกจาก `spec.versions` จริง ๆ — ลบทั้งที่มันยัง list อยู่จะ fail เพราะ object อาจยังมีอยู่ใน encoding ของ version นั้น
+
+### status subresource: พิสูจน์แล้วว่าแยกจาก spec จริง
+
+`subresources: { status: {} }` แยก `/status` ออกเป็น endpoint ของตัวเอง มี RBAC surface ของตัวเอง เหมือน built-in Deployment เป๊ะ — การ update มันต้องใช้ `--subresource=status` และ patch แค่ `spec` เฉย ๆ แตะมันไม่ได้เลย
+
+```text
+$ kubectl patch widget gizmo --subresource=status --type=merge -p '{"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
+widget.example.com/gizmo patched
+```
+
+## Operator SDK กับ OLM: สร้าง controller โดยไม่ต้องเขียนทุกอย่างเอง
+
+[เอกสาร Operator pattern ของ Kubernetes](https://kubernetes.io/docs/concepts/extend-kubernetes/operator/) list framework หลายตัวที่ generate CRD scaffolding, reconcile-loop boilerplate, และ testing harness ที่ตัวอย่าง `makeInformer` เล็ก ๆ ของบทนี้ทำด้วยมือ คือ **kubebuilder** (Go, scaffold โปรเจกต์ controller-runtime เต็มรูปแบบ), Operator SDK ของ **Operator Framework** (operator แบบ Go/Ansible/Helm เป็นบ้านของ **Operator Lifecycle Manager (OLM)** — ส่วนที่จัดการติดตั้ง, upgrade, และ resolve dependency ของ operator เองข้าม cluster ไม่ใช่แค่สิ่งที่ controller ของ operator ตัวเดียวทำ), **Kopf** (framework แบบ Pythonic), **kube-rs** (Rust), **KubeOps** (.NET), และ **Metacontroller** (ประกอบ operator จาก webhook ที่คุณ implement เอง โดยไม่ต้องเขียน controller binary เลย) จะเลือกตัวไหนขึ้นอยู่กับภาษาของทีมและว่า OLM ที่จัดการ install/upgrade/dependency ของตัว operator เองคุ้มค่าที่จะเอามาใช้เพิ่มบน reconcile logic ของ operator เองไหม
+
 <Mermaid title="custom resource ป้อนเข้า watch-diff-act loop ของ Operator ซึ่งขับเคลื่อน database instance จริง" code={operatorLoopDiagram} />
 
 export const operatorLoopDiagram = `flowchart LR
@@ -125,8 +391,73 @@ export const operatorLoopDiagram = `flowchart LR
   act --> infra["Real PostgreSQL instance"]
   infra -->|status| ctrl`;
 
+## Mental Model
+
+CRD คือแค่การลงทะเบียน schema ไม่มีอะไรมากไปกว่านั้น — พิสูจน์แล้วด้านบน `conversion.strategy: None` round-trip object ระหว่าง version ได้จริงโดยไม่มี code รันเลย เพราะทั้งสอง version อธิบายรูปแบบเดียวกัน `x-kubernetes-validations` reject instance ที่ผิดได้จริงโดยไม่มี code รันเลย เพราะ CEL รันอยู่ข้างใน API server เอง ทุกอย่างที่ดูเหมือน "behavior" — provision database, restart replica ที่พัง — มาจาก controller แยกต่างหากที่ watch schema นั้นทั้งหมด นี่คือเหตุผลที่ Operator pattern ทั้งหมดย่อลงมาเหลือ: CRD คือ contract, controller คือ implementation และ `storedVersions`/การ resolve printer column (พิสูจน์แล้วด้านบนว่าน่าแปลกใจจริง ๆ) จริง ๆ แล้วก็แค่ "ตอนนี้ API server คืนรูปแบบไหนกลับมา" ไม่ใช่ "รูปแบบไหนถูกต้อง"
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ข้อดี | ต้นทุน |
+|---|---|---|
+| `conversion.strategy: None` | พิสูจน์แล้วด้านบน: ไม่ต้องมี infrastructure เพิ่ม round-trip ระหว่าง version ได้ทันที | ใช้ได้แค่ตอนที่ schema ของทุก version ที่ served เหมือนกันเป๊ะ — field rename จริง ๆ ต้องใช้ `Webhook` แทน |
+| `conversion.strategy: Webhook` | รองรับ schema ที่เปลี่ยนจริงระหว่าง version | ต้องรันและดูแล webhook server จริง (docs-only ในบทนี้ ไม่มี server deploy) |
+| `x-kubernetes-validations` (CEL) | พิสูจน์แล้วด้านบน: reject จริงพร้อม message ที่กำหนดเอง ไม่ต้อง deploy component เพิ่ม | compile-time error อ้างได้แค่ field ที่มีอยู่ใน schema แล้ว (พิสูจน์แล้วด้านบน) — validate กับ external state ไม่ได้ |
+| version ตัวเลขสูงกว่าที่ `served` แต่ไม่ใช่ `storage` | ให้ client อ่าน/เขียนรูปแบบใหม่ได้ทันที | พิสูจน์แล้วด้านบน: `kubectl` เลือกมันเป็น default discovery แบบเงียบ ๆ แม้จะไม่ใช่ storage version ซึ่งซ่อน printer column ที่ storage version ประกาศไว้ได้ |
+| เคลียร์ `storedVersions` ด้วยมือ | ควบคุมได้เต็มที่ว่าจะประกาศว่า encoding เก่าหายไปเมื่อไหร่แน่ | พิสูจน์แล้วด้านบน: ไม่มีอะไรทำแบบนี้ให้อัตโนมัติ — ข้ามขั้นตอนนี้ไป (หรือทำเร็วเกินไป) จะปล่อยให้ state เก่าค้างตลอดไปหรือเสี่ยงพัง read ของ object ที่ยัง migrate ไม่เสร็จ |
+| `makeInformer` (client-node) แทน `Watch` loop ที่เขียนเอง | พิสูจน์แล้วด้านบน: relist-on-error อัตโนมัติ, local cache, boilerplate น้อยกว่า | ยังเป็น controller ที่เขียนตั้งแต่ศูนย์ — ไม่มี leader election, ไม่มี work queue, ไม่มี rate limiting ต่างจาก scaffolding ของ kubebuilder/Operator SDK |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"storage version คือ version ที่ kubectl ใช้เป็น default"** พิสูจน์แล้วด้านบน: `kubectl explain widget`/`kubectl get widgets` resolve ไปที่ `v2` ด้วยลำดับความสำคัญตามตัวเลขล้วน ๆ ไม่เกี่ยวกับว่า version ไหน `storage: true`
+- **"flip storage: true ไป version ใหม่จะ migrate object ที่มีอยู่ทันที"** พิสูจน์แล้วด้านบน: `status.storedVersions` ยัง list version เก่าอยู่แม้หลังจาก object ที่มีอยู่ทุกตัวจะถูก rewrite จริง ๆ แล้ว — field นี้ไม่ auto-update ต้องเช็คและ patch เองด้วยมือ
+- **"has() ใน CEL rule เช็ค field ชื่ออะไรก็ได้ ประกาศไว้หรือไม่ก็ตาม"** พิสูจน์แล้วด้านบนด้วย compile error จริง: `has(self.replicas)` fail การ validate CRD ไปเลยถ้า `replicas` ไม่ถูกประกาศไว้ใน OpenAPI schema
+- **"webhook conversion server จำเป็นแค่ตอน rename version แบบผิวเผิน"** strategy `None` จัดการ rename ที่รูปแบบเหมือนกันได้อยู่แล้วแค่ผ่าน `apiVersion` (พิสูจน์แล้วด้านบน) — `Webhook` จริง ๆ จำเป็นแค่ตอนที่ *รูปแบบ* field ต่างกันจริงระหว่าง version ซึ่งเป็นภาระที่หนักกว่าที่ฟังดู
+- **"CRD instance ที่ apply ไม่ผ่านเพราะ Kind ยังไม่ติดตั้งเป็น error ประเภทเดียวกับ admission rejection"** CRD instance ที่ apply กับ cluster ที่ไม่เคยติดตั้ง CRD เลยจะ fail ด้วย `no matches for kind` (error ระดับ discovery ก่อนที่ schema หรือ CEL validation ไหนจะรันด้วยซ้ำ) — คนละแบบกับ `x-kubernetes-validations` rejection จริงที่พิสูจน์แล้วด้านบน ซึ่งต้องมี CRD ติดตั้งและ Established อยู่ก่อนแล้ว
+
+## อ่านโค้ดที่ AI เขียน
+
+ตอน review CRD, conversion configuration, หรือ controller code ที่ AI สร้าง ให้เช็ค
+
+- CRD หลาย version ที่ `conversion.strategy: None` ทั้งที่ schema ของ version ต่างกันจริง (field ที่ rename หรือปรับโครงสร้างใหม่) — พิสูจน์แล้วด้านบน `None` เปลี่ยนแค่ label `apiVersion` ไม่ได้ transform ข้อมูลเลย ดังนั้น shape ที่ต่างจริงจะทำให้ read ผิดแบบเงียบ ๆ
+- `x-kubernetes-validations` rule ที่อ้าง field ที่ไม่เคยประกาศไว้ใน schema เดียวกัน — พิสูจน์แล้วด้านบนว่าถูก reject ตอน apply CRD ด้วย compile error จริง ไม่ใช่ถูกเมินเฉย ๆ ดังนั้น fail เร็ว แต่วิธีแก้ (ประกาศ field) พลาดง่ายตอน review ผ่าน ๆ
+- สมมติว่า `kubectl get <plural>` สะท้อน storage version ของ CRD — พิสูจน์แล้วด้านบน มันสะท้อน version ที่ served ที่ priority สูงสุดตาม naming convention ซึ่งอาจเป็นคนละ version เลย
+- storage-version migration ที่ไม่มี step เช็ค/เคลียร์ `storedVersions` ชัดเจน — พิสูจน์แล้วด้านบน field นี้ไม่ update ตัวเอง ดังนั้น "เรา bump storage เป็น v2 แล้ว" โดยไม่มี step นี้จะทิ้ง version reference เก่าค้างไว้ตลอดไป
+- controller ที่ไม่มี error handler บน watch/informer ของมัน (หรือปล่อยให้ process exit ตอน connection หลุด) — พิสูจน์แล้วด้านบน `error` event ของ `makeInformer` ที่ restart informer คือสิ่งที่ทำให้ controller จริงมีชีวิตอยู่ตลอดอายุ cluster ไม่ใช่ script รันครั้งเดียว
+- CRD instance manifest ที่ apply โดยไม่เช็คก่อนว่า CRD เองติดตั้งบน cluster เป้าหมายแล้วหรือยัง — error `no matches for kind` แปลว่า schema ไม่เคยถูกลงทะเบียนเลย คนละปัญหากับ validation rule ใด ๆ ข้างใน schema นั้น
+
+<SpotTheBug code={`# @expect-error real CEL compile error, proven above: undefined field 'replicas'
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.example.com
+spec:
+  group: example.com
+  scope: Namespaced
+  names:
+    plural: widgets
+    singular: widget
+    kind: Widget
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                size:
+                  type: string
+              x-kubernetes-validations:
+                - rule: "self.size != 'large' || has(self.replicas)"
+                  message: "replicas is required when size is 'large'"`}>
+`replicas` ถูกอ้างโดย `has(self.replicas)` แต่ไม่เคยถูกประกาศไว้ที่ไหนใน `properties` ของ `spec` เลย พิสูจน์แล้วด้านบนด้วย response จริงจาก API server: `The CustomResourceDefinition "widgets.example.com" is invalid: ... compilation failed: ERROR: <input>:1:28: undefined field 'replicas'` `has()` ของ CEL เช็คการมีอยู่ของ field ได้แค่ที่ OpenAPI schema ประกาศไว้จริง ๆ เท่านั้น วิธีแก้คือเติม `replicas: { type: integer }` เข้าไปคู่กับ `size` ใน `properties` block เดียวกัน
+</SpotTheBug>
+
 <Callout title="สรุปหนึ่งบรรทัด">
-**CustomResourceDefinition** ลงทะเบียน Kind ใหม่เข้ากับ Kubernetes API validate ด้วย **OpenAPI v3 schema** ทำให้สร้าง list และ watch ได้เหมือน built-in object ทุกอย่าง แต่แค่นั้นยังไม่เปลี่ยนอะไรในโลกจริง **Operator pattern** จับคู่ CRD นั้นกับ **controller** ที่รัน watch-diff-act reconciliation loop แบบเดียวกับ built-in controller ของ Kubernetes เอง เล็งไปที่ logic เฉพาะงาน operation และเพราะ controller ตัวนี้ต้องรันต่อเนื่องไม่ใช่ครั้งเดียว นี่คือกรณีที่ชัดที่สุดที่ **programmatic API client แบบ watch** คุ้มค่ากว่า `kubectl apply` แบบครั้งเดียว
+**CustomResourceDefinition** ลงทะเบียน Kind ใหม่ validate ด้วย **OpenAPI v3 schema** — รวมถึง **`x-kubernetes-validations`** CEL rule ที่ API server บังคับใช้จริง (พิสูจน์แล้วด้านบน รวมถึง compile-time rejection จริงตอน rule อ้าง field ที่ไม่ได้ประกาศไว้) — แต่แค่นั้นยังไม่เปลี่ยนอะไรในโลกจริงเลย **controller** ที่จับคู่กัน รัน watch-diff-act loop เดียวกับที่ตัวอย่าง `makeInformer` ของบทนี้พิสูจน์แบบสด ๆ คือสิ่งที่ทำให้มันเป็น **Operator** CRD หลาย version แยก **`served`** ออกจาก **`storage`** และพิสูจน์แล้วด้านบนว่า `kubectl` resolve version default ตามลำดับตัวเลข **ไม่ใช่** storage version — กับดักเงียบ ๆ จริงสำหรับทั้ง printer column และ behavior `conversion.strategy: None` (พิสูจน์แล้วด้านบน round-trip object เดียวกันได้จริงโดยไม่มี code เพิ่ม) ใช้ได้แค่ตอนที่ schema ของทุก version ที่ served เหมือนกันเป๊ะ shape ที่เปลี่ยนจริงต้องใช้ `Webhook` `status.storedVersions` (พิสูจน์แล้วด้านบน) ไม่เคยเคลียร์ตัวเอง — การ migrate storage version เป็น process ที่ต้องเช็คด้วยมือ ไม่ใช่ flip-แล้ว-ลืม framework อย่าง **kubebuilder**, **Operator SDK** (พร้อม **OLM** สำหรับติดตั้ง operator เอง), **Kopf**, **kube-rs**, **KubeOps**, และ **Metacontroller** scaffold boilerplate ของ reconciliation ที่บทนี้เขียนด้วยมือ
 </Callout>
 
 export const quizOperators = [
@@ -139,6 +470,7 @@ export const quizOperators = [
       'network layer ใหม่สำหรับ Service',
     ],
     answer: 0,
+    explain: 'พิสูจน์แล้วด้านบน: การสร้าง, get, และ watch object Widget ทำงานเหมือน built-in Kind ทุกอย่าง มาจากแค่ CRD ที่ลงทะเบียน schema เท่านั้น',
   },
   {
     q: 'ทำไม CRD เดี่ยว ๆ ถึงยังไม่ทำให้อะไรกลายเป็น Operator',
@@ -149,6 +481,7 @@ export const quizOperators = [
       'Operator ต้องใช้ Helm chart ส่วน CRD ไม่รองรับ Helm',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: controller makeInformer คือตัวที่ตอบสนองต่อ ADDED/MODIFIED event จริงด้วย reconcile log จริง ส่วน CRD เดี่ยว ๆ แค่เก็บและ validate เท่านั้น',
   },
   {
     q: 'ทำไม controller ของ Operator ถึงต้องใช้ programmatic API client แบบ watch แทน kubectl apply ครั้งเดียว',
@@ -159,16 +492,40 @@ export const quizOperators = [
       'kubectl apply ไม่รองรับไฟล์ YAML สำหรับ custom resource',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: informer ยังรันต่อและตอบสนองต่อ patch จริงที่เกิดขึ้น (size medium -> small) ไม่กี่วินาทีหลังเริ่ม ซึ่งคำสั่ง kubectl ครั้งเดียวทำแบบนั้นไม่ได้',
   },
   {
-    q: 'ใน Operator reconciliation loop หลังจาก controller diff desired state กับ real state แล้วจะเกิดอะไรขึ้น',
+    q: '```text\n$ kubectl explain widget\nVERSION:    v2\n$ kubectl get widgets\nNAME    SIZE\ngizmo   medium\n```\nv1 (storage: true) ประกาศ printer column 3 คอลัมน์ v2 (storage: false) ประกาศแค่ 1 คอลัมน์ ทำไม kubectl get widgets ถึงโชว์แค่ SIZE',
     options: [
-      'จะลบ custom resource ทุกครั้ง',
-      'ถ้า real state ไม่ตรงกับ spec จะ act เพื่อแก้ส่วนต่าง ถ้าตรงแล้วก็ไม่ทำอะไรใน cycle นั้น',
-      'จะ restart API server ทันที',
-      'รอให้มนุษย์อนุมัติทุกการเปลี่ยนแปลงด้วยมือ',
+      'kubectl ใช้ storage version สำหรับ discovery เสมอ',
+      'kubectl resolve ไปที่ v2 ด้วยลำดับความสำคัญตามตัวเลข ซึ่งไม่เกี่ยวกับว่า version ไหนถูก mark storage: true',
+      'นี่คือ bug ควรใช้ storage version เสมอ',
+      'printer column ถูก cache ไว้แบบเก่า',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: kubectl explain widget เองรายงาน VERSION: v2 ทั้งที่ v1 เป็น storage:true ยืนยันว่า resolve ตามลำดับความสำคัญของ version ไม่ใช่ตาม storage version',
+  },
+  {
+    q: '```text\n$ kubectl get crd widgets.example.com -o jsonpath=\'{.status.storedVersions}\'\n["v1","v2"]\n```\nหลัง flip storage เป็น v2 และ rewrite object ที่มีอยู่ตัวเดียวแล้ว storedVersions ยัง list v1 อยู่ นี่พิสูจน์อะไร',
+    options: [
+      'การ rewrite fail แบบเงียบ ๆ',
+      'storedVersions ไม่ถูก control plane update ให้อัตโนมัติ — ต้องยืนยันและ patch เองด้วยมือเมื่อไม่มี object เหลืออยู่ใน version เก่าแล้ว',
+      'object v1 migrate ไป v2 ไม่ได้เลย',
+      'นี่คือ display bug ใน kubectl',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: ต้องใช้ kubectl patch --subresource=status ด้วยมือถึงจะลบ v1 ออกจาก storedVersions ได้ แม้หลัง rewrite แล้วก็ตาม',
+  },
+  {
+    q: 'ความต่างจริงระหว่าง conversion.strategy: None กับ conversion.strategy: Webhook คืออะไร',
+    options: [
+      'None เร็วกว่าแต่ทำงานเหมือน Webhook ทุกกรณี',
+      'None แค่เปลี่ยน label apiVersion และต้องการให้ทุก version ที่ served share schema เดียวกันเป๊ะ ส่วน Webhook รัน conversion logic จริงสำหรับ version ที่ schema ต่างกันจริง',
+      'Webhook ถูก deprecated ไปแล้วเปลี่ยนมาใช้ None แทน',
+      'None ต้องมี webhook server รันอยู่ ส่วน Webhook ไม่ต้องมี',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: None round-trip gizmo ระหว่าง v1/v2 ได้ถูกต้องเพราะทั้งคู่ share รูปแบบ spec.size เดียวกัน — field rename จริงจะต้องใช้ Webhook แทน',
   },
 ];
 

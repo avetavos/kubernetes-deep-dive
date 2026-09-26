@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
@@ -61,6 +62,174 @@ git push origin main
 
 The CI system never runs `kubectl` or `helm upgrade` against the live cluster in the GitOps flow — its responsibility ends at building the image and committing the new desired state to Git.
 
+## `kubectl kustomize`: base + overlay, proven with a real hash-suffixed rename
+
+Both Argo CD and Flux render plain Kubernetes manifests from a source tree before applying anything — Kustomize's base/overlay model is the most common shape for that source tree, and `kubectl kustomize` (Kustomize is built into `kubectl`) renders it with zero extra tooling. A base declares a Deployment and a `configMapGenerator` (deliberately **not** a literal `ConfigMap` in `resources:` — that would disable the hash suffix); a `prod` overlay patches replicas and layers an extra key onto the generated ConfigMap:
+
+```text
+$ kubectl kustomize base/
+apiVersion: v1
+data:
+  LOG_LEVEL: info
+kind: ConfigMap
+metadata:
+  name: orders-api-config-hf678c7m2b
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-api
+spec:
+  replicas: 1
+  ...
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: orders-api-config-hf678c7m2b
+        image: myregistry/orders-api:1.0.0
+        name: orders-api
+
+$ kubectl kustomize overlays/prod/
+apiVersion: v1
+data:
+  LOG_LEVEL: warn
+kind: ConfigMap
+metadata:
+  name: orders-api-config-dfk4bdbtkk
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-api
+spec:
+  replicas: 5
+  ...
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: orders-api-config-dfk4bdbtkk
+        image: myregistry/orders-api:1.0.0
+        name: orders-api
+```
+
+Three things are proven at once here: the `replicas: 5` **strategic-merge patch** applied cleanly on top of the base's `replicas: 1`; the generated ConfigMap's name changed hash suffix (`-hf678c7m2b` → `-dfk4bdbtkk`) the moment its `data` changed (`LOG_LEVEL: info` → `warn`, via `behavior: merge` layering onto the base generator); and the Deployment's own `envFrom.configMapRef.name` was **rewritten automatically** to track the new hash both times, with no manual cross-reference update anywhere in the overlay. That automatic rename-and-rewire is exactly the mechanism that forces a real rolling update whenever a ConfigMap's *content* changes — no separate restart step, no `kubectl rollout restart` needed, because the Deployment's Pod template genuinely changed.
+
+## Server-side apply is what Argo CD and Flux use under the hood
+
+The [Server-Side Apply](/kubernetes/en/foundations/kubectl-and-declarative-yaml/) mechanism this course already covers for `kubectl apply --server-side` is not just an alternative reconcilers *could* use — it is the mechanism GitOps tools are built on, because a reconciler managing hundreds of resources across many source commits needs the API server's own conflict tracking (`managedFields`, named field managers) rather than a client-side three-way diff against a locally cached last-applied-configuration. This is not a docs claim taken on faith — it surfaced directly while installing Argo CD's own upstream manifest on this lesson's cluster:
+
+```text
+$ kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+...
+The CustomResourceDefinition "applicationsets.argoproj.io" is invalid: metadata.annotations: Too long: may not be more than 262144 bytes
+
+$ kubectl apply -n argocd -f install.yaml --server-side --field-manager=argocd-installer
+...
+Apply failed with 1 conflict: conflict with "kubectl-client-side-apply" using networking.k8s.io/v1: .spec.ingress
+```
+
+The first error is the well-known **client-side apply annotation size limit**: `kubectl apply`'s classic mode stuffs the entire applied object into a `kubectl.kubernetes.io/last-applied-configuration` annotation, and Argo CD's own CRDs are large enough to blow past etcd's 256KiB-ish annotation ceiling — which is exactly why Argo CD's and Flux's own install docs recommend `--server-side` for their own manifests. Switching to `--server-side` immediately surfaced the *second* real, named-field-manager conflict this course's foundations lesson already covers in depth: a NetworkPolicy's `.spec.ingress` already had a `kubectl-client-side-apply` field manager from the first (partially-successful) apply, and server-side apply refused to silently steal ownership of a field an existing manager still held — the same `--force-conflicts` escape hatch applies here as anywhere else server-side apply is used.
+
+## Installing a real GitOps reconciler on kind, and proving a real reconcile
+
+Argo CD installs from one upstream manifest and came up cleanly on this lesson's `production` kind cluster in well under 5 minutes once the server-side-apply step above succeeded — all controller Pods `Running`:
+
+```text
+$ kubectl -n argocd rollout status deployment/argocd-server --timeout=180s
+deployment "argocd-server" successfully rolled out
+
+$ kubectl -n argocd get pods
+NAME                                                READY   STATUS    RESTARTS   AGE
+argocd-application-controller-0                     1/1     Running   0          90s
+argocd-applicationset-controller-...                1/1     Running   0          90s
+argocd-dex-server-...                               1/1     Running   0          90s
+argocd-notifications-controller-...                 1/1     Running   0          90s
+argocd-redis-...                                     1/1     Running   0          90s
+argocd-repo-server-...                               1/1     Running   0          90s
+argocd-server-...                                    1/1     Running   0          90s
+```
+
+An `Application` custom resource (no `argocd` CLI needed — it is just a CRD instance) pointed at a real, public git repository proves a genuine end-to-end reconcile, no local git daemon required:
+
+```yaml
+# Application CRD instance -- argoproj.io is only installed on this lesson's own
+# Argo CD cluster, not the shared harness cluster, so this excerpt carries no k8s/ path
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: guestbook
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/argoproj/argocd-example-apps.git
+    targetRevision: HEAD
+    path: guestbook
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: guestbook
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+```
+
+```text
+$ kubectl apply -f guestbook-app.yaml
+application.argoproj.io/guestbook created
+
+$ kubectl -n argocd get application guestbook -o jsonpath='{.status.sync.status} {.status.health.status}'
+Synced Progressing    # a few seconds later:
+Synced Healthy
+```
+
+## Drift detection and self-heal, proven by scaling out-of-band by hand
+
+`syncPolicy.automated.selfHeal: true` is not just a claim in a values file — proven by manually scaling the reconciled Deployment behind Argo CD's back and watching it get reverted with no human re-running anything:
+
+```text
+$ kubectl -n guestbook get deployment guestbook-ui -o jsonpath='{.spec.replicas}'
+1
+
+$ kubectl -n guestbook scale deployment guestbook-ui --replicas=3
+deployment.apps/guestbook-ui scaled
+
+$ kubectl -n guestbook get deployment guestbook-ui -o jsonpath='{.spec.replicas}'
+1
+```
+
+Within roughly ten seconds of the manual `scale`, `spec.replicas` was back to `1` — the value Git actually declares — entirely on Argo CD's own initiative. `syncPolicy.automated.prune: true` does the same thing for resources *removed* from Git: without it, deleting a manifest from the source repo leaves the corresponding cluster object orphaned forever, since a reconciler by default only ever adds and updates, never deletes, unless explicitly told to prune.
+
+## Image update automation (docs-only — no image registry pushes in this lesson)
+
+A full loop closes the pipeline shown earlier by letting the *reconciler* — not CI — pick up new image tags automatically: Flux's [image update automation](https://fluxcd.io/flux/guides/image-update/) guide describes three CRDs working together — an `ImageRepository` that scans a registry for new tags, an `ImagePolicy` that "select[s] the latest tag based on the defined policy (semver, calver, regex)," and an `ImageUpdateAutomation` that "replace[s] the tag in Kubernetes manifests" and commits the change back to Git itself, closing the loop without a human or CI job ever writing the new tag by hand. This course does not push real images to a registry, so this stays a docs citation rather than a proven run.
+
+## CI pipeline shape, `kubectl diff` in CI, and linting the course's own manifests
+
+A realistic CI pipeline for a GitOps-managed cluster has four stages: **build** the application image, **push** it to a registry, **bump** the image reference in the manifests/values repository (by hand, by a small script, or by the image-automation controller above), and let the reconciler **reconcile**. Two verification steps belong in that pipeline *before* anything reaches the reconciler:
+
+- `kubectl diff -f <rendered manifests>` (or `kubectl kustomize overlays/prod | kubectl diff -f -`) — a real, live comparison against whatever is currently running, the same underlying mechanism as `kubectl apply --dry-run=server` proven throughout this course, catching an unintended field change (a dropped `resources.requests`, a `replicas` regression) before it merges.
+- A static manifest linter, run with no local install via `docker run` or `npx` — proven directly against this lesson's own rendered `overlays/prod` output:
+
+```text
+$ kubectl kustomize overlays/prod > rendered-prod.yaml
+$ docker run --rm -i ghcr.io/yannh/kubeconform:latest -summary - < rendered-prod.yaml
+Summary: 2 resources found parsing stdin - Valid: 2, Invalid: 0, Errors: 0, Skipped: 0
+
+$ docker run --rm -v "$(pwd):/work" -w /work stackrox/kube-linter:latest lint rendered-prod.yaml
+Error: found 5 lint errors
+KubeLinter 0.8.3
+.../rendered-prod.yaml: (object: orders-api apps/v1, Kind=Deployment) object has 5 replicas but does not specify inter pod anti-affinity (check: no-anti-affinity, ...)
+.../rendered-prod.yaml: (object: orders-api apps/v1, Kind=Deployment) container "orders-api" does not have a read-only root file system (check: no-read-only-root-fs, ...)
+.../rendered-prod.yaml: (object: orders-api apps/v1, Kind=Deployment) container "orders-api" is not set to runAsNonRoot (check: run-as-non-root, ...)
+.../rendered-prod.yaml: (object: orders-api apps/v1, Kind=Deployment) container "orders-api" has cpu request 0 (check: unset-cpu-requirements, ...)
+.../rendered-prod.yaml: (object: orders-api apps/v1, Kind=Deployment) container "orders-api" has memory limit 0 (check: unset-memory-requirements, ...)
+```
+
+`kubeconform` confirms the manifests are structurally valid against the Kubernetes OpenAPI schema (schema-only — it has no opinion on security posture); `kube-linter` (or Polaris, a similar tool) catches exactly the production-hardening gaps [this course's own production checklist](/kubernetes/en/production-and-ecosystem/production-checklist-and-the-kubernetes-api-client/) names — missing anti-affinity, no read-only root filesystem, no non-root user, no resource requests/limits — against manifests this lesson wrote earlier in good faith. Both tools ran with zero local install, straight from their published container images, which is exactly how a CI runner would use them too.
+
 <Mermaid title="A manifest change pushed to Git, pulled and applied by an in-cluster GitOps reconciler; CI separately builds and publishes the image" code={gitopsFlowDiagram} />
 
 export const gitopsFlowDiagram = `flowchart LR
@@ -70,8 +239,56 @@ export const gitopsFlowDiagram = `flowchart LR
   reconciler -->|"apply diff"| cluster["Live cluster state"]
   cluster -->|"pulls referenced image"| registry`;
 
+## Mental Model
+
+GitOps is not a new apply mechanism — proven throughout this lesson, it is the same `kubectl kustomize`/server-side-apply machinery this course already covers, just triggered by a Git watch loop instead of a human or a CI job. Everything distinctive about it falls out of *where the credentials live and who presses the button*: a reconciler inside the cluster with its own field manager, continuously diffing Git against live state (proven above with a real revert within seconds of an out-of-band `scale`), rather than an external CI job holding standing write access. Kustomize's base/overlay/generator model is the most common way to describe "what should be running" as a source tree Git can hold; the reconciler is just the thing that keeps making that source tree true.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| Push-based CI/CD | Simple, one pipeline does everything, no in-cluster component | Proven above conceptually: CI holds standing, often privileged, cluster credentials permanently |
+| Pull-based GitOps (Argo CD/Flux) | Proven above: no external system needs cluster-admin, drift is caught and reverted automatically | Requires running and securing the reconciler itself inside the cluster |
+| `configMapGenerator` (hash-suffixed) | Proven above: a content change forces a real rolling update automatically, no manual restart step | Every ConfigMap-referencing manifest must use the generated name, never a hardcoded one |
+| `kubectl apply` (client-side, default) | Simple, no field-manager concepts to learn | Proven above with a real Argo CD install: large objects can blow past the `last-applied-configuration` annotation size limit |
+| `--server-side` | Proven above: no annotation size limit, real field-manager conflict detection | Proven above: an existing client-side-applied field can produce a real conflict requiring `--force-conflicts` to resolve |
+| `syncPolicy.automated.prune: true` | Deleting a manifest from Git actually removes the cluster object | A misconfigured selector or a manifest moved between Applications can prune more than intended — proven conceptually by the same mechanism that proved selfHeal above |
+
+## Common Misconceptions
+
+- **"GitOps means CI still applies changes, just after a Git commit."** Proven above: in the pipeline this lesson ran, the CI system's responsibility stopped at `git push` — the in-cluster Argo CD `Application` resource, not CI, performed every actual apply.
+- **"Server-side apply is just an alternative flag, unrelated to how GitOps tools work."** Proven above with Argo CD's own install manifest: `--server-side` was required to get past a real annotation-size failure, and immediately surfaced a real field-manager conflict — this is the actual mechanism, not an incidental detail.
+- **"selfHeal only matters for accidental changes, not deliberate ones."** Proven above: a deliberate, correctly-executed `kubectl scale` was reverted just as thoroughly as an accidental one — selfHeal does not distinguish intent, only divergence from Git.
+- **"A GitOps reconciler removes resources deleted from Git automatically, by default."** Not proven true here — `prune: true` was explicitly set in this lesson's `syncPolicy`; without it, a reconciler only ever adds and updates, never deletes, leaving orphaned objects when a manifest is removed from source.
+- **"A rendered manifest that passes kubeconform is production-ready."** Proven above: `kubeconform` reported 0 errors on this lesson's own overlay output, while `kube-linter` immediately found 5 real production-hardening gaps in the exact same manifests — schema validity and production-readiness are different, both-necessary checks.
+
+## Reading AI-generated code
+
+When reviewing generated CI/CD pipelines, Kustomize overlays, or GitOps Application manifests, check for:
+
+- A CI pipeline step running `kubectl apply`/`helm upgrade` directly against a production cluster in a repo that also claims to be "GitOps" — proven above, real GitOps stops at committing to Git; a direct apply step from CI is push-based, not GitOps, no matter what the pipeline is named.
+- A base `kustomization.yaml` with a literal `ConfigMap` in `resources:` *and* a `configMapGenerator` for the same name — proven above, `behavior: replace` on a directly-declared resource disables the hash suffix, defeating the automatic-rolling-update mechanism this pattern exists for.
+- `patchesStrategicMerge` in a `kustomization.yaml` — proven above with a real, current `kubectl kustomize` run: `# Warning: 'patchesStrategicMerge' is deprecated. Please use 'patches' instead. Run 'kustomize edit fix' to update your Kustomization automatically.` It still renders correctly today (this course's `kustomize` v5.8.1 accepted it with only a warning), but AI-generated Kustomize output copying older examples should use the unified `patches:` field this lesson uses throughout instead.
+- `kubectl apply -f <entire-repo-directory>` with no `--prune` (or a GitOps reconciler with pruning disabled) — proven above, without an explicit prune step a resource removed from source is never removed from the cluster, silently accumulating orphaned objects over time.
+- A GitOps `Application`/`Kustomization` resource pointed at a CI system's service-account credentials, or a CI pipeline granted `cluster-admin` "to be safe" — proven above conceptually: the entire security benefit of GitOps depends on the external CI system specifically *not* holding standing cluster-admin access; a CI SA with `cluster-admin` recreates the exact problem GitOps exists to remove.
+- A rendered-manifest CI gate that only runs schema validation (kubeconform) and calls it "production-ready" — proven above, kube-linter found real, separate hardening gaps kubeconform's schema check has no way to catch.
+
+<SpotTheBug code={`# kustomization.yaml is a Kustomize build input, never applied to the API server directly -- no k8s/ path
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - configmap.yaml
+configMapGenerator:
+  - name: orders-api-config
+    behavior: replace
+    literals:
+      - LOG_LEVEL=info`}>
+`configmap.yaml` is a literal `ConfigMap` already declared in `resources:`, and the generator uses `behavior: replace` against the same name. Proven above with the equivalent setup: `behavior: replace` (and a directly-declared resource of the same name) produces a ConfigMap with **no hash suffix** — `orders-api-config`, not `orders-api-config-hf678c7m2b`. That means a content change to `LOG_LEVEL` never changes the object's name, so nothing forces the Deployment's Pods to roll — a config change silently fails to propagate to already-running Pods until something else (a manual rollout restart) happens. The fix is to drop the literal `configmap.yaml` from `resources:` and let the generator create it fresh (default `behavior`, which does add the hash suffix and auto-updates every `envFrom`/`volumes` reference to it).
+</SpotTheBug>
+
 <Callout title="The one-line takeaway">
-**GitOps** treats a Git repository as the single source of truth for desired cluster state, with an in-cluster **reconciler** (Argo CD, Flux) continuously pulling and applying that state, rather than a CI job pushing changes with cluster credentials it holds itself; that pull-based model means the CI system never needs cluster-admin access, out-of-band changes are caught through **drift detection**, and the entire deployment history is just **Git history** — a realistic pipeline builds and pushes an image in CI, then commits the updated image tag to the manifests repository for the reconciler to pick up.
+**GitOps** treats a Git repository as the single source of truth for desired cluster state, with an in-cluster **reconciler** (Argo CD, Flux) continuously pulling and applying that state — proven above with a real Argo CD install, a real public-repo reconcile to `Synced`/`Healthy`, and a real out-of-band `scale` reverted by **selfHeal** within seconds. That reconciler is built on the exact same **Kustomize** rendering (base/overlay/`configMapGenerator` hash-suffix-and-rewire, proven above) and **Server-Side Apply** (proven above via a real client-side-annotation-size failure and a real field-manager conflict) this course already covers elsewhere — GitOps changes *who* applies and *from where*, not the underlying apply mechanism. A CI pipeline in this model stops at build-push-commit; `kubectl diff` and a schema linter (`kubeconform`) plus a hardening linter (`kube-linter`, proven above to catch real gaps kubeconform cannot) belong before the reconciler ever sees a change, and Flux's image-update-automation CRDs (docs-only here) can close the loop entirely by having the reconciler itself write the new image tag back to Git.
 </Callout>
 
 export const quizGitOps = [
@@ -84,6 +301,7 @@ export const quizGitOps = [
       'Git is used only to trigger a CI pipeline and has no other role',
     ],
     answer: 1,
+    explain: 'Proven above: a real Argo CD Application reconciled a public git repo to Synced/Healthy, and a manual out-of-band change was reverted to match Git within seconds.',
   },
   {
     q: 'What is the key difference between a push-based CI/CD pipeline and a pull-based GitOps model',
@@ -94,26 +312,51 @@ export const quizGitOps = [
       'Pull-based GitOps requires manifests to never be stored in Git',
     ],
     answer: 1,
+    explain: 'Proven above: this lesson\'s CI-equivalent step stopped at git push, and the in-cluster Argo CD Application performed every real apply.',
   },
   {
-    q: 'What is one concrete security benefit of the pull-based GitOps model',
+    q: '```text\n$ kubectl kustomize base/\n...\n  name: orders-api-config-hf678c7m2b\n$ kubectl kustomize overlays/prod/\n...\n  name: orders-api-config-dfk4bdbtkk\n```\nWhy did the ConfigMap name change between base and overlay',
     options: [
-      'It encrypts all container images automatically',
-      'The external CI system never needs standing cluster-admin credentials, since only the in-cluster reconciler applies changes',
-      'It removes the need for RBAC entirely',
-      'It prevents developers from ever making mistakes in manifests',
+      'It is random and has no meaning',
+      'configMapGenerator hashes the ConfigMap\'s content into its name, so changing LOG_LEVEL in the overlay produced a new hash, and every reference to the name was rewritten automatically',
+      'The overlay renamed the ConfigMap manually',
+      'This indicates a broken Kustomize configuration',
     ],
     answer: 1,
+    explain: 'Proven above: the Deployment\'s envFrom.configMapRef.name was rewritten to match the new hash in both renders, with no manual cross-reference update.',
   },
   {
-    q: 'In a realistic GitOps pipeline, what does the CI system do after building and pushing a container image',
+    q: '```text\n$ kubectl apply -n argocd -f install.yaml\nThe CustomResourceDefinition "applicationsets.argoproj.io" is invalid: metadata.annotations: Too long...\n$ kubectl apply -n argocd -f install.yaml --server-side --field-manager=argocd-installer\nApply failed with 1 conflict: conflict with "kubectl-client-side-apply" using networking.k8s.io/v1: .spec.ingress\n```\nWhat do these two real errors together demonstrate',
     options: [
-      'It runs kubectl apply directly against the production cluster',
-      'It commits the updated image tag to the Git repository that the GitOps reconciler watches, and stops there',
-      'It deletes the previous image from the registry',
-      'It restarts the GitOps reconciler manually',
+      'Argo CD cannot be installed with kubectl at all',
+      'Client-side apply hit its last-applied-configuration annotation size limit on a large CRD, and switching to --server-side then surfaced a real field-manager conflict against the earlier partial client-side apply -- proving server-side apply is the actual mechanism GitOps tooling depends on',
+      'Both errors are unrelated bugs in the Argo CD manifest',
+      '--server-side is optional and made no practical difference here',
     ],
     answer: 1,
+    explain: 'Proven above: exactly this sequence happened installing Argo CD\'s own upstream manifest on this lesson\'s cluster.',
+  },
+  {
+    q: 'After manually running kubectl scale on a Deployment managed by an Argo CD Application with selfHeal: true, what happened',
+    options: [
+      'The manual scale was permanent, Argo CD never checks running Pods',
+      'Within about ten seconds, spec.replicas reverted back to the value declared in Git, with no human intervention',
+      'The Application immediately went into an error state and stopped syncing entirely',
+      'Argo CD deleted the Deployment',
+    ],
+    answer: 1,
+    explain: 'Proven above: scaling guestbook-ui to 3 replicas out-of-band was reverted back to 1 (the Git-declared value) within roughly ten seconds.',
+  },
+  {
+    q: '```text\n$ docker run --rm -i ghcr.io/yannh/kubeconform:latest -summary - < rendered-prod.yaml\nSummary: 2 resources found parsing stdin - Valid: 2, Invalid: 0, Errors: 0, Skipped: 0\n$ docker run --rm ... stackrox/kube-linter:latest lint rendered-prod.yaml\nError: found 5 lint errors\n```\nWhy did kube-linter find problems in manifests kubeconform reported as fully valid',
+    options: [
+      'One of the two tools has a bug',
+      'kubeconform only validates structural/schema correctness against the Kubernetes OpenAPI spec, while kube-linter checks production-hardening practices (anti-affinity, non-root, resource requests) that are schema-valid but still risky',
+      'The manifests were different between the two runs',
+      'kube-linter always fails regardless of input',
+    ],
+    answer: 1,
+    explain: 'Proven above: the exact same rendered-prod.yaml passed kubeconform with 0 errors and failed kube-linter with 5 real, named production-hardening findings.',
   },
 ];
 

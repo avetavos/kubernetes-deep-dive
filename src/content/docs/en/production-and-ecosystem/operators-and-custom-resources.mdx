@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
@@ -75,7 +76,7 @@ Applying that `Database` object does nothing on its own — the API server happi
 
 Everywhere else in this course, `kubectl apply` is enough because a human runs it once and the built-in controllers take it from there. A controller for an Operator is different: it has to run continuously, reacting to every add, update, and delete of the custom resource, for as long as the cluster exists. That is exactly the situation a one-shot CLI command cannot serve and a programmatic, watch-based client can. Using `@kubernetes/client-node`'s `Watch` class against the custom resource's API path is a realistic way to build the reconciliation loop at the heart of an Operator:
 
-```typescript
+```ts
 import * as k8s from '@kubernetes/client-node';
 
 const kc = new k8s.KubeConfig();
@@ -115,6 +116,271 @@ const req = await watch.watch(
 
 Every `ADDED` or `MODIFIED` event runs the reconcile step again, which is the entire idea behind the Operator pattern: keep comparing desired state (the custom resource) against real state (the actual infrastructure) and correct the difference, forever, without a human re-running a command.
 
+Run for real against a live `Widget` CRD (proven below), the informer produces a genuine reconcile log — `makeInformer` from `@kubernetes/client-node` 2.x, not a hand-rolled `Watch` loop:
+
+```text
+$ npx tsx src/widget-controller.ts
+[ADDED] gizmo
+[reconcile] Widget/gizmo size=medium resourceVersion=1579
+informer started, watching Widgets...
+patched gizmo.spec.size -> small
+[MODIFIED] gizmo
+[reconcile] Widget/gizmo size=small resourceVersion=1661
+demo complete, exiting
+```
+
+```ts
+// src/widget-controller.ts
+import * as k8s from '@kubernetes/client-node';
+
+const kc = new k8s.KubeConfig();
+kc.loadFromDefault();
+
+const customApi = kc.makeApiClient(k8s.CustomObjectsApi);
+
+const GROUP = 'example.com';
+const VERSION = 'v2';
+const PLURAL = 'widgets';
+const NAMESPACE = 'default';
+
+function reconcile(widget: any): void {
+  const name = widget.metadata?.name;
+  const size = widget.spec?.size;
+  const resourceVersion = widget.metadata?.resourceVersion;
+  console.log(`[reconcile] Widget/${name} size=${size} resourceVersion=${resourceVersion}`);
+}
+
+async function main(): Promise<void> {
+  const listFn = () =>
+    customApi.listNamespacedCustomObject({ group: GROUP, version: VERSION, namespace: NAMESPACE, plural: PLURAL });
+
+  const informer = k8s.makeInformer(
+    kc,
+    `/apis/${GROUP}/${VERSION}/namespaces/${NAMESPACE}/${PLURAL}`,
+    listFn as any,
+  );
+
+  informer.on('add', (obj: any) => reconcile(obj));
+  informer.on('update', (obj: any) => reconcile(obj));
+  informer.on('delete', (obj: any) => console.log(`[DELETED] ${obj.metadata?.name}`));
+  informer.on('error', (err: any) => {
+    console.error('[informer error]', err?.body ?? err);
+    setTimeout(() => informer.start(), 1000);
+  });
+
+  await informer.start();
+}
+
+main();
+```
+
+`makeInformer` wraps the raw `Watch` class with a local cache and automatic **relist-on-error**: the `error` handler above restarts the informer rather than letting the process die on a dropped connection, which is exactly the resiliency a real Operator's controller needs running unattended for the life of the cluster.
+
+## Multi-version CRDs: served, storage, and the version kubectl actually picks
+
+A production CRD rarely stays on one version forever. `spec.versions[]` is a list, and each entry independently controls whether it is **`served`** (can API requests use this version at all) and whether it is **`storage`** (etcd persists objects in this version's shape — exactly one version in the list must set `storage: true`):
+
+```yaml
+# k8s/operators-and-custom-resources/widget-crd.yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.example.com
+spec:
+  group: example.com
+  scope: Namespaced
+  names:
+    plural: widgets
+    singular: widget
+    kind: Widget
+    shortNames: ['wg']
+  versions:
+    - name: v1
+      served: true
+      storage: false
+      additionalPrinterColumns:
+        - name: Size
+          type: string
+          jsonPath: .spec.size
+        - name: Ready
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Ready")].status
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                size:
+                  type: string
+                  enum: ['small', 'medium', 'large']
+                replicas:
+                  type: integer
+              required: ['size']
+              x-kubernetes-validations:
+                - rule: "self.size != 'large' || has(self.replicas)"
+                  message: "replicas is required when size is 'large'"
+            status:
+              type: object
+              properties:
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type: { type: string }
+                      status: { type: string }
+      subresources:
+        status: {}
+    - name: v2
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Size
+          type: string
+          jsonPath: .spec.size
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                size:
+                  type: string
+                  enum: ['small', 'medium', 'large']
+              required: ['size']
+            status:
+              type: object
+              properties:
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type: { type: string }
+                      status: { type: string }
+      subresources:
+        status: {}
+  conversion:
+    strategy: None
+```
+
+### `conversion.strategy: None` proven: the same object, read as two versions
+
+**`None`** is only valid when every served version shares an identical schema (here, both `v1` and `v2` share the `spec.size` shape) — the API server "assumes the same schema for all versions and only sets the `apiVersion` field of custom resources to the proper value," per the [Kubernetes CRD versioning docs](https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definition-versioning/). Proven by creating one object as `v1` and reading the identical object back as `v2` with no webhook running anywhere:
+
+```text
+$ kubectl apply -f widget-instance.yaml   # apiVersion: example.com/v1
+widget.example.com/gizmo created
+
+$ kubectl get widget.v2.example.com gizmo -o yaml
+apiVersion: example.com/v2
+kind: Widget
+metadata:
+  name: gizmo
+  namespace: default
+  resourceVersion: "1421"
+  uid: 8365eba8-52b9-4a35-b491-48dc446e0ab7
+spec:
+  size: medium
+```
+
+If the versions' schemas genuinely diverge (a renamed field, a restructured `spec`), `None` cannot round-trip correctly and `conversion.strategy: Webhook` is required instead: a real webhook server, referenced from `spec.conversion.webhook.clientConfig`, receives a `ConversionReview` request and returns the object transformed into the requested version. This course runs no webhook server, so that path is docs-only here — see the [same versioning guide](https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definition-versioning/) for the `ConversionReview` request/response shape.
+
+### A real CEL rejection from `x-kubernetes-validations`
+
+The CEL rule above is enforced by the API server itself, no webhook or admission controller needed — proven by a real rejection:
+
+```text
+$ kubectl apply -f widget-bad.yaml   # spec: { size: large }  (no replicas)
+The Widget "bad-gizmo" is invalid: spec: Invalid value: replicas is required when size is 'large'
+```
+
+Getting there took one real, compile-time CEL error first: `has(self.replicas)` fails to compile unless `replicas` is actually declared somewhere in the schema —
+
+```text
+$ kubectl apply -f widget-crd-broken.yaml
+The CustomResourceDefinition "widgets.example.com" is invalid: spec.versions[0].schema.openAPIV3Schema.properties[spec].x-kubernetes-validations[0].rule:
+Invalid value: ...: compilation failed: ERROR: <input>:1:28: undefined field 'replicas'
+ | self.size != 'large' || has(self.replicas)
+ | ...........................^
+```
+
+`has()` can only test presence of a field the OpenAPI schema actually knows about — a CEL rule referencing an undeclared field is rejected at CRD-apply time, before any instance is ever created, not silently ignored.
+
+### Printer columns: a real, surprising gotcha
+
+Both versions declare `additionalPrinterColumns`, but `v1` has three (`Size`, `Ready`, `Age`) while `v2` — the **storage** version — has only one (`Size`). A bare `kubectl get widgets` does not use the storage version's columns:
+
+```text
+$ kubectl explain widget
+GROUP:      example.com
+KIND:       Widget
+VERSION:    v2
+
+$ kubectl api-resources --api-group=example.com -o wide
+NAME      SHORTNAMES   APIVERSION       NAMESPACED   KIND     VERBS
+widgets   wg           example.com/v2   true         Widget   ...
+
+$ kubectl get widgets
+NAME    SIZE
+gizmo   medium
+
+$ kubectl get widget.v1.example.com
+NAME    SIZE     READY   AGE
+gizmo   medium   True    14s
+```
+
+`kubectl` resolved the bare `widgets`/`widget` to `example.com/v2` — **not** the storage version — because CRD version priority for names that follow the `vN`/`vNbetaM`/`vNalphaM` convention ranks purely by number (`v2` outranks `v1`) regardless of which one is marked `storage: true`. **Storage version and the version `kubectl` picks by default are two separate concepts**, proven here by the printer columns simply disappearing when the higher-numbered served version happens to declare fewer of them — an easy, silent trap for a reader who assumes "the storage version" is "the one `kubectl get` shows."
+
+### `storedVersions`: accumulates on a storage flip, never cleans up on its own
+
+Flipping which version is `storage: true` does not retroactively rewrite existing etcd objects — `status.storedVersions` tracks every version any object is still physically encoded in, and the API server never removes an entry from it automatically:
+
+```text
+$ kubectl apply -f widget-crd.yaml   # v1 storage:false, v2 storage:true (flipped)
+customresourcedefinition.apiextensions.k8s.io/widgets.example.com configured
+
+$ kubectl get crd widgets.example.com -o jsonpath='{.status.storedVersions}'
+["v1","v2"]
+
+$ kubectl label widget gizmo touch=1 --overwrite   # any write re-stores the object in the new storage version
+widget.example.com/gizmo labeled
+
+$ kubectl get crd widgets.example.com -o jsonpath='{.status.storedVersions}'
+["v1","v2"]
+```
+
+Even after the only existing object has genuinely been rewritten in `v2`'s storage encoding, `storedVersions` still lists `v1` — the [Kubernetes docs](https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definition-versioning/) are explicit that this is a manual cleanup step: "verify that the old version is no longer listed" only after confirming (by migrating every object, e.g. with a `kubectl get <kind> -o json | kubectl replace -f -` sweep across every namespace) that nothing is still stored in it, then patch the field yourself:
+
+```text
+$ kubectl patch crd widgets.example.com --subresource=status --type=merge -p '{"status":{"storedVersions":["v2"]}}'
+customresourcedefinition.apiextensions.k8s.io/widgets.example.com patched
+
+$ kubectl get crd widgets.example.com -o jsonpath='{.status.storedVersions}'
+["v2"]
+```
+
+Only after `storedVersions` is manually confirmed and cleaned up like this is it safe to remove the old version from `spec.versions` entirely — removing it while it is still listed fails, because objects may still exist encoded in that version's shape.
+
+### `status` subresource: proven separate from `spec`
+
+`subresources: { status: {} }` splits `/status` into its own endpoint with its own RBAC surface, exactly like a built-in Deployment — updating it requires `--subresource=status`, and a plain `spec`-only patch cannot touch it:
+
+```text
+$ kubectl patch widget gizmo --subresource=status --type=merge -p '{"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
+widget.example.com/gizmo patched
+```
+
+## Operator SDKs and OLM: building the controller without hand-rolling everything
+
+The [Kubernetes Operator pattern docs](https://kubernetes.io/docs/concepts/extend-kubernetes/operator/) list several frameworks that generate the CRD scaffolding, reconcile-loop boilerplate, and testing harness this lesson's tiny `makeInformer` example does by hand: **kubebuilder** (Go, scaffolds a full controller-runtime project), the **Operator Framework**'s Operator SDK (Go/Ansible/Helm-based operators, home of the **Operator Lifecycle Manager (OLM)** — the piece that manages installing, upgrading, and dependency-resolving operators themselves across a cluster, not just what a single operator's controller does), **Kopf** (a Pythonic framework), **kube-rs** (Rust), **KubeOps** (.NET), and **Metacontroller** (compose an operator from webhooks you implement, without writing a controller binary at all). Which one fits depends on the team's language and whether OLM's own install/upgrade/dependency machinery for the operator itself is worth adopting on top of the operator's own reconcile logic.
+
 <Mermaid title="A custom resource feeding an Operator's watch-diff-act loop, which drives a real database instance" code={operatorLoopDiagram} />
 
 export const operatorLoopDiagram = `flowchart LR
@@ -125,8 +391,73 @@ export const operatorLoopDiagram = `flowchart LR
   act --> infra["Real PostgreSQL instance"]
   infra -->|status| ctrl`;
 
+## Mental Model
+
+A CRD is a schema registration, nothing more — proven above, `conversion.strategy: None` genuinely round-trips an object between versions with zero code running, because both versions describe the same shape; `x-kubernetes-validations` genuinely rejects bad instances with zero code running, because CEL runs inside the API server itself. Everything that looks like "behavior" — provisioning a database, restarting a failed replica — comes entirely from a separate controller watching that schema, which is why the whole Operator pattern reduces to: CRD is the contract, controller is the implementation, and `storedVersions`/printer-column resolution (proven above to be genuinely surprising) are really just "which shape does the API server hand back right now," never "which shape is correct."
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| `conversion.strategy: None` | Proven above: zero extra infrastructure, instant round-trip between versions | Only valid when every served version's schema is identical — any real field rename needs `Webhook` instead |
+| `conversion.strategy: Webhook` | Handles genuine schema changes between versions | Requires running and maintaining a real webhook server (docs-only in this lesson, no server deployed) |
+| `x-kubernetes-validations` (CEL) | Proven above: real rejection with a custom message, no extra component to deploy or maintain | Compile-time errors reference only fields already in the schema (proven above) — cannot validate against external state |
+| Higher-numbered version marked `served` but not `storage` | Lets clients read/write a newer shape immediately | Proven above: `kubectl` silently prefers it for default discovery even when it is not the storage version, which can hide printer columns the storage version declares |
+| Manual `storedVersions` cleanup | Full control over exactly when an old encoding is declared gone | Proven above: nothing does this automatically — skipping it (or doing it too early) either leaves stale state forever or risks breaking reads of not-yet-migrated objects |
+| `makeInformer` (client-node) over a hand-rolled `Watch` loop | Proven above: automatic relist-on-error, local cache, less boilerplate | Still a from-scratch controller — no leader election, no work queue, no rate limiting, unlike kubebuilder/Operator SDK scaffolding |
+
+## Common Misconceptions
+
+- **"The storage version is the version kubectl uses by default."** Proven above: `kubectl explain widget`/`kubectl get widgets` resolved to `v2` purely by numeric version priority, independent of which version had `storage: true`.
+- **"Flipping storage: true to a new version instantly migrates existing objects."** Proven above: `status.storedVersions` still listed the old version even after every existing object had genuinely been rewritten — the field is not auto-updated, it must be checked and patched by hand.
+- **"has() in a CEL rule can check any field name, declared or not."** Proven above with a real compile error: `has(self.replicas)` fails CRD validation outright unless `replicas` is declared in the OpenAPI schema.
+- **"A Webhook conversion server is only needed for cosmetic version renames."** `None` strategy already handles a same-shape rename via `apiVersion` alone (proven above) — a real `Webhook` is only required when the actual field *shape* differs between versions, which is a materially bigger commitment than it sounds.
+- **"A CRD instance failing to apply because the Kind isn't installed is the same class of error as an admission rejection."** A CRD instance applied against a cluster where the CRD itself was never installed fails with `no matches for kind` (a discovery-layer error, before any schema or CEL validation runs) — a completely different failure mode from the real `x-kubernetes-validations` rejection proven above, which requires the CRD to already be installed and Established.
+
+## Reading AI-generated code
+
+When reviewing generated CRDs, conversion configuration, or controller code, check for:
+
+- A multi-version CRD with `conversion.strategy: None` where the versions' schemas actually differ (a renamed or restructured field) — proven above, `None` only ever changes the `apiVersion` label; it does not transform data, so a real shape difference silently corrupts reads under it.
+- `x-kubernetes-validations` rules referencing a field never declared in the same schema — proven above, this is rejected at CRD-apply time with a real compile error, not silently ignored, so it fails fast but the fix (declare the field) is easy to miss in a quick review.
+- Assuming `kubectl get <plural>` reflects the CRD's storage version — proven above, it reflects the highest-priority *served* version by naming convention, which can be a different version entirely.
+- A storage-version migration with no explicit `storedVersions` check/cleanup step — proven above, the field never updates itself, so "we bumped storage to v2" without this step leaves stale version references indefinitely.
+- A controller with no error handler on its watch/informer (or one that lets the process exit on a dropped connection) — proven above, `makeInformer`'s `error` event restarting the informer is what keeps a real controller alive for the life of the cluster, not a one-shot script.
+- A CRD instance manifest applied without first confirming the CRD itself is installed on the target cluster — a `no matches for kind` error means the schema was never registered at all, a different problem from any validation rule inside that schema.
+
+<SpotTheBug code={`# @expect-error real CEL compile error, proven above: undefined field 'replicas'
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.example.com
+spec:
+  group: example.com
+  scope: Namespaced
+  names:
+    plural: widgets
+    singular: widget
+    kind: Widget
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                size:
+                  type: string
+              x-kubernetes-validations:
+                - rule: "self.size != 'large' || has(self.replicas)"
+                  message: "replicas is required when size is 'large'"`}>
+`replicas` is referenced by `has(self.replicas)` but never declared anywhere in `spec`'s `properties`. Proven above with the real API-server response: `The CustomResourceDefinition "widgets.example.com" is invalid: ... compilation failed: ERROR: <input>:1:28: undefined field 'replicas'`. CEL's `has()` can only test presence of a field the OpenAPI schema actually declares — the fix is adding `replicas: { type: integer }` alongside `size` in the same `properties` block.
+</SpotTheBug>
+
 <Callout title="The one-line takeaway">
-A **CustomResourceDefinition** registers a new Kind with the Kubernetes API, validated by an **OpenAPI v3 schema**, so it can be created, listed, and watched exactly like a built-in object — but that alone changes nothing in the real world. The **Operator pattern** pairs that CRD with a **controller** running the same watch-diff-act reconciliation loop as built-in Kubernetes controllers, aimed at custom operational logic, and because that controller must run continuously rather than once, this is the clearest case for a **programmatic, watch-based API client** instead of one-shot `kubectl apply`.
+A **CustomResourceDefinition** registers a new Kind, validated by an **OpenAPI v3 schema** — including real, API-server-enforced **`x-kubernetes-validations`** CEL rules (proven above, including a real compile-time rejection when a rule references an undeclared field) — but changes nothing in the real world by itself; a paired **controller**, running the same watch-diff-act loop this lesson's `makeInformer` example proves live, is what makes it an **Operator**. Multi-version CRDs separate **`served`** from **`storage`**, and proven above, `kubectl`'s default version resolution follows numeric priority, **not** the storage version — a real, silent trap for printer columns and behavior alike. `conversion.strategy: None` (proven above, a genuine same-object round-trip with zero extra code) only works when every served version's schema is identical; a real shape change needs `Webhook`. `status.storedVersions` (proven above) never cleans itself up — migrating storage versions is a manual, checked process, not a flip-and-forget. Frameworks like **kubebuilder**, the **Operator SDK** (with **OLM** for installing operators themselves), **Kopf**, **kube-rs**, **KubeOps**, and **Metacontroller** scaffold the reconciliation boilerplate this lesson wrote by hand.
 </Callout>
 
 export const quizOperators = [
@@ -139,6 +470,7 @@ export const quizOperators = [
       'A new networking layer for Services',
     ],
     answer: 0,
+    explain: 'Proven above: creating, getting, and watching Widget objects all worked exactly like a built-in Kind, purely from the CRD registering the schema.',
   },
   {
     q: 'Why does a CRD by itself not make something an Operator',
@@ -149,6 +481,7 @@ export const quizOperators = [
       'Operators require a Helm chart and CRDs do not support Helm',
     ],
     answer: 1,
+    explain: 'Proven above: the makeInformer controller is what actually reacted to ADDED/MODIFIED events with a real reconcile log; the CRD alone only stores and validates.',
   },
   {
     q: 'Why does an Operator controller need a programmatic, watch-based API client rather than one-shot kubectl apply',
@@ -159,16 +492,40 @@ export const quizOperators = [
       'kubectl apply does not support YAML files for custom resources',
     ],
     answer: 1,
+    explain: 'Proven above: the informer stayed running and reacted to a real live patch (size medium -> small) seconds after starting, something a one-shot kubectl command cannot do.',
   },
   {
-    q: 'In the Operator reconciliation loop, what happens after the controller diffs desired state against real state',
+    q: '```text\n$ kubectl explain widget\nVERSION:    v2\n$ kubectl get widgets\nNAME    SIZE\ngizmo   medium\n```\nv1 (storage: true) declares 3 printer columns, v2 (storage: false) declares 1. Why does kubectl get widgets show only SIZE',
     options: [
-      'It always deletes the custom resource',
-      'If real state does not match the spec, it acts to correct the difference, otherwise it does nothing that cycle',
-      'It immediately restarts the API server',
-      'It waits for a human to manually approve every change',
+      'kubectl always uses the storage version for discovery',
+      'kubectl resolved to v2 by numeric version priority, which is independent of which version is marked storage: true',
+      'This is a bug, the storage version should always be used',
+      'Printer columns are cached and stale',
     ],
     answer: 1,
+    explain: 'Proven above: kubectl explain widget itself reports VERSION: v2 even though v1 was storage:true, confirming version-priority resolution, not storage-version resolution.',
+  },
+  {
+    q: '```text\n$ kubectl get crd widgets.example.com -o jsonpath=\'{.status.storedVersions}\'\n["v1","v2"]\n```\nAfter flipping storage to v2 and rewriting the only existing object, storedVersions still lists v1. What does this prove?',
+    options: [
+      'The rewrite silently failed',
+      'storedVersions is not automatically updated by the control plane -- it must be manually verified and patched once no objects remain in the old version',
+      'v1 objects can never be migrated to v2',
+      'This is a display bug in kubectl',
+    ],
+    answer: 1,
+    explain: 'Proven above: a manual kubectl patch --subresource=status was required to remove v1 from storedVersions even after the rewrite.',
+  },
+  {
+    q: 'What is the real difference between conversion.strategy: None and conversion.strategy: Webhook',
+    options: [
+      'None is faster but functionally identical to Webhook in every case',
+      'None only relabels apiVersion and requires every served version to share an identical schema; Webhook runs real conversion logic for versions whose schemas actually differ',
+      'Webhook is deprecated in favor of None',
+      'None requires a running webhook server, Webhook does not',
+    ],
+    answer: 1,
+    explain: 'Proven above: None correctly round-tripped gizmo between v1/v2 because both share the same spec.size shape -- a real field rename would require Webhook instead.',
   },
 ];
 

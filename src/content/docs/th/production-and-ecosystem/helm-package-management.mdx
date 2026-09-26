@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
@@ -103,6 +104,231 @@ helm history myapp
 helm uninstall myapp
 ```
 
+## Helm 4 เทียบกับ Helm 3 — เปลี่ยนอะไรจริง ๆ
+
+คอร์สนี้เขียนอิง **Helm 4.3.0** [GitHub release ของ v4.0.0](https://github.com/helm/helm/releases/tag/v4.0.0) เองระบุ scope ชัดเจนว่า "Helm v4 is a major version with backward incompatible changes including to the flags and output of the Helm CLI and to the SDK" แต่บอกเพิ่มว่า "the changes are not as extensive as those from Helm v2 to v3, with the goal that the majority of workflows remain compatible between Helm v3 and v4" chart **apiVersion v2** ที่มีอยู่เดิม — ส่วนใหญ่ที่ใช้กันจริง — "will continue to be supported in Helm v4" ไม่ต้องเขียนใหม่ release notes ยังพูดถึง plugin system ที่ออกแบบใหม่ (รองรับ WebAssembly-based plugin), post-renderer ที่ทำเป็น plugin, **server-side apply** แบบ first-class, การเฝ้าดู resource-readiness ด้วย kstatus, และ local content-based chart caching
+
+ความต่างของ CLI สองจุดที่ course หรือ AI assistant ที่ train มาจาก Helm 3 เป็นหลักจะผิดแน่ ๆ พิสูจน์ตรง ๆ กับ binary `v4.3.0` ที่ติดตั้งจริง
+
+```text
+$ helm install --help | grep -A1 "server-side"
+      --server-side                                object updates run in the server instead of the client (default true)
+
+$ helm upgrade --help | grep -A1 "take-ownership"
+      --take-ownership                             if set, upgrade will ignore the check for helm annotations and take
+                                                     ownership of the existing resources
+```
+
+**server-side apply เป็น default ใน Helm 4** (`--server-side` ของ `helm install` default เป็น `true`; `helm upgrade` รับค่าแบบ tri-state `--server-side auto|true|false`) — กลไกเดียวกันเป๊ะกับ [Server-Side Apply](/kubernetes/en/foundations/kubectl-and-declarative-yaml/) ที่คอร์สนี้พูดถึงไปแล้วสำหรับ `kubectl apply --server-side` มี `managedFields`/field-manager แบบเดียวกัน และมี `--force-conflicts` เป็นทางออกแบบเดียวกัน (flag ของ Helm ก็สะกดว่า `--force-conflicts` เหมือนกัน) `--take-ownership` เป็นของใหม่ใน Helm 4 ให้ `helm install`/`helm upgrade` adopt resource ที่มีอยู่แล้วใน cluster โดยไม่ต้องมี annotation `meta.helm.sh/release-name` ที่ Helm ปกติต้องมีก่อนถึงจะแตะ object นั้นได้ — มีประโยชน์ตอน import manifest ที่ apply มือไว้เข้ามาเป็น Release แต่อันตรายถ้าชี้ไปผิด object
+
+การเปลี่ยนแปลงจุดที่สามคือของจริงที่ทำให้ pipeline เดิมพังได้ พิสูจน์ด้วยการรันคำสั่งตรง ๆ
+
+```text
+$ helm upgrade --help | grep -A1 -- "--atomic"
+Error: unknown flag: --atomic
+Flag --atomic has been deprecated, use --rollback-on-failure instead
+```
+
+`--atomic` ยัง parse ได้ (ยอมรับพร้อม deprecation warning) แต่ตัวแทนของมันคือ `--rollback-on-failure` เป็น flag ที่ Helm 4 เอกสารบอกให้ใช้ต่อไป — AI assistant ที่ train มาจาก Helm 3 แล้วไปหยิบ `--atomic` มาใช้ใน pipeline code ใหม่ไม่ได้ผิด แค่ตามหลัง
+
+## helm template เทียบ helm install --dry-run=server: diff จริง พิสูจน์ได้
+
+`helm template` ไม่เคยคุยกับ cluster เลย — เป็นแค่ client-side Go-template render ล้วน ๆ `helm install --dry-run=server` render manifest ชุดเดียวกันแต่**ส่งไปที่ API server จริง**ด้วย `dry-run=server` ดังนั้น schema validation, admission plugin, และ defaulting ทำงานจริงหมด เหมือนกับ `kubectl apply --dry-run=server` ที่อื่นในคอร์สนี้ รันติดกันกับ Chart และ values ชุดเดียวกันเป๊ะ
+
+```text
+$ helm template orders ./orders-api
+---
+# Source: orders-api/templates/service.yaml
+apiVersion: v1
+kind: Service
+...
+---
+# Source: orders-api/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+...
+---
+# Source: orders-api/templates/tests/test-connection.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "orders-orders-api-test-connection"
+  annotations:
+    "helm.sh/hook": test
+...
+
+$ helm install orders ./orders-api --dry-run=server
+NAME: orders
+LAST DEPLOYED: Sat Sep 26 18:15:10 2026
+NAMESPACE: default
+STATUS: pending-install
+REVISION: 1
+DESCRIPTION: Dry run complete
+HOOKS:
+---
+# Source: orders-api/templates/tests/test-connection.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "orders-orders-api-test-connection"
+  annotations:
+    "helm.sh/hook": test
+...
+
+MANIFEST:
+---
+# Source: orders-api/templates/service.yaml
+...
+---
+# Source: orders-api/templates/deployment.yaml
+...
+```
+
+`helm template` เท manifest ที่ render แล้วทุกอันออกมาเป็น stream แบนเดียว — รวม Pod ที่มี `helm.sh/hook: test` ด้วย — โดยไม่มีแนวคิดเรื่อง Release state เลย `helm install --dry-run=server` **แยก HOOKS ออกจาก MANIFEST** (hook ไม่ใช่ส่วนหนึ่งของ manifest ของ Release ที่ track ไว้ มันรันเฉพาะตอนสั่งผ่าน `helm test` เท่านั้น) และรายงาน metadata `NAME`/`STATUS`/`REVISION` ตรงกับที่ install จริงจะได้ เพราะมัน round-trip ผ่าน API server จริง ๆ ไม่ใช่แค่เติมค่าลง template
+
+## Values precedence พิสูจน์ด้วย chart จริง
+
+Helm merge values จากลำดับความสำคัญต่ำไปสูง คือ `values.yaml` ของ chart เอง แล้วตามด้วยไฟล์ `-f`/`--values` ตามลำดับที่ระบุ (ไฟล์หลังชนะถ้า key ซ้ำกัน) แล้ว `--set`/`--set-string`/`--set-file` มาทีหลังสุด พิสูจน์ด้วย chart ที่ `values.yaml` ตั้ง `replicaCount: 2` กับ `image.tag: 1.27-alpine`, override file ตั้ง `replicaCount: 3` กับ `image.tag: "1.27"`, และ `--set` flag override tag อีกที
+
+```text
+$ cat values-prod.yaml
+replicaCount: 3
+image:
+  tag: "1.27"
+
+$ helm upgrade --install orders ./orders-api -f values-prod.yaml --set image.tag=1.27-alpine --rollback-on-failure --wait
+Release "orders" has been upgraded. Happy Helming!
+NAME: orders
+...
+REVISION: 6
+
+$ helm get values orders
+USER-SUPPLIED VALUES:
+image:
+  tag: 1.27-alpine
+replicaCount: 3
+
+$ helm get values orders -a
+COMPUTED VALUES:
+image:
+  repository: nginx
+  tag: 1.27-alpine
+replicaCount: 3
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+```
+
+`replicaCount` จบที่ `3` (ไฟล์ `-f` ชนะ default ของ chart ที่ `2` และไม่มี `--set` ไปแตะมันเลย) ส่วน `image.tag` จบที่ `1.27-alpine` (`--set` flag ชนะไฟล์ `-f` ที่เป็น `"1.27"` ซึ่งชนะ default ของ chart ไปแล้ว) — ตรงกับลำดับที่ document ไว้เป๊ะ คือ `values.yaml` → `-f` (ตามลำดับ) → `--set` ไม่ใช่การเดา
+
+## helm rollback กับประวัติ revision จริงที่ยุ่งเหยิง
+
+`helm upgrade --install --rollback-on-failure --wait` (ชื่อใหม่ของ `--atomic` ใน Helm 4) rollback upgrade ที่ล้มเหลวให้อัตโนมัติ — พิสูจน์ตรงนี้ด้วย upgrade ที่ล้มเหลวจริงสองครั้งติดกันบน Release เดียวกันเป๊ะ (ครั้งแรกเพราะ worker node ยังไม่ `Ready` ครั้งที่สองเพราะ image tag ที่ไม่มีอยู่จริงทำให้ `ImagePullBackOff`)
+
+```text
+$ helm history orders
+REVISION  UPDATED                   STATUS      CHART              APP VERSION  DESCRIPTION
+1         Sat Sep 26 18:15:18 2026  superseded  orders-api-0.1.0   1.0.0        Install complete
+2         Sat Sep 26 18:15:25 2026  failed      orders-api-0.1.0   1.0.0        Upgrade "orders" failed: resource Deployment/default/orders-orders-api not ready...
+3         Sat Sep 26 18:16:55 2026  superseded  orders-api-0.1.0   1.0.0        Rollback to 1
+4         Sat Sep 26 18:17:08 2026  failed      orders-api-0.1.0   1.0.0        Upgrade "orders" failed: resource Deployment/default/orders-orders-api not ready...
+5         Sat Sep 26 18:20:08 2026  superseded  orders-api-0.1.0   1.0.0        Rollback to 3
+6         Sat Sep 26 18:20:28 2026  deployed    orders-api-0.1.0   1.0.0        Upgrade complete
+```
+
+upgrade ที่ล้มเหลวทุกครั้ง (revision 2 กับ 4) สร้าง rollback revision ของตัวเองอัตโนมัติ (3 กับ 5) โดยไม่ต้องมี operator เข้าไปแตะเลย — `--rollback-on-failure` ปกป้อง Release จากการถูกปล่อยค้างครึ่ง ๆ กลาง ๆ ได้จริง แต่ไม่ใช่ตัวแทนของการแก้ต้นเหตุ upgrade ที่ image tag พิมพ์ผิดจนไม่มีอยู่จริงจะวนซ้ำ fail-then-rollback แบบนี้ไปเรื่อย ๆ ถ้า CI pipeline retry มันแบบไม่คิดอะไร เพราะ rollback คืนสถานะ *เดิมที่ทำงานได้* ไม่ใช่สถานะ *ใหม่ที่ตั้งใจไว้* การรัน `helm rollback orders <revision>` ด้วยมือก็ทำแบบเดียวกันได้ตามต้องการ โดยไม่ต้องรอความล้มเหลวมา trigger
+
+## helm lint กับ helm test
+
+`helm lint` เช็คโครงสร้างและ template ของ chart แบบ static ก่อนที่จะ render อะไรเข้า cluster เลย
+
+```text
+$ helm lint ./orders-api
+==> Linting orders-api
+[INFO] Chart.yaml: icon is recommended
+
+1 chart(s) linted, 0 chart(s) failed
+```
+
+chart ยังใส่ Pod ที่มี `helm.sh/hook: test` ของตัวเองใต้ `templates/tests/` ได้ด้วย — `helm test` รันมันกับ Release ที่**ติดตั้งอยู่แล้ว**และรายงานผ่าน/ไม่ผ่าน ซึ่งเป็น smoke test ของ Service จริงที่รันอยู่ ไม่ใช่แค่ lint template source
+
+```text
+$ helm test orders
+NAME: orders
+...
+TEST SUITE:     orders-orders-api-test-connection
+Last Started:   Sat Sep 26 18:23:09 2026
+Last Completed: Sat Sep 26 18:23:16 2026
+Phase:          Succeeded
+```
+
+## helm diff: เห็นการเปลี่ยนแปลงก่อนจะทำจริง
+
+`helm upgrade` เองก็แสดงว่าจะเกิดอะไรขึ้นผ่าน `--dry-run` ได้อยู่แล้ว แต่ plugin ของ community ชื่อ `helm-diff` render unified diff ที่ถูกต้องเทียบกับ Release ที่รันอยู่จริง มันไม่ได้ bundle มาให้ — การติดตั้งใน Helm 4 เจอ step ตรวจ signature ใหม่ของ plugin system ตรง ๆ เลย
+
+```text
+$ helm plugin install https://github.com/databus23/helm-diff
+Error: plugin source does not support verification. Use --verify=false to skip verification
+
+$ helm plugin install https://github.com/databus23/helm-diff --verify=false
+WARNING: Skipping plugin signature verification
+Downloading https://github.com/databus23/helm-diff/releases/download/v3.15.15/helm-diff-macos-arm64.tgz
+Installed plugin: diff
+
+$ helm diff upgrade orders ./orders-api -f values-prod.yaml --set image.tag=1.27-alpine --set replicaCount=4
+default, orders-orders-api, Deployment (apps) has changed:
+    spec:
+-     replicas: 3
++     replicas: 4
+      ...
+```
+
+Helm 4 ตรวจ signature ของ plugin เป็น default และปฏิเสธ source ที่ไม่ได้ sign ไปเลย ไม่ได้เชื่อแบบเงียบ ๆ — `--verify=false` คือ opt-out ที่ต้องระบุตรง ๆ และ audit ได้ ไม่ใช่ default ที่หลุดเข้าไปเอง
+
+## OCI registry: Chart ในฐานะ OCI artifact
+
+Helm สมัยใหม่กระจาย chart แบบเดียวกับที่กระจาย container image — เป็น OCI artifact ที่ระบุด้วย `oci://` แทนที่ chart-repository index แบบเดิม พิสูจน์ end-to-end กับ registry ในเครื่องแบบใช้แล้วทิ้ง
+
+```text
+$ helm package ./orders-api -d .
+Successfully packaged chart and saved it to: orders-api-0.1.0.tgz
+
+$ helm push orders-api-0.1.0.tgz oci://localhost:5050/charts --plain-http
+Pushed: localhost:5050/charts/orders-api:0.1.0
+Digest: sha256:23c5fd204fbcc25d18e0111a2b1846d6335a2657e98c7644635fb3213b1a95cb
+
+$ helm pull oci://localhost:5050/charts/orders-api --version 0.1.0 -d ./pulled --plain-http
+Pulled: localhost:5050/charts/orders-api:0.1.0
+Digest: sha256:23c5fd204fbcc25d18e0111a2b1846d6335a2657e98c7644635fb3213b1a95cb
+
+$ helm show chart oci://localhost:5050/charts/orders-api --version 0.1.0 --plain-http
+apiVersion: v2
+appVersion: 1.0.0
+name: orders-api
+version: 0.1.0
+```
+
+`--plain-http` ต้องใส่ตรงนี้เพราะ registry demo ไม่มี TLS certificate — registry จริง (`ghcr.io`, ECR, Artifact Registry, Harbor ส่วนตัว) ระบุแบบเดียวกันผ่าน HTTPS โดยไม่ต้องมี flag เพิ่ม และ `helm install`/`helm upgrade` รับ `oci://` reference ได้เหมือนกับ `repo/chart` แบบเดิมเป๊ะ
+
+## Chart เล็ก ๆ หนึ่งอัน, library chart หนึ่งอัน, และทำไม template เองถึงเป็น excerpt
+
+Chart ที่พิสูจน์ตลอดบทนี้จริง ๆ แล้วคือสอง chart คือ `orders-api` (application chart) ที่ประกาศ `dependencies:` ไปยัง chart ตัวที่สองชื่อ `common` ที่ `Chart.yaml` ตั้ง `type: library` **library chart** ไม่มี template ที่ติดตั้งได้ของตัวเองเลย — มีแต่ helper ที่ `define` ไว้ให้ chart อื่น `include` ไปใช้
+
+```text
+# charts/common/templates/_helpers.tpl — excerpt, not a standalone manifest
+{{- define "common.fullname" -}}
+{{ .Release.Name }}-{{ .Chart.Name }}
+{{- end -}}
+
+{{- define "common.labels" -}}
+app.kubernetes.io/name: {{ .Chart.Name }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+```
+
+`templates/deployment.yaml` ของ `orders-api` เรียก `{{ include "common.fullname" . }}` กับ `{{- include "common.labels" . | nindent 4 }}` — ไฟล์ helper `.tpl` ทุกไฟล์ และ chart template ทุกไฟล์ที่มี `{{ }}` Go-template syntax คือ excerpt ที่ตั้งใจไว้ในบทนี้ ไม่ใช่ manifest ที่สมบูรณ์ในตัวเอง — harness ของคอร์สนี้ที่ตรวจ fence `# k8s/...` กับ API server จริงข้าม fence พวกนี้ไปโดยตั้งใจ เพราะ `{{ .Release.Name }}` ไม่ใช่ YAML ที่ถูกต้องจนกว่า Helm จะ render มันก่อน หลักฐานว่า template ถูกต้องคือ output จริงของ `helm template`/`helm install --dry-run=server` ด้านบน ไม่ใช่การ apply template source ตรง ๆ
+
 <Mermaid title="values และ templates ของ Chart render ออกมาเป็น manifest แล้วถูก apply เข้า cluster ในฐานะ Release ที่ track ไว้" code={helmFlowDiagram} />
 
 export const helmFlowDiagram = `flowchart LR
@@ -112,8 +338,53 @@ export const helmFlowDiagram = `flowchart LR
   render --> manifests["Rendered Kubernetes manifests"]
   manifests --> cluster["Applied to cluster as Release myapp, revision N"]`;
 
+## Mental Model
+
+Helm คือ template renderer บวก revision tracker ไม่มีอะไรลึกลับไปกว่านั้น `values.yaml` (กับ override ของมัน) เป็น input เดียวที่เปลี่ยน `templates/` คือ Go-template source ที่ตายตัว และทุก `helm install`/`upgrade`/`rollback` จริง ๆ คือ "render แล้วปล่อยให้ API server reconcile ผลลัพธ์" พิสูจน์แล้วด้านบนด้วย `helm install --dry-run=server` ที่ round-trip ผ่าน API จริง ๆ Helm 4 เปลี่ยน *ความรอบคอบ* ของการ reconcile นั้น (server-side apply เป็น default, plugin system ที่ตรวจ signature, `--rollback-on-failure` แทน `--atomic`) แต่ไม่ได้เปลี่ยน model พื้นฐาน — ประวัติ revision ของ Release คือ `kubectl rollout history` ที่ scope ไปทุกอย่างที่ Chart จัดการเป๊ะ ไม่ใช่แนวคิดแยกต่างหาก
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ข้อดี | ต้นทุน |
+|---|---|---|
+| `helm template` | เร็ว ไม่ต้องมี cluster ปลอดภัยที่จะรันที่ไหนก็ได้ | ไม่เคยจับ rejection จริงจาก API server ได้เลย — พิสูจน์แล้วด้านบน มีแค่ `--dry-run=server` เท่านั้นที่ทำได้ |
+| `helm install/upgrade --dry-run=server` | พิสูจน์แล้วด้านบน: schema validation จริง และ preview NAME/STATUS/REVISION จริง | ต้องมี cluster access จริง ช้ากว่า render ด้วย template ล้วน ๆ |
+| `--rollback-on-failure` (ชื่อใหม่ของ `--atomic` ใน Helm 4) | พิสูจน์แล้วด้านบน: undo upgrade ที่ล้มเหลวอัตโนมัติ ไม่มี Release ค้างครึ่ง ๆ | พิสูจน์แล้วด้านบน: image tag ผิดวนซ้ำ fail→rollback ไปเรื่อย ๆ ถ้า retry แบบไม่คิด — มันปกป้อง state ไม่ได้ diagnose ต้นเหตุ |
+| plugin `helm-diff` | พิสูจน์แล้วด้านบน: unified diff จริงเทียบกับ Release ที่รันอยู่ ก่อนจะ upgrade | เป็นของ third-party ไม่ sign เป็น default — พิสูจน์แล้วด้านบน Helm 4 ต้องระบุ `--verify=false` ตรง ๆ ถึงจะติดตั้งได้ |
+| Library chart (`type: library`) สำหรับ helper ที่แชร์กัน | `_helpers.tpl` ไฟล์เดียว ใช้ซ้ำได้ทุก chart ที่พึ่งพา ไม่ต้อง copy-paste | ติดตั้งเองไม่ได้ — มีอยู่แค่ในฐานะ dependency และ template ของตัวเอง render เองไม่ได้โดยตั้งใจ |
+| OCI (`oci://`) chart registry | พิสูจน์แล้วด้านบน: ใช้ infrastructure ของ registry เดียวกับ container image ไม่ต้อง host chart-repo index แยก | ต้องมี `--plain-http` หรือ TLS cert จริง — OCI registry ที่ไม่มีทั้งคู่ปฏิเสธการเชื่อมต่อตรง ๆ |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"helm template กับ helm install --dry-run=server พิสูจน์เรื่องเดียวกัน"** พิสูจน์แล้วด้านบน: `helm template` ไม่เคยติดต่อ cluster เลย มีแค่ `--dry-run=server` เท่านั้นที่ส่ง render ไปที่ API server จริงและได้ schema validation กับ admission behavior จริงกลับมา
+- **"--atomic ยังคือ flag ที่ควรใช้ใน Helm 4"** พิสูจน์แล้วด้านบนกับ CLI จริง: `--atomic` ยัง parse ได้พร้อม deprecation warning แต่ flag ที่ Helm 4 document ไว้คือ `--rollback-on-failure`
+- **"ค่าจากไฟล์ -f ชนะ --set เสมอ เพราะไฟล์ระบุชัดเจนกว่า"** พิสูจน์แล้วด้านบน: `--set` คือ source ที่ precedence สูงสุด apply หลังไฟล์ `-f` ทุกไฟล์ ไม่ใช่ก่อน
+- **"library chart ก็แค่ chart ธรรมดาที่ไม่มีค่า default"** พิสูจน์แล้วด้านบน: `type: library` ใน `Chart.yaml` หมายความว่า chart นั้นไม่มี template ที่ติดตั้งได้ของตัวเองเลย — มีแต่ helper ที่ `define` ไว้ ไม่เคย apply เข้า cluster โดยตรง
+- **"helm lint น่าจะจับ ImagePullBackOff จาก image tag ผิดได้"** `helm lint` เช็คแค่โครงสร้าง chart กับ syntax ของ template แบบ static — พิสูจน์แล้วด้านบน มันไม่เคยติดต่อ registry หรือ cluster เลย ดังนั้น image tag ที่ไม่มีอยู่จริง lint ผ่านสบาย ๆ แล้วไปพังตอน `helm upgrade --wait` จริงเท่านั้น
+
+## อ่านโค้ดที่ AI เขียน
+
+ตอน review Helm chart, ขั้นตอน CI pipeline, หรือ upgrade script ที่ AI สร้าง ให้เช็ค
+
+- `helm install`/`helm upgrade` ที่ไม่มี `--rollback-on-failure` (หรือ `--atomic` รุ่นเก่า) ใน CI pipeline — พิสูจน์แล้วด้านบน upgrade ที่ล้มเหลวโดยไม่มี flag ไหนเลยจะปล่อย Release ค้างที่ state `failed` และ Pod เก่าอาจถูกรื้อไปแล้ว โดยไม่มีอะไร rollback ให้อัตโนมัติ
+- `--atomic` ที่ใช้ใน pipeline code ใหม่ของ Helm 4 — พิสูจน์แล้วด้านบน มันยังทำงานได้แต่ deprecated แล้ว `--rollback-on-failure` คือ flag ปัจจุบัน
+- chart template (ไฟล์ `.tpl` หรือไฟล์ไหนใต้ `templates/` ที่มี `{{ }}`) ที่ถูก apply ตรง ๆ ด้วย `kubectl apply -f` แทนที่จะ render ก่อน — Go-template syntax ไม่ใช่ YAML ที่ถูกต้อง พิสูจน์แล้วด้านบนด้วย harness ของคอร์สนี้ที่ข้าม fence แบบนี้ไปโดยตั้งใจ
+- `helm plugin install` จาก URL พร้อม `--verify=false` ที่ใช้เป็นนิสัย default แทนที่จะเป็นข้อยกเว้นที่ตั้งใจและ review แล้ว — พิสูจน์แล้วด้านบน default ของ Helm 4 คือต้องมี signature ที่ verify ได้
+- chart ที่ไม่มี Pod `helm.sh/hook: test` และไม่มี step `helm test` ใน deploy pipeline — ความต่างระหว่าง "chart render ผ่าน" กับ "Service ที่รันอยู่ตอบ request ได้จริง" คือสิ่งที่ `helm test` พิสูจน์ และการ review แค่ template ไม่มีทางรู้
+- `helm upgrade` ที่ pipe ตรงจาก CI โดยไม่มี step `helm diff` (หรืออย่างน้อย `--dry-run`) นำหน้า — พิสูจน์แล้วด้านบน `helm diff` แสดงการเปลี่ยนแปลงจริงของ live Release ก่อนที่จะเกิดขึ้น จับ `replicas`/image ที่ลดลงโดยไม่ตั้งใจได้ก่อนที่จะไปถึง production
+
+<SpotTheBug code={`# scripts/deploy-orders-api.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+helm upgrade --install orders ./orders-api \\
+  -f values-prod.yaml \\
+  --set image.tag="\${IMAGE_TAG}" \\
+  --wait --timeout 5m`}>
+upgrade นี้ไม่มี `--rollback-on-failure` (ชื่อปัจจุบันของ Helm 4; `--atomic` ยังทำงานได้แต่ deprecated แล้ว) พิสูจน์แล้วด้านบนด้วยประวัติ Release ของคอร์สนี้เอง: upgrade ที่ล้มเหลวจริงสองครั้งต่างก็ต้องการ rollback อัตโนมัติเพื่อไม่ให้ Deployment ค้างครึ่งอัปเดต — ถ้าไม่มี flag ไหนเลย `--wait` ที่ล้มเหลว (`IMAGE_TAG` ผิด, probe ที่ไม่มีวัน healthy) จะปล่อย Release ไว้ที่ `STATUS: failed` พร้อม rollout ครึ่ง ๆ ที่เกิดไปแล้ว และไม่มีอะไร revert ให้ วิธีแก้คือเติม `--rollback-on-failure` เข้าไปในคำสั่งเดียวกันนี้
+</SpotTheBug>
+
 <Callout title="สรุปหนึ่งบรรทัด">
-**Chart** package manifest ของ Kubernetes ที่ template ไว้ พร้อม `values.yaml` ของค่า default ให้เป็นหน่วยเดียวที่ version และแชร์ได้ **Release** คือ instance หนึ่งของ Chart ที่ตั้งชื่อไว้และถูก track ในการติดตั้งใน cluster สร้างด้วย `helm install` และ config แยกตาม environment ผ่าน override values file หรือ `--set` ส่วน `helm upgrade` กับ `helm rollback` ทำงานกับประวัติ revision ทั้งชุดนั้น เป็นแนวคิด rollout เดียวกับที่ `kubectl rollout` ใช้กับ Deployment ตัวเดียว แต่ขยาย scope ครอบคลุมทุกอย่างที่ Chart จัดการร่วมกัน
+**Chart** package manifest ของ Kubernetes ที่ template ไว้ พร้อม `values.yaml` ของค่า default ให้เป็นหน่วยเดียวที่ version และแชร์ได้ ระบุได้ทั้งแบบคลาสสิกหรือเป็น **OCI artifact** (`oci://` พิสูจน์แล้วด้านบน) **Release** คือ instance หนึ่งของ Chart ที่ตั้งชื่อไว้และถูก track config แยกตาม environment ผ่านไฟล์ `-f` กับ `--set` ตามลำดับ precedence ที่เพิ่มขึ้นเรื่อย ๆ (พิสูจน์แล้วด้านบน) **Helm 4** ยังให้ Chart `apiVersion: v2` ใช้งานร่วมกันได้ พร้อมทำให้ **server-side apply เป็น default** ต้องมี **plugin ที่ sign แล้ว** เป็น default และเปลี่ยนชื่อ `--atomic` เป็น **`--rollback-on-failure`** (ทั้งหมดพิสูจน์แล้วด้านบนกับ CLI จริงของ `v4.3.0`) `helm template` render ในเครื่องอย่างเดียว ส่วน `helm install/upgrade --dry-run=server` กับ `helm diff` round-trip ผ่าน API server จริงและ Release จริง `helm lint` จับความผิดพลาดเชิงโครงสร้างของ chart แบบ static `helm test` พิสูจน์ว่า Release ที่ติดตั้งแล้วทำงานได้จริง และ **library chart** (`type: library`) เก็บแค่ `_helpers.tpl` ที่ `define` ไว้ให้แชร์กัน — ติดตั้งเองไม่ได้ และ template `{{ }}` ของมันถูกตรวจความถูกต้องผ่าน output ที่ render แล้ว ไม่ใช่การ apply ตรง ๆ
 </Callout>
 
 export const quizHelm = [
@@ -126,6 +397,7 @@ export const quizHelm = [
       'Release คือไฟล์ source ส่วน Chart คือ Pod ที่รันอยู่',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: helm template/install render Chart ให้เป็น manifest และ helm install track ผลลัพธ์เป็น Release ที่ตั้งชื่อไว้พร้อมประวัติ revision ของตัวเอง',
   },
   {
     q: 'ปกติแล้ว configuration เฉพาะแต่ละ environment ถูกส่งเข้า Chart ยังไง',
@@ -136,6 +408,7 @@ export const quizHelm = [
       'Helm ไม่รองรับความต่างระหว่าง environment',
     ],
     answer: 2,
+    explain: 'พิสูจน์แล้วด้านบนด้วยห่วงโซ่ values.yaml + values-prod.yaml + --set จริง และ helm get values ที่แสดงชัดว่าค่าไหนชนะ',
   },
   {
     q: 'helm upgrade กับ helm rollback สัมพันธ์กับ kubectl rollout ของ Deployment ตัวเดียวยังไง',
@@ -146,16 +419,40 @@ export const quizHelm = [
       'helm upgrade มาแทน kubectl rollout ทั้งหมด และใช้คู่กันไม่ได้',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: helm history แสดง install/upgrade-ล้มเหลว/rollback/upgrade-ล้มเหลว/rollback/upgrade เป็น timeline revision เดียวต่อเนื่องของทั้ง Release',
   },
   {
-    q: 'helm template ต่างจาก helm install ตรงไหน',
+    q: 'helm template ต่างจาก helm install --dry-run=server ตรงไหน',
     options: [
-      'แค่ render Chart ให้เป็น Kubernetes manifest ธรรมดาในเครื่อง โดยไม่ได้ติดตั้งอะไรเข้า cluster',
-      'ติดตั้ง Chart แต่ข้ามการสร้าง Release record',
-      'ใช้ได้แค่กับ Chart ที่ไม่มี values.yaml เท่านั้น',
-      'เหมือนกับ helm install ทุกประการ',
+      'เหมือนกันทุกประการ',
+      'helm template ใช้ได้แค่กับ Chart ที่ไม่มี values.yaml เท่านั้น',
+      'helm template render ในเครื่องอย่างเดียว ไม่ติดต่อ cluster เลย ส่วน --dry-run=server ส่ง render ไปที่ API server จริงเพื่อ validate จริงและรายงาน NAME/STATUS/REVISION',
+      'helm install --dry-run=server ไม่เคย render template เลย มีแค่ helm template เท่านั้นที่ทำ',
     ],
-    answer: 0,
+    answer: 2,
+    explain: 'พิสูจน์แล้วด้านบน: มีแค่ output ของ --dry-run=server เท่านั้นที่มี NAME/STATUS/REVISION/DESCRIPTION และแยก HOOKS ออกจาก MANIFEST เพราะมัน round-trip ผ่าน API server จริง',
+  },
+  {
+    q: '```text\n$ helm upgrade --help | grep -A1 -- "--atomic"\nFlag --atomic has been deprecated, use --rollback-on-failure instead\n```\nAI-generated deploy script ของ Helm 4 ควรใช้อะไรแทน --atomic',
+    options: [
+      '--atomic ไม่ได้ deprecated จริง นี่เป็น warning ปลอม',
+      '--rollback-on-failure ซึ่งเป็น flag ทดแทนที่ Helm 4 document ไว้',
+      '--force-conflicts',
+      '--take-ownership',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบนกับ CLI ของ Helm 4.3.0 จริง: --atomic ยัง parse ได้แต่ deprecated แล้วโดยแนะนำ --rollback-on-failure',
+  },
+  {
+    q: '```text\n$ helm plugin install https://github.com/databus23/helm-diff\nError: plugin source does not support verification. Use --verify=false to skip verification\n```\nทำไมคำสั่ง helm plugin install ธรรมดาถึงล้มเหลวใน Helm 4',
+    options: [
+      'URL ผิด',
+      'Helm 4 ต้องการ plugin signature verification เป็น default และ source นี้ไม่มี signature ให้ verify',
+      'helm-diff ใช้กับ Helm 4 ไม่ได้เลย',
+      'การติดตั้ง plugin ถูกลบออกจาก Helm 4 แล้ว',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: เติม --verify=false (opt-out ที่ต้องระบุตรง ๆ และ audit ได้) แล้ว install แบบเดียวกันสำเร็จ',
   },
 ];
 

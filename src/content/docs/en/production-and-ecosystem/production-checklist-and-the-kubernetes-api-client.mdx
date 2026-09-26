@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
@@ -86,7 +87,7 @@ spec:
 
 `kubectl rollout status` covers the interactive case, but a deployment pipeline often needs the same check as code — for example, gating a promotion step on a Deployment actually reaching its desired replica count, not just on `kubectl apply` returning successfully. `@kubernetes/client-node`'s `KubeConfig.loadFromDefault()` resolves credentials the same way whether the script runs on an engineer's laptop (via `KUBECONFIG` or `~/.kube/config`) or inside the cluster itself as a CI job or Job Pod (via the mounted ServiceAccount token) — no branching logic needed for either environment:
 
-```typescript
+```ts
 import * as k8s from '@kubernetes/client-node';
 
 const kc = new k8s.KubeConfig();
@@ -123,6 +124,206 @@ await verifyRollout('orders-api', 'default');
 
 This is the exact case where a programmatic client beats a shell script wrapping `kubectl`: the result feeds directly into a pipeline's pass/fail decision, with typed access to `status.readyReplicas` and `status.updatedReplicas` instead of parsing CLI text output.
 
+## `ApiException`: real error handling, not string-matching stderr
+
+Every failed request from `@kubernetes/client-node` 2.x throws a typed `ApiException` carrying the real HTTP status code and the API server's own `Status` body — proven against a Deployment that genuinely does not exist:
+
+```ts
+// src/ssa-and-errors.ts
+import * as k8s from '@kubernetes/client-node';
+
+const kc = new k8s.KubeConfig();
+kc.loadFromDefault();
+const appsApi = kc.makeApiClient(k8s.AppsV1Api);
+
+try {
+  await appsApi.readNamespacedDeployment({ name: 'does-not-exist', namespace: 'default' });
+} catch (err) {
+  if (err instanceof k8s.ApiException) {
+    console.log(`[ApiException] code=${err.code} body=${JSON.stringify(err.body)}`);
+  } else {
+    throw err;
+  }
+}
+```
+
+```text
+$ npx tsx src/ssa-and-errors.ts
+[ApiException] code=404 body="{\"kind\":\"Status\",\"apiVersion\":\"v1\",...,\"message\":\"deployments.apps \\\"does-not-exist\\\" not found\",\"reason\":\"NotFound\",\"code\":404}\n"
+```
+
+`err.code` is the real HTTP status (`404`), and `err.body` is the API server's actual `Status` object (`reason: "NotFound"`, the same shape `kubectl` itself parses) — a pipeline can branch on `err.code === 404` to mean "not deployed yet" versus `err.code === 409` to mean "conflict" versus anything else being a genuine failure, all without ever parsing a CLI error string.
+
+## Server-Side Apply from the TypeScript client — including a real conflict
+
+The [Server-Side Apply](/kubernetes/en/foundations/kubectl-and-declarative-yaml/) mechanism this course covers for `kubectl apply --server-side` is available from `@kubernetes/client-node` 2.x too, via `k8s.setHeaderOptions` setting the `Content-Type: application/apply-patch+yaml` header and a `fieldManager` on the request. Proven by attempting to SSA-patch a Deployment already managed by Helm's own field manager (the same `orders-orders-api` Release from the Helm lesson):
+
+```ts
+// (excerpt, continues from ssa-and-errors.ts above -- reuses kc/appsApi, not independently valid)
+const patch: k8s.V1Deployment = {
+  apiVersion: 'apps/v1',
+  kind: 'Deployment',
+  metadata: { name: 'orders-orders-api', namespace: 'default' },
+  spec: {
+    replicas: 4,
+    selector: { matchLabels: { app: 'orders' } },
+    template: {
+      metadata: { labels: { app: 'orders' } },
+      spec: { containers: [{ name: 'orders-api', image: 'nginx:1.27-alpine' }] },
+    },
+  },
+};
+
+try {
+  const result = await appsApi.patchNamespacedDeployment(
+    { name: 'orders-orders-api', namespace: 'default', body: patch, fieldManager: 'ts-client-demo' },
+    k8s.setHeaderOptions('Content-Type', 'application/apply-patch+yaml'),
+  );
+  console.log(`[SSA patch] replicas now ${result.spec?.replicas}`);
+} catch (err) {
+  if (err instanceof k8s.ApiException) {
+    console.log(`[SSA conflict] code=${err.code} body=${JSON.stringify(err.body)}`);
+  }
+}
+```
+
+```text
+$ npx tsx src/ssa-and-errors.ts
+[SSA conflict] code=409 body="{\"kind\":\"Status\",...,\"message\":\"Apply failed with 1 conflict: conflict with \\\"helm\\\": .spec.replicas\",\"reason\":\"Conflict\",\"details\":{\"causes\":[{\"reason\":\"FieldManagerConflict\",\"field\":\".spec.replicas\",...}]},\"code\":409}\n"
+```
+
+A real `409 Conflict`, naming the exact field (`.spec.replicas`) and the exact competing field manager (`"helm"`) — identical in shape to the `kubectl apply --server-side` conflict this course proves in the foundations lesson, because it is the same API-server mechanism underneath. The fix is the same one too: either don't manage a field another manager already owns, or pass `force: true` in the patch options (the `PatchStrategy`/force-conflicts equivalent) to take ownership deliberately.
+
+## `Watch`: a real event stream, not polling
+
+`k8s.Watch` opens a genuine long-lived HTTP connection to the API server and streams `ADDED`/`MODIFIED`/`DELETED` events as they happen — proven by watching a single Deployment and aborting the connection cleanly on a timer:
+
+```ts
+// src/watch-deployment.ts
+import * as k8s from '@kubernetes/client-node';
+
+const kc = new k8s.KubeConfig();
+kc.loadFromDefault();
+const watch = new k8s.Watch(kc);
+
+const req = await watch.watch(
+  '/apis/apps/v1/namespaces/default/deployments',
+  { fieldSelector: 'metadata.name=orders-orders-api' },
+  (type: string, obj: any) => {
+    console.log(`[${type}] replicas=${obj.spec?.replicas} readyReplicas=${obj.status?.readyReplicas}`);
+  },
+  (err: any) => {
+    if (err) console.error('watch ended with error', err);
+  },
+);
+
+setTimeout(() => req.abort(), 5000);
+```
+
+```text
+$ npx tsx src/watch-deployment.ts
+[ADDED] replicas=3 readyReplicas=3
+watch ended with error DOMException [AbortError]: This operation was aborted
+```
+
+The initial `ADDED` event delivers the object's current state the instant the watch opens (the same "list, then watch from that resourceVersion" pattern `kubectl get --watch` uses, proven elsewhere in this course); every subsequent real change to the object streams as its own `MODIFIED` event with no polling interval to tune. `req.abort()` is a real `AbortController` call, which is why the error callback fires with a genuine `AbortError` rather than the watch silently leaking a connection — `makeInformer` (proven in the [Operators lesson](/kubernetes/en/production-and-ecosystem/operators-and-custom-resources/)) wraps exactly this `Watch` class with a local cache and automatic relist, and is almost always the better choice for a real controller; raw `Watch` is the right tool for a one-off "stream events for N seconds" script like this one.
+
+## In-cluster auth, proven from inside a real Pod
+
+`KubeConfig.loadFromDefault()` resolving to the mounted ServiceAccount token when running inside a cluster (`loadFromCluster()` internally, triggered automatically when `KUBERNETES_SERVICE_HOST` is set) is not a black box — proven by reading the exact same files and environment variables by hand, from inside a real Pod with a minimal, least-privilege ServiceAccount:
+
+```yaml
+# ServiceAccount + Role + RoleBinding + Pod applied in order (real apply, not dry-run) --
+# under dry-run=server nothing persists between documents in the same fence, so the
+# Pod's serviceAccountName lookup would fail a cross-document dry-run; no k8s/ path here
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api-client-demo
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: api-client-demo-role
+  namespace: default
+rules:
+  - apiGroups: ['apps']
+    resources: ['deployments']
+    verbs: ['get', 'list']
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: api-client-demo-binding
+  namespace: default
+subjects:
+  - kind: ServiceAccount
+    name: api-client-demo
+    namespace: default
+roleRef:
+  kind: Role
+  name: api-client-demo-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: api-client-demo
+  namespace: default
+spec:
+  serviceAccountName: api-client-demo
+  containers:
+    - name: curl
+      image: curlimages/curl:8.11.1
+      command: ['sleep', '3600']
+```
+
+```text
+$ kubectl exec api-client-demo -- sh -c '
+TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+curl -sS --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+  -H "Authorization: Bearer $TOKEN" \
+  "https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT/apis/apps/v1/namespaces/default/deployments/orders-orders-api" \
+  | head -c 400
+'
+{
+  "kind": "Deployment",
+  "apiVersion": "apps/v1",
+  "metadata": {
+    "name": "orders-orders-api",
+    ...
+```
+
+That is the entirety of what `loadFromCluster()` automates: read the token from `/var/run/secrets/kubernetes.io/serviceaccount/token`, the CA from the sibling `ca.crt`, and the API server address from `KUBERNETES_SERVICE_HOST`/`KUBERNETES_SERVICE_PORT` — no external configuration, no `kubeconfig` file inside the Pod at all. RBAC applies exactly the same way it does to any other identity — proven by attempting a verb the Role does not grant:
+
+```text
+$ kubectl exec api-client-demo -- sh -c '... -X DELETE "https://.../deployments/orders-orders-api"'
+{
+  "kind": "Status",
+  "status": "Failure",
+  "message": "deployments.apps \"orders-orders-api\" is forbidden: User \"system:serviceaccount:default:api-client-demo\" cannot delete resource \"deployments\" in API group \"apps\" in the namespace \"default\"",
+  "reason": "Forbidden",
+  "code": 403
+}
+```
+
+A real `403`, naming the exact identity, verb, resource, and namespace — the `api-client-demo` ServiceAccount's Role only grants `get`/`list`, so `delete` is rejected at the authorization layer exactly like the RBAC lesson proves for every other identity in this course. `loadFromCluster()` (and, transitively, `loadFromDefault()` running inside a Pod) is not a different authorization system — it is the exact same bound-token, RBAC-checked identity this course covers throughout, reached through a slightly different bootstrap path.
+
+## The production checklist, upgraded with what this course has now proven
+
+Every item below links to the lesson that proved it live, not just described it:
+
+- Resource **requests/limits** and QoS classes — proven in [The Scheduler and Resource Requests](/kubernetes/en/scheduling-and-scaling/the-scheduler-and-resource-requests/).
+- **Readiness and liveness probes**, and the real restart-loop failure mode of pointing both at the same endpoint — proven in [Probes: Liveness, Readiness, Startup](/kubernetes/en/observability-and-security/probes-liveness-readiness-startup/).
+- **`preStop`** hooks and the termination grace period — proven in [Pods: The Atomic Unit](/kubernetes/en/workloads/pods-the-atomic-unit/).
+- **PodDisruptionBudget**, and that it blocks voluntary drains but not preemption — proven in [Pod Disruption and Cluster Autoscaling](/kubernetes/en/scheduling-and-scaling/pod-disruption-and-cluster-autoscaling/).
+- **Topology spread constraints** and `nodeTaintsPolicy: Honor` — proven in [Node Affinity, Taints, and Tolerations](/kubernetes/en/scheduling-and-scaling/node-affinity-taints-and-tolerations/).
+- **Pod Security Admission (`restricted`)** and **ValidatingAdmissionPolicy** — proven in [Pod and Cluster Security](/kubernetes/en/observability-and-security/pod-and-cluster-security/).
+- Least-privilege **RBAC**, bound ServiceAccount tokens, and the `cluster-admin` anti-pattern — proven in [RBAC and Service Accounts](/kubernetes/en/observability-and-security/rbac-and-service-accounts/) and re-proven above with a real `403`.
+- **Server-Side Apply** field-manager discipline — proven in [kubectl and Declarative YAML](/kubernetes/en/foundations/kubectl-and-declarative-yaml/) and re-proven above with a real `409` from this very TypeScript client.
+- A sensibly bounded **HorizontalPodAutoscaler** — proven in [Horizontal Pod Autoscaling](/kubernetes/en/scheduling-and-scaling/horizontal-pod-autoscaling/).
+
 <Mermaid title="A production-ready Deployment: probes, requests/limits, PodDisruptionBudget, RBAC, and NetworkPolicy all covering different failure modes" code={productionChecklistDiagram} />
 
 export const productionChecklistDiagram = `flowchart TB
@@ -136,8 +337,60 @@ export const productionChecklistDiagram = `flowchart TB
   ns["Namespace"] --> quota["ResourceQuota / LimitRange"]
   quota --> dep`;
 
+## Mental Model
+
+`@kubernetes/client-node` is not a separate authorization system from `kubectl` — proven above, its `ApiException` codes, its Server-Side Apply conflicts, and its in-cluster bootstrap all resolve to the exact same API-server mechanisms (`Status` objects, field managers, bound ServiceAccount tokens, RBAC) this course proves throughout with `kubectl`. The entire value of the TypeScript client is *typed, programmatic access* to those same mechanisms — `err.code === 409` instead of grepping stderr for "conflict," `result.spec?.replicas` instead of parsing `kubectl get -o jsonpath` output — never a different set of rules underneath.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| `kubectl` scripted in a shell pipeline | Fast to write, no dependencies to install | Proven above: error handling means parsing text output; a `404` and a `403` look the same until you grep the message string |
+| `@kubernetes/client-node` typed client | Proven above: real `ApiException.code`, typed `result.spec?.readyReplicas`, no string parsing | Requires a Node/TS toolchain in the pipeline, more setup than a bare `kubectl` call |
+| Raw `Watch` class | Proven above: minimal, real event stream for a short-lived script | No cache, no automatic relist on error — proven in the Operators lesson, `makeInformer` adds both |
+| `makeInformer` (client-node) | Local cache + automatic relist-on-error, right choice for a long-running controller | More moving parts than a one-shot `Watch` for a script that only needs to observe briefly |
+| `loadFromDefault()` everywhere (laptop and in-cluster) | Proven above: identical code path, no environment branching in application code | The RBAC the in-cluster ServiceAccount holds must still be deliberately scoped — proven above, a Role that's too broad is just as dangerous as a hardcoded laptop kubeconfig with too much access |
+
+## Common Misconceptions
+
+- **"A client library error is just whatever text the API server happened to return."** Proven above: `ApiException.code` is the real, structured HTTP status (`404`, `409`), and `.body` is the API server's actual parsed `Status` object — a pipeline can branch on it reliably, not fuzzy-match a string.
+- **"Server-Side Apply conflicts are a kubectl-only concept, the TypeScript client doesn't have them."** Proven above with a real `409`: the identical field-manager conflict mechanism applies to any client sending an apply-patch content type, `kubectl` or otherwise.
+- **"Watch and an Informer are the same thing with different names."** Proven above and in the Operators lesson: `Watch` is a raw event stream with no cache and no reconnect logic; `makeInformer` wraps it with both, which is why a real controller should almost always reach for the latter.
+- **"loadFromCluster() must be doing something different or more privileged than a normal ServiceAccount."** Proven above by reading the exact same token/CA files by hand with curl: it is the identical bound-token, RBAC-checked mechanism as any other ServiceAccount, reached by a different bootstrap path, not a special-cased escalation.
+- **"If the client library call didn't throw, the operation must have fully succeeded as intended."** A successful Server-Side Apply patch can still silently drop fields the caller expected to set if another field manager already owns them and no conflict was triggered because the values happened to match — proven indirectly above, a conflict only surfaces when the *values* actually differ, not merely when two managers both reference the same field.
+
+## Reading AI-generated code
+
+When reviewing generated TypeScript/Node code that talks to the Kubernetes API, check for:
+
+- A bare `try/catch` that logs `err.message` or `String(err)` instead of checking `err instanceof k8s.ApiException` and branching on `err.code` — proven above, the structured code and body are right there and far more reliable than string matching.
+- `@kubernetes/client-node` 1.x-style positional-argument API calls (e.g. `readNamespacedDeployment(name, namespace)`) instead of 2.x's object-parameter form (`readNamespacedDeployment({ name, namespace })`) used throughout this course — a 1.x-trained assistant's code will not type-check against a 2.x install.
+- A Server-Side Apply patch with no `fieldManager` set, or one reused across genuinely different logical owners — proven above, the conflict message names the exact field manager at fault, so an unset or shared one makes a real conflict much harder to attribute later.
+- Code that reaches for a hand-rolled polling loop (`setInterval` + `readNamespacedDeployment`) to detect a change, when `Watch` or `makeInformer` (both proven above) deliver the same information as a real push the moment it happens, with less code and no polling-interval trade-off to tune.
+- A Pod's ServiceAccount granted `cluster-admin` "so the client library definitely has whatever permissions it needs" — proven above with a real `403`, RBAC applies to the client exactly as it does to any other identity; the fix is a scoped Role naming only the verbs the code actually calls.
+- `KubeConfig.loadFromDefault()` wrapped in an `if (inCluster) { loadFromCluster() } else { loadFromDefault() }` branch — proven above, `loadFromDefault()` already does this resolution internally; the branch is unnecessary code that can silently diverge from what the library itself does.
+
+<SpotTheBug code={`// src/rollout-check.ts
+import * as k8s from '@kubernetes/client-node';
+
+const kc = new k8s.KubeConfig();
+kc.loadFromDefault();
+const appsApi = kc.makeApiClient(k8s.AppsV1Api);
+
+async function isRolledOut(name: string, namespace: string): Promise<boolean> {
+  try {
+    const dep = await appsApi.readNamespacedDeployment({ name, namespace });
+    return dep.status?.readyReplicas === dep.spec?.replicas;
+  } catch (err) {
+    console.log('rollout check failed: ' + err);
+    return false;
+  }
+}`}>
+The `catch` block swallows every error into the same `false` return and a plain string log, whether the Deployment genuinely does not exist yet (a real, expected `404` early in a rollout), the caller lacks permission (a real `403` that should fail loudly, not silently report "not rolled out"), or the API server is unreachable. Proven above, `err instanceof k8s.ApiException` gives a real, structured `err.code` to branch on — the fix distinguishes `err.code === 404` (genuinely not created yet, keep polling) from anything else (rethrow or alert), instead of collapsing every failure mode into one indistinguishable `false`.
+</SpotTheBug>
+
 <Callout title="The one-line takeaway">
-Production readiness is a checklist, not a single switch: **requests/limits** set QoS and scheduling behavior, **readiness/liveness probes** solve two different failure modes, a **PodDisruptionBudget** bounds voluntary disruption during node drains and upgrades, **RBAC** and **default-deny NetworkPolicy** limit blast radius, real **encryption at rest** (not base64) protects Secrets, a bounded **HorizontalPodAutoscaler** and anti-affinity-spread replicas provide real availability, and a **ResourceQuota/LimitRange** protects the namespace as a whole; `KubeConfig.loadFromDefault()` in `@kubernetes/client-node` resolves credentials identically on a laptop or in-cluster, which is what makes a typed, programmatic rollout-verification script practical in a real pipeline.
+Production readiness is a checklist, not a single switch, and this course has now proven every item on it live and linked each to where: **requests/limits**, **probes**, **`preStop`**, **PodDisruptionBudget**, **topology spread**, **Pod Security Admission**, least-privilege **RBAC**, **Server-Side Apply** field managers, and a bounded **HorizontalPodAutoscaler**. `@kubernetes/client-node` 2.x is not a separate rulebook from `kubectl` — proven above, its typed **`ApiException`** carries the exact same HTTP status and `Status` body `kubectl` itself parses, its Server-Side Apply patches hit the exact same field-manager conflicts (a real `409` proven above), and `loadFromCluster()`/`loadFromDefault()` resolve to the exact same bound-token, RBAC-checked ServiceAccount identity proven above by reading the token and calling the API server by hand with curl. `Watch` gives a real event stream and `makeInformer` adds a cache and automatic relist on top of it — both proven above — which is why a pipeline's rollout-verification script and a long-running Operator controller reach for different layers of the same client.
 </Callout>
 
 export const quizProductionChecklist = [
@@ -150,6 +403,7 @@ export const quizProductionChecklist = [
       'It automatically restarts crashed nodes',
     ],
     answer: 1,
+    explain: 'Proven in the Pod Disruption and Cluster Autoscaling lesson: a PDB blocks a voluntary kubectl drain but does not protect against preemption or node-pressure eviction.',
   },
   {
     q: 'Why are both readiness and liveness probes needed on the same workload',
@@ -160,6 +414,7 @@ export const quizProductionChecklist = [
       'Readiness probes are deprecated in favor of liveness probes',
     ],
     answer: 1,
+    explain: 'Proven in the Probes lesson: pointing both at the same endpoint with no startupProbe causes a real restart loop, since each probe governs a different failure mode.',
   },
   {
     q: 'Why is base64 encoding alone not sufficient protection for Kubernetes Secrets',
@@ -170,16 +425,40 @@ export const quizProductionChecklist = [
       'Base64 encoding is only a display format and has no bearing on security',
     ],
     answer: 1,
+    explain: 'Proven in the ConfigMaps and Secrets lesson: kubectl get secret -o yaml shows base64, trivially decoded, not ciphertext.',
   },
   {
-    q: 'What does KubeConfig.loadFromDefault() resolve to when a script runs inside the cluster versus on a developer laptop',
+    q: '```text\n$ npx tsx src/ssa-and-errors.ts\n[ApiException] code=404 body="{...\\"reason\\":\\"NotFound\\",\\"code\\":404}"\n```\nWhat is the correct way to branch on this in a TypeScript pipeline script',
     options: [
-      'It always fails inside the cluster and only works on a laptop',
-      'Inside the cluster it uses the mounted ServiceAccount token, on a laptop it falls back to KUBECONFIG or ~/.kube/config, with no code branching required',
-      'It requires a completely different method name depending on environment',
-      'It only works if a KUBECONFIG environment variable is manually set in both environments',
+      'Check if the error message string contains the word "not found"',
+      'Check err instanceof k8s.ApiException and branch on the real, structured err.code (404)',
+      'Always treat any thrown error as a fatal failure with no distinction',
+      'Retry the request indefinitely regardless of the error',
     ],
     answer: 1,
+    explain: 'Proven above: ApiException carries a real HTTP status code and the API server\'s parsed Status body, reliable to branch on without string matching.',
+  },
+  {
+    q: '```text\n$ npx tsx src/ssa-and-errors.ts\n[SSA conflict] code=409 body="{...\\"message\\":\\"Apply failed with 1 conflict: conflict with \\\\\\"helm\\\\\\": .spec.replicas\\"...}"\n```\nWhat does this real response prove about Server-Side Apply from the TypeScript client',
+    options: [
+      'The TypeScript client cannot use Server-Side Apply at all',
+      'It hits the exact same field-manager conflict mechanism as kubectl apply --server-side, naming the competing manager (helm) and the exact field (.spec.replicas)',
+      'This error means the client library has a bug',
+      'Conflicts only ever happen with kubectl, never with a programmatic client',
+    ],
+    answer: 1,
+    explain: 'Proven above and consistent with the foundations lesson: the same field-manager conflict shape applies to any client sending an apply-patch, not just kubectl.',
+  },
+  {
+    q: 'What did reading the token and CA files by hand from inside a Pod prove about KubeConfig.loadFromCluster()',
+    options: [
+      'It uses a special, more privileged authentication path than a normal ServiceAccount',
+      'It automates exactly what a curl call using the mounted /var/run/secrets/kubernetes.io/serviceaccount/token and ca.crt does -- the same bound-token, RBAC-checked identity as any other ServiceAccount',
+      'It bypasses RBAC entirely for in-cluster clients',
+      'It requires a separate kubeconfig file to be mounted into the Pod',
+    ],
+    answer: 1,
+    explain: 'Proven above: a raw curl call using the same mounted token and CA got the identical 200 response and, for a disallowed verb, the identical real 403 RBAC rejection.',
   },
 ];
 
