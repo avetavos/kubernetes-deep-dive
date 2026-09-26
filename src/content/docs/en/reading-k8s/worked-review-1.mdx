@@ -1,0 +1,486 @@
+---
+title: 'Worked review 1: a web app Deployment, Service, Ingress, and HPA'
+description: 'An AI-generated web app rollout — Deployment, Service, Ingress, and HorizontalPodAutoscaler — reviewed bug by bug against real dry-run/apply errors, real kubectl events, and real endpoint/probe/rollout behaviour on a live cluster.'
+sidebar:
+  order: 4
+---
+
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import Mermaid from '../../../../components/Mermaid.astro';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## The feature
+
+The prompt was: *"Deploy a web app behind a Service and an Ingress, with an HPA so it scales under load."* What follows is the kind of first draft an AI assistant hands back for exactly that prompt — every file looks like something copied from a slightly old tutorial, and the object shapes are individually plausible. Read it the way the [review checklist](/kubernetes/en/reading-k8s/review-checklist/) recommends: apply-time correctness first (does the API server even accept this), then rollout behaviour, then traffic shape. It has **7 real bugs**; check the [AI bug catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/) for the general pattern behind each one. Every claim below was proven on a real two-node `kind` cluster (`kind create cluster --name reading-b`, Kubernetes 1.37.0, `metrics-server` patched with `--kubelet-insecure-tls`) — real `kubectl apply`, real `kubectl describe`/`get events`, real endpoint and probe behaviour.
+
+## The generated code
+
+```yaml
+# web-app Deployment, as generated -- see review below
+apiVersion: apps/v1beta1
+kind: Deployment
+metadata:
+  name: web-app
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 0
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+        tier: frontend
+    spec:
+      containers:
+      - name: web-app
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        livenessProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 3
+          failureThreshold: 1
+        readinessProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 3
+          failureThreshold: 1
+```
+
+```yaml
+# web-app Service, as generated -- see review below
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-app
+spec:
+  selector:
+    app: web-app
+    tier: backend
+  ports:
+  - port: 80
+    targetPort: 80
+```
+
+```yaml
+# web-app HorizontalPodAutoscaler, as generated -- see review below
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target: { type: Utilization, averageUtilization: 60 }
+```
+
+```yaml
+# @expect-error no matches for kind "Ingress" in version "networking.k8s.io/v1beta1"
+apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: web-app
+spec:
+  rules:
+  - host: web.example.com
+    http:
+      paths:
+      - path: /
+        backend:
+          serviceName: web-app
+          servicePort: 80
+```
+
+## The review walk
+
+### Deployment: an `apiVersion` that was removed years ago
+
+`apps/v1beta1` is exactly the pre-1.16 Deployment shape a stale training example still uses. Proven directly against the API server:
+
+```text
+$ kubectl apply -f deployment.yaml
+error: resource mapping not found for name: "web-app" namespace: "wr1" from "deployment.yaml": no matches for kind "Deployment" in version "apps/v1beta1"
+ensure CRDs are installed first
+```
+
+<SpotTheBug code={`apiVersion: apps/v1beta1
+kind: Deployment`}>
+This isn't a deprecation warning, it's a hard removal — `apps/v1beta1` and `apps/v1beta2` stopped being served in Kubernetes 1.16, moved to `apps/v1`. The API server has no route for this group/version at all, so `kubectl` never even reaches schema validation; it fails at REST-mapping time, before the object is looked at. The fix is simply `apiVersion: apps/v1` — the rest of the Deployment's shape under `apps/v1` is unchanged.
+</SpotTheBug>
+
+### Service: a `selector` that doesn't match the Deployment's own Pods
+
+The Service selects `app: web-app, tier: backend`; the Deployment's Pod template is labeled `app: web-app, tier: frontend`. Both objects apply cleanly — the API server never cross-checks a Service's selector against any Deployment. Proven with real endpoints after both the Deployment and Service were applied and the Pods were `2/2 Running`:
+
+```text
+$ kubectl get endpoints web-app
+Warning: v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice
+NAME      ENDPOINTS   AGE
+web-app   <none>      24s
+
+$ kubectl get endpointslices -l kubernetes.io/service-name=web-app
+NAME            ADDRESSTYPE   PORTS     ENDPOINTS   AGE
+web-app-985wj   IPv4          <unset>   <unset>     24s
+```
+
+<SpotTheBug code={`selector:
+  app: web-app
+  tier: backend`}>
+Every field here is individually valid YAML and a legal Service selector — there is nothing for schema validation to reject. The Service is simply selecting a set of Pods that happens to be empty, and it stays that way silently: `kubectl get svc` shows the Service as healthy, the Deployment shows `3/3` Ready, and the only visible symptom is an EndpointSlice with zero addresses. The fix is making the two labels agree — either `tier: frontend` on the selector, or dropping the `tier` key from the selector entirely if it isn't needed to disambiguate.
+</SpotTheBug>
+
+### Deployment: no `resources.requests` at all, so the HPA can never work
+
+The container has no `resources` block whatsoever. Both the Deployment and the HPA apply cleanly — this only surfaces once the HPA actually tries to compute a percentage. Proven with a real HPA against this exact Deployment on `metrics-server`:
+
+```text
+$ kubectl get hpa web-app-hpa
+NAME          REFERENCE                TARGETS              MINPODS   MAXPODS   REPLICAS   AGE
+web-app-hpa   Deployment/web-app-hpa   cpu: <unknown>/60%   2         10        2          35s
+
+$ kubectl describe hpa web-app-hpa
+...
+  Type            Status  Reason                   Message
+  ----            ------  ------                   -------
+  ScalingActive   False   FailedGetResourceMetric  the HPA was unable to compute the replica count: failed to get cpu utilization: missing request for cpu in container web-app of Pod web-app-hpa-f94bdb95c-knmc2
+Events:
+  Warning  FailedGetResourceMetric  failed to get cpu utilization: missing request for cpu in container web-app of Pod web-app-hpa-f94bdb95c-knmc2
+```
+
+<SpotTheBug code={`containers:
+- name: web-app
+  image: nginx:alpine
+  ports:
+  - containerPort: 80`}>
+A subtlety worth knowing before you go looking for this bug in a real manifest: setting `resources.limits.cpu` **without** `resources.requests.cpu` does **not** reproduce this error — the API server defaults an unset CPU request to match the CPU limit the moment any limit is present (confirmed directly: applying a container with only `limits: { cpu: 500m }` came back with `requests: { cpu: 500m }` already filled in). The real bug is a container with **no `resources` block at all** — `{}` on the wire, confirmed via `kubectl get pod -o jsonpath='{.spec.containers[0].resources}'`. HPA's utilization math is always requests-relative and never falls back to limits; with truly no request, `metrics-server` has nothing to divide by, and `kubectl get hpa` reports `<unknown>` forever. The fix is adding an explicit `resources.requests.cpu` (and, separately, a `resources.limits` for good QoS hygiene) to the container.
+</SpotTheBug>
+
+### Deployment: the same endpoint for liveness and readiness
+
+Both probes hit `GET /` on port 80 every 3 seconds with `failureThreshold: 1`, and there is no `startupProbe`. Proven with a slow-starting container (20-second warm-up) using this exact probe shape:
+
+```text
+$ kubectl describe pod slow-warm-bad
+Events:
+  Type     Reason     Age                From      Message
+  ----     ------     ----               ----      -------
+  Warning  Unhealthy  15s (x2 over 33s)  kubelet   Liveness probe failed: Get "http://10.244.1.11:8080/": dial tcp 10.244.1.11:8080: connect: connection refused
+  Normal   Killing    15s (x2 over 33s)  kubelet   Container web failed liveness probe, will be restarted
+  Warning  Unhealthy  3s (x15 over 35s)  kubelet   Readiness probe failed: Get "http://10.244.1.11:8080/": dial tcp 10.244.1.11:8080: connect: connection refused
+
+$ kubectl get pod slow-warm-bad
+NAME            READY   STATUS    RESTARTS     AGE
+slow-warm-bad   0/1     Running   2 (0s ago)   50s
+```
+
+<SpotTheBug code={`livenessProbe:
+  httpGet: { path: /, port: 80 }
+  periodSeconds: 3
+  failureThreshold: 1
+readinessProbe:
+  httpGet: { path: /, port: 80 }
+  periodSeconds: 3
+  failureThreshold: 1`}>
+A liveness probe answers "is this container stuck and needs a restart"; a readiness probe answers "should traffic reach this container right now." Pointing both at the same endpoint with no `startupProbe` erases that distinction: a container that is merely still warming up looks identical, to the kubelet, to one that is permanently wedged — and it gets killed for a condition a restart cannot fix, since restarting resets the warm-up clock to zero, confirmed above by real, repeating restarts (`RESTARTS: 2 (0s ago)` and climbing). The fix is a dedicated `startupProbe` (which fully disables liveness/readiness until it succeeds once) sized for the real worst-case startup time, plus a liveness probe that is meaningfully more tolerant than readiness once startup is done.
+</SpotTheBug>
+
+### Deployment: no `preStop`, so a rolling delete can drop an in-flight request
+
+There is no `lifecycle.preStop` on the container. Proven with a real Service + a client pod curling in a loop while the serving Pod is deleted mid-loop, 40 requests at 250ms intervals, delete issued after request 8:
+
+```text
+$ kubectl exec loadgen -- sh -c 'for i in $(seq 1 40); do wget -q -T1 -O /dev/null -S http://web-app/ 2>&1 | grep -o "HTTP/[0-9.]* [0-9]*"; sleep 0.25; done' &
+$ kubectl delete pod web-app-<hash>
+```
+
+```text
+# request  status (no preStop)
+8   HTTP/1.1 200
+9   HTTP/1.1 200
+10  (no response -- connection refused/reset)
+11  HTTP/1.1 200
+...
+39/40 succeeded, exactly 1 request lost, timed right at the delete
+```
+
+The identical test against a Pod with `preStop: sleep 5` added showed the one failure move to request #1 (a pre-delete cold-start blip, unrelated to termination) — every request from the delete point onward succeeded, `40/40` from that point on.
+
+<SpotTheBug code={`containers:
+- name: web-app
+  image: nginx:alpine
+  # no lifecycle.preStop here`}>
+`kubectl delete pod` sends SIGTERM to the container roughly in parallel with removing the Pod from the Service's Endpoints — it does **not** wait for every kube-proxy on every node to finish reprogramming iptables/ipvs first. Without a `preStop` hook, nginx can stop accepting new connections before that endpoint-removal has propagated everywhere, so a request routed in that narrow window fails. A `preStop` hook that just sleeps a few seconds does nothing to the Service or endpoint machinery at all — it only keeps the container's listening socket open a little longer, which is enough, proven above, to absorb the exact same race that dropped a request without it. The fix: `lifecycle.preStop.exec.command: ["sh", "-c", "sleep 5"]` plus a `terminationGracePeriodSeconds` large enough to contain it.
+</SpotTheBug>
+
+### Deployment: `maxUnavailable: 0` and `maxSurge: 0` together
+
+Both knobs are set to `0` in the same `rollingUpdate` block. Proven directly against the API server:
+
+```text
+$ kubectl apply -f deployment-zerozero.yaml
+The Deployment "web-app-zz" is invalid: spec.strategy.rollingUpdate.maxUnavailable: Invalid value: 0: may not be 0 when `maxSurge` is 0
+```
+
+<SpotTheBug code={`strategy:
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 0`}>
+This looks like "maximally safe" to someone reading the field names in isolation — zero unavailable, zero surge, what could roll wrong? The API server rejects it outright, because together they describe a rollout with no legal way to make progress at all: it can't take a Pod down (`maxUnavailable: 0`) and it can't bring a new one up first either (`maxSurge: 0`). At least one of the two must be non-zero. The fix is picking the actual trade-off intended — `maxUnavailable: 0, maxSurge: 1` for zero-downtime at the cost of one extra Pod during rollout, or `maxUnavailable: 1, maxSurge: 0` for no extra capacity at the cost of one Pod missing briefly.
+</SpotTheBug>
+
+### Ingress: the pre-1.19 `v1beta1` shape
+
+```text
+$ kubectl apply -f ingress.yaml
+error: resource mapping not found for name: "web-app" namespace: "wr1" from "ingress.yaml": no matches for kind "Ingress" in version "networking.k8s.io/v1beta1"
+ensure CRDs are installed first
+```
+
+<SpotTheBug code={`apiVersion: networking.k8s.io/v1beta1
+...
+backend:
+  serviceName: web-app
+  servicePort: 80`}>
+Same class of bug as the Deployment's `apps/v1beta1`: this is the Ingress shape from before Kubernetes 1.19, and both the API version and the `backend.serviceName`/`backend.servicePort` field names were removed, not merely deprecated. The fix is `networking.k8s.io/v1`, with `pathType` now required and the backend written as `backend.service.name`/`backend.service.port.number` — or, given the Ingress API's frozen status and ingress-nginx's retirement, migrating to Gateway API's `HTTPRoute` instead of updating in place.
+</SpotTheBug>
+
+## The corrected code
+
+```yaml
+# k8s/worked-review-1/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+        tier: frontend
+    spec:
+      terminationGracePeriodSeconds: 15
+      containers:
+      - name: web-app
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        resources:
+          requests: { cpu: 100m, memory: 64Mi }
+          limits: { cpu: 250m, memory: 128Mi }
+        startupProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 2
+          failureThreshold: 15
+        readinessProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 3
+          failureThreshold: 1
+        livenessProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 10
+          failureThreshold: 3
+        lifecycle:
+          preStop:
+            exec:
+              command: ["sh", "-c", "sleep 5"]
+```
+
+```yaml
+# k8s/worked-review-1/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-app
+spec:
+  selector:
+    app: web-app
+    tier: frontend
+  ports:
+  - port: 80
+    targetPort: 80
+```
+
+```yaml
+# k8s/worked-review-1/hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target: { type: Utilization, averageUtilization: 60 }
+```
+
+```yaml
+# k8s/worked-review-1/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web-app
+spec:
+  rules:
+  - host: web.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: web-app
+            port:
+              number: 80
+```
+
+`npm run verify` dry-runs all four files above against the shared `verify-k8s` cluster with 0 errors, and `node tools/verify-manifests.mjs --apply reading-k8s/worked-review-1` really applies them into a temp namespace: the Deployment reaches `3/3 Ready` and the Service's EndpointSlice now lists all 3 Pod IPs (selector match fixed). `verify-k8s` has no `metrics-server` installed, so the HPA there still shows `<unknown>` — that's the shared cluster's own environment, not a regression. Applying the identical fix (adding the `resources.requests.cpu` block) to the review's own `reading-b` cluster, which does have `metrics-server`, confirmed the actual behavior change directly: `kubectl get hpa` moved from `cpu: <unknown>/60%` to a real `cpu: 0%/60%`, and `kubectl describe hpa` now shows `ScalingActive: True, Reason: ValidMetricFound` in place of the earlier `FailedGetResourceMetric`.
+
+## What changed and why
+
+| # | Bug | Fix |
+|---|---|---|
+| 1 | Deployment `apiVersion: apps/v1beta1` | `apps/v1` — real `no matches for kind` on the old group/version |
+| 2 | Service selector (`tier: backend`) doesn't match the Pod template (`tier: frontend`) | Selector matches the real Pod labels — proven with a real empty EndpointSlice before, populated after |
+| 3 | Container has no `resources` block at all | `resources.requests.cpu` present — real `<unknown>`/`FailedGetResourceMetric` before, real percentage after |
+| 4 | Same endpoint for `livenessProbe` and `readinessProbe`, no `startupProbe` | Dedicated `startupProbe` + a more tolerant `livenessProbe` — real restart-loop proven before |
+| 5 | No `lifecycle.preStop` | `preStop: sleep 5` — real dropped request during delete proven before, 0 dropped after |
+| 6 | `maxUnavailable: 0` and `maxSurge: 0` together | Exactly one of the two is non-zero — real, immediate API-server rejection otherwise |
+| 7 | Ingress `apiVersion: networking.k8s.io/v1beta1` with `backend.serviceName`/`servicePort` | `networking.k8s.io/v1` with `pathType` + `backend.service.name`/`port.number` — real `no matches for kind` on the old version |
+
+## Mental Model
+
+Two of these seven bugs (1, 7) are the API server refusing to even recognize the object — a stale training example using an API version that was removed years ago, caught instantly and loudly. The other five all apply cleanly and only fail later, each because the manifest made a claim about *something outside the file itself* that nothing at apply time checks: that a Service's selector actually matches a real Deployment's Pod labels, that a container's resource footprint is declared for an autoscaler that needs it, that "responding" and "ready for traffic" are the same question for this specific app, that the Service's endpoint bookkeeping is fast enough to never need a grace window, and that a rollout strategy which sounds maximally cautious is actually a legal combination at all. None of these five produce an error anywhere — they only show up as a real, but silent, gap between what `kubectl get` reports (all green) and what actually happens to real traffic.
+
+## Common Misconceptions
+
+- **"If `kubectl apply` succeeds, the objects are wired together correctly."** Proven above: a Service with a selector that matches nothing applies exactly as cleanly as one that matches everything — the API server never cross-validates a Service against any Deployment.
+- **"A container with `resources.limits` set is safe for HPA even without `resources.requests`."** Proven above by direct API-server behavior: a `limits.cpu` with no `requests.cpu` gets `requests.cpu` **defaulted to match the limit** — the real HPA-breaking bug is a container with no `resources` block at all, not "limits but no requests."
+- **"A `preStop` hook fixes a dropped-connection bug by telling the Service to stop routing here."** Proven above: `preStop` does nothing to Service/endpoint machinery — it only keeps the container's own listening socket open a little longer, which happens to be enough time for the real (separate, asynchronous) endpoint removal to finish propagating.
+
+<Mermaid title="Where each bug sits in this web app's request/rollout path" code={wr1Diagram} />
+
+export const wr1Diagram = `flowchart TD
+  A["Deployment: apps/v1beta1"] -->|"1: apiVersion removed"| A
+  A --> B["Pod template: tier=frontend"]
+  C["Service: selector tier=backend"] -->|"2: selector mismatch -- 0 endpoints"| C
+  B -.->|"traffic, if selector matched"| C
+  A --> D["livenessProbe == readinessProbe"]
+  D -->|"4: restart loop on slow start"| D
+  A --> E["no lifecycle.preStop"]
+  E -->|"5: dropped request on delete"| E
+  A --> F["maxUnavailable: 0, maxSurge: 0"]
+  F -->|"6: rollout rejected outright"| F
+  G["HPA: scaleTargetRef Deployment"] -->|"3: no resources.requests -- unknown"| G
+  A --> G
+  H["Ingress: networking.k8s.io/v1beta1"] -->|"7: apiVersion removed"| H
+  C --> H
+`;
+
+<Callout title="The one-line takeaway">
+Two of these seven bugs are a hard, instant API-server rejection; the other five all apply cleanly and pass every schema check, because each one is really a claim about a fact *outside* the object itself — does this selector actually match those Pods, is a resource request present for the autoscaler reading it, is this endpoint the right signal for both liveness and readiness, will the Service's own endpoint bookkeeping keep up with a delete — that only a real endpoint list, a real HPA condition, or a real curl-during-delete can check.
+</Callout>
+
+export const quizWorkedReview1 = [
+  {
+    q: "```text\nerror: resource mapping not found for name: \"web-app\" ... : no matches for kind \"Deployment\" in version \"apps/v1beta1\"\n```\nWhy does this fail before the API server even looks at the Deployment's fields?",
+    options: [
+      'It is a schema validation error on the Deployment spec',
+      '`apps/v1beta1` was removed in Kubernetes 1.16 -- the API server has no REST mapping for that group/version at all, so it fails at routing time, before any field is validated',
+      'It only fails because `replicas` is missing',
+      'This is a client-side kubectl warning, the server would accept it',
+    ],
+    answer: 1,
+    explain: 'Proven above: the real error is "no matches for kind ... in version", a discovery/REST-mapping failure -- the API server never serves that group/version, so it never reaches schema validation for the rest of the object.',
+  },
+  {
+    q: 'A Deployment (`tier: frontend` on its Pods) and a Service (`selector: {app: web-app, tier: backend}`) both `kubectl apply` successfully, and `kubectl get pods`/`get deployment` show everything healthy. What does `kubectl get endpointslices` show?',
+    options: [
+      'An error, since the Service selector does not match any Deployment',
+      'A real EndpointSlice object with zero addresses -- the Service applies and exists, it simply selects no Pods',
+      'The Service silently falls back to selecting all Pods in the namespace',
+      'kubectl refuses to create the Service at all',
+    ],
+    answer: 1,
+    explain: 'Proven above: `kubectl get endpointslices` for this exact Service showed ADDRESSTYPE IPv4, PORTS <unset>, ENDPOINTS <unset> -- a real, valid, empty EndpointSlice. The API server never cross-checks a Service selector against any other object.',
+  },
+  {
+    q: "```yaml\ncontainers:\n- name: web-app\n  image: nginx:alpine\n```\nNo `resources` block at all, targeted by an HPA on `cpu` utilization. What does `kubectl describe hpa` report, and why doesn't setting only `resources.limits.cpu` (with no `requests.cpu`) reproduce the same bug?",
+    options: [
+      'It reports 0% forever either way -- limits vs requests makes no difference',
+      '`FailedGetResourceMetric` / `missing request for cpu`, because HPA math is requests-relative; setting only `limits.cpu` does NOT reproduce this, since the API server defaults an unset `requests.cpu` to match a present `limits.cpu`',
+      'HPA falls back to using `limits.cpu` automatically when `requests.cpu` is absent',
+      'The HPA object fails to apply in this situation',
+    ],
+    answer: 1,
+    explain: 'Proven directly against the API server: a container with only `limits: {cpu: 500m}` came back from the server with `requests: {cpu: 500m}` already filled in. The real bug requires a container with NO resources block at all -- confirmed with `kubectl get pod -o jsonpath=\'{.spec.containers[0].resources}\'` returning `{}`, which is exactly when `kubectl describe hpa` shows the real `FailedGetResourceMetric`/`missing request for cpu` message.',
+  },
+  {
+    q: 'A container has identical `livenessProbe` and `readinessProbe` (same path, same port) and no `startupProbe`, and takes 20 real seconds to start listening. What does `kubectl describe pod` show?',
+    options: [
+      'Nothing unusual -- both probes just fail together harmlessly until the container is ready',
+      'A real, repeating restart loop: "Liveness probe failed" followed by "Container ... failed liveness probe, will be restarted", climbing RESTARTS count -- because the still-warming-up container looks identical to a permanently stuck one',
+      'Only the readiness probe fails; liveness always passes during startup',
+      'Kubernetes automatically infers a grace period from the container image',
+    ],
+    answer: 1,
+    explain: 'Proven above with real events: "Killing ... Container web failed liveness probe, will be restarted" repeated, and `kubectl get pod` showing a real, climbing restart count. A restart cannot fix "still warming up" -- it resets the warm-up clock to zero, which is exactly why this loops.',
+  },
+  {
+    q: "```text\n8   HTTP/1.1 200\n9   HTTP/1.1 200\n10  (no response)\n11  HTTP/1.1 200\n```\n40 requests every 250ms against a Service backed by one Pod with no `lifecycle.preStop`, the Pod deleted right around request 8. Adding `preStop: sleep 5` and repeating the identical test moved the one failure to request #1 instead. What does that prove?",
+    options: [
+      'preStop tells the Service to stop routing to the Pod immediately, avoiding the drop entirely',
+      'preStop keeps the container listening a few seconds longer, which is enough time for the separate, asynchronous endpoint-removal to finish propagating everywhere -- it does nothing to the Service/endpoint machinery itself',
+      'The request-1 failure in the fixed run proves preStop does not actually help',
+      'SIGTERM and endpoint removal are always perfectly synchronized, so this test is measuring something else',
+    ],
+    answer: 1,
+    explain: 'Proven above: with no preStop, exactly one request failed right at the delete moment (endpoint removal had not propagated to every node yet, but the container had already stopped accepting connections). With preStop: sleep 5, every request from the delete point onward succeeded -- the one failure that remained (request #1) happened BEFORE the delete, an unrelated cold-start blip.',
+  },
+  {
+    q: "```text\nThe Deployment \"web-app-zz\" is invalid: spec.strategy.rollingUpdate.maxUnavailable: Invalid value: 0: may not be 0 when `maxSurge` is 0\n```\nWhy does the API server reject `maxUnavailable: 0` together with `maxSurge: 0`, even though each one individually is a valid, common setting?",
+    options: [
+      'It is an arbitrary limit that can be disabled with a feature gate',
+      'Together they describe a rollout with no legal way to make progress: it cannot take a Pod down and it cannot bring a new one up first either -- at least one must be non-zero',
+      'maxSurge: 0 is deprecated and always rejected regardless of maxUnavailable',
+      'This only fails when replicas is an odd number',
+    ],
+    answer: 1,
+    explain: 'Proven above with the real API-server error. `maxUnavailable: 0, maxSurge: 1` (zero-downtime, one extra Pod during rollout) or `maxUnavailable: 1, maxSurge: 0` (no extra capacity, one Pod briefly missing) are both legal -- zero and zero together is not.',
+  },
+];
+
+<Quiz client:visible id="reading-k8s/worked-review-1" questions={quizWorkedReview1} />
+
+<ProgressTracker client:visible id="reading-k8s/worked-review-1" />

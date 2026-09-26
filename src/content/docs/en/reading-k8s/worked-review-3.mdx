@@ -1,0 +1,526 @@
+---
+title: 'Worked review 3: a platform namespace with RBAC, quotas, and NetworkPolicy'
+description: 'An AI-generated platform namespace bundle — Namespace, PSA labels, ResourceQuota, LimitRange, RBAC, NetworkPolicy, and a ValidatingAdmissionPolicy — reviewed bug by bug against real admission rejections, real kubectl auth can-i output, and real drain/DNS/egress behaviour on a live cluster.'
+sidebar:
+  order: 6
+---
+
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import Mermaid from '../../../../components/Mermaid.astro';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## The feature
+
+The prompt was: *"Set up a new platform namespace for a team: enforce security baselines, cap resource usage, give their app's ServiceAccount the access it needs, and lock down the network."* This is the densest kind of AI-generated bundle — seven different object kinds, each individually a small, plausible-looking snippet copied from a slightly different tutorial. It has **7 real bugs**; check the [AI bug catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/) for the general pattern behind each one. Every claim below was proven on the same real two-node `kind` cluster used in [worked review 1](/kubernetes/en/reading-k8s/worked-review-1/) (`reading-b`, Kubernetes 1.37.0), with **Calico v3.31.5** installed for real `NetworkPolicy` enforcement — real `kubectl apply`, real admission rejections, real `kubectl auth can-i`, and a real, timed network test.
+
+## The generated code
+
+```yaml
+# platform Namespace + Pod Security Admission labels, as generated -- see review below
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+```
+
+```yaml
+# platform-quota ResourceQuota, as generated -- see review below
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: platform-quota
+  namespace: platform
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+    pods: "20"
+```
+
+```yaml
+# platform-app ServiceAccount + ClusterRoleBinding, as generated -- see review below
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: platform-app
+  namespace: platform
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: platform-app-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: platform-app
+  namespace: platform
+```
+
+```yaml
+# platform-app agent Pod, as generated -- see review below
+apiVersion: v1
+kind: Pod
+metadata:
+  name: agent
+  namespace: platform
+spec:
+  serviceAccountName: platform-app
+  containers:
+  - name: c
+    image: busybox:1.36
+    command: ["sh", "-c", "sleep 3600"]
+    resources:
+      requests: { cpu: 20m, memory: 32Mi }
+      limits: { cpu: 50m, memory: 64Mi }
+    securityContext:
+      privileged: true
+```
+
+```yaml
+# default-deny NetworkPolicy, as generated -- see review below
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: platform
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+```
+
+```yaml
+# @expect-error no matches for kind "PodSecurityPolicy" in version "policy/v1beta1"
+apiVersion: policy/v1beta1
+kind: PodSecurityPolicy
+metadata:
+  name: platform-restricted
+spec:
+  privileged: false
+  runAsUser: { rule: MustRunAsNonRoot }
+  seLinux: { rule: RunAsAny }
+  fsGroup: { rule: RunAsAny }
+  supplementalGroups: { rule: RunAsAny }
+  volumes: ["*"]
+```
+
+## The review walk
+
+### RBAC: a workload ServiceAccount bound to `cluster-admin`
+
+`platform-app`'s only stated job is running the team's app inside its own namespace, but it's bound to the built-in `cluster-admin` `ClusterRole` cluster-wide via a `ClusterRoleBinding`. Proven with the exact identity a compromised container running as this ServiceAccount would have:
+
+```text
+$ kubectl auth can-i delete secrets --as=system:serviceaccount:platform:platform-app -A
+yes
+
+$ kubectl auth can-i delete nodes --as=system:serviceaccount:platform:platform-app
+yes
+```
+
+<SpotTheBug code={`roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin`}>
+`cluster-admin` is a pre-aggregated `ClusterRole` granting every verb on every resource, cluster-wide — binding it to a workload's ServiceAccount is one of the largest blast radii available in the entire object model, proven above: this identity can delete Secrets in *every* namespace, or delete Nodes outright, neither of which "run our app" ever requires. The API server accepts this binding exactly as cleanly as a correctly-scoped one; nothing at apply time distinguishes "the right amount of access" from "all of it." The fix is a namespaced `Role` naming only the verbs and resources the app's own code actually calls (`get`/`list`/`watch` on its own ConfigMaps, say), bound with a `RoleBinding` scoped to the `platform` namespace, never a `ClusterRoleBinding` to `cluster-admin`.
+</SpotTheBug>
+
+### Pod: `securityContext.privileged: true` under a `restricted` namespace
+
+The namespace enforces `pod-security.kubernetes.io/enforce: restricted`, and the agent Pod sets `privileged: true` anyway. Proven directly:
+
+```text
+$ kubectl apply -f agent-pod.yaml
+Error from server (Forbidden): error when creating "agent-pod.yaml": pods "agent" is forbidden: violates PodSecurity "restricted:latest": privileged (container "c" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (container "c" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (container "c" must set securityContext.capabilities.drop=["ALL"]), runAsNonRoot != true (pod or container "c" must set securityContext.runAsNonRoot=true), seccompProfile (pod or container "c" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+```
+
+<SpotTheBug code={`securityContext:
+  privileged: true`}>
+This is the API server itself rejecting the object outright, not a linter's opinion — Pod Security Admission (GA since 1.25, and the built-in replacement for the removed PodSecurityPolicy) enforces the `restricted` Pod Security Standard the namespace's label declares, and lists the *exact* five fields this container fails, all at once, in one real error. `privileged: true` reaching for root-equivalent host access to work around some unrelated permission error is one of the most common AI-generated "fixes" that makes a security posture strictly worse instead of solving the actual problem. The fix is naming the real capability or UID the container needs — almost never `privileged: true` — plus the other four fields the error already names: `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]`, `runAsNonRoot: true`, `seccompProfile.type: RuntimeDefault`.
+</SpotTheBug>
+
+### Pod: `automountServiceAccountToken` left on by default
+
+Neither the ServiceAccount nor the Pod sets `automountServiceAccountToken: false`, even though this agent never calls the Kubernetes API. Proven by inspecting the Pod's actual volumes once it's running:
+
+```text
+$ kubectl get pod agent-ok -o jsonpath='{.spec.volumes[*].name}'
+kube-api-access-bsgwq
+
+$ kubectl get pod agent-ok -o jsonpath='{.spec.containers[0].volumeMounts[*].mountPath}'
+/var/run/secrets/kubernetes.io/serviceaccount
+```
+
+<SpotTheBug code={`apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: platform-app
+  # no automountServiceAccountToken: false anywhere`}>
+By default every Pod gets its ServiceAccount's bound token automatically projected into a volume mounted at `/var/run/secrets/kubernetes.io/serviceaccount` — confirmed above, a real `kube-api-access-*` volume genuinely exists on this Pod's spec even though nothing in the container ever reads it. That mounted token is attack surface for no benefit at all on a workload that never calls the Kubernetes API: if the container is ever compromised, whatever RBAC that ServiceAccount holds is immediately usable from inside it. The fix is `automountServiceAccountToken: false` on the Pod (or the ServiceAccount itself), which removes the entire volume and mount, not just its contents — and is only worth re-enabling explicitly the moment the workload legitimately needs to call the API.
+</SpotTheBug>
+
+### ResourceQuota: no `LimitRange`, so every Pod must specify everything by hand
+
+The namespace has a `ResourceQuota` tracking `requests.cpu`/`requests.memory`/`limits.cpu`/`limits.memory`, but no `LimitRange` to default them. Proven with a Pod that has genuinely no `resources` block at all:
+
+```text
+$ kubectl apply -f norequest-pod.yaml
+Error from server (Forbidden): error when creating "norequest-pod.yaml": pods "norequest" is forbidden: failed quota: platform-quota: must specify limits.cpu for: c; limits.memory for: c; requests.cpu for: c; requests.memory for: c
+```
+
+<SpotTheBug code={`apiVersion: v1
+kind: ResourceQuota
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+    pods: "20"
+  # no LimitRange anywhere in this namespace`}>
+A `ResourceQuota` on any of `requests.cpu`/`requests.memory`/`limits.cpu`/`limits.memory` forces **every** Pod created in that namespace to declare all four explicitly — there is no fallback, proven above with a real, immediate `Forbidden` naming all four missing fields on a Pod that would otherwise be perfectly valid. A `LimitRange` is what supplies a default when a Pod's author doesn't specify one; without it, every team deploying into this namespace has to already know the exact quota shape just to get *any* Pod admitted, which is exactly the kind of friction that makes people copy-paste arbitrary numbers rather than think about them. The fix is a `LimitRange` in the same namespace with sane `default`/`defaultRequest` values, so an unadorned Pod spec still gets something reasonable instead of an outright rejection.
+</SpotTheBug>
+
+### NetworkPolicy: `policyTypes` missing `Egress`
+
+The generated `default-deny` policy selects every Pod (`podSelector: {}`) but only lists `Ingress` in `policyTypes` — no `Egress` at all. Proven with a real Pod that this exact policy selects, on a cluster with Calico actually enforcing NetworkPolicy:
+
+```text
+$ kubectl exec deploy/web -- wget -q -T 3 -O /dev/null -S https://1.1.1.1
+  referrer-policy: strict-origin-when-cross-origin
+  x-content-type-options: nosniff
+  x-frame-options: DENY
+  alt-svc: h3=":443"; ma=86400
+```
+
+<SpotTheBug code={`spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  # Egress is not listed here at all`}>
+A NetworkPolicy's `policyTypes` isn't just documentation of which rule lists follow — it controls which *direction* is restricted at all. Naming a Pod in `podSelector` doesn't put any limit on its egress unless `Egress` is also listed in `policyTypes`, proven above: a Pod selected by this exact "default-deny" policy still reached an arbitrary external host over HTTPS with zero restriction, real response headers and all. A manifest named `default-deny` that silently leaves one entire traffic direction wide open is a dangerous kind of wrong — it reads as complete. The fix is listing both directions explicitly: `policyTypes: [Ingress, Egress]`, with an empty (or scoped) `egress: []` to actually restrict outbound traffic too.
+</SpotTheBug>
+
+### NetworkPolicy: default-deny with no DNS egress rule
+
+Once `Egress` is correctly added to `policyTypes` with no `egress` rules at all, every outbound connection — including the cluster's own DNS lookups — is blocked. Proven with a real client Pod, before and after:
+
+```text
+$ kubectl exec client -- wget -q -T 3 -O- http://web.netpol-demo.svc.cluster.local/
+<!DOCTYPE html>
+...   # before any NetworkPolicy: works fine
+
+$ kubectl apply -f default-deny-all.yaml   # policyTypes: [Ingress, Egress], no egress rules
+$ kubectl exec client -- wget -q -T 3 -O- http://web.netpol-demo.svc.cluster.local/
+wget: bad address 'web.netpol-demo.svc.cluster.local'
+```
+
+<SpotTheBug code={`spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  # no egress rules at all -- including no DNS`}>
+`bad address` here isn't an HTTP-layer failure at all — it's a **DNS resolution failure**: with `Egress` denied and no rule allowing it, the client's own lookup to CoreDNS (UDP/TCP port 53) never leaves the Pod, so the name never resolves before an HTTP connection is even attempted, proven above by the request never getting far enough to time out on the actual connection. This is the single most common real-world default-deny outage. The fix every default-deny policy needs is a companion rule allowing DNS egress specifically — `egress: [{ to: [{namespaceSelector: {}}], ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}] }]` — which restores name resolution without reopening anything else (a separate, still-real test confirmed that DNS-only egress resolves names but a subsequent HTTP connection on port 80 still times out, since no rule allows that port).
+</SpotTheBug>
+
+### PSP: a `PodSecurityPolicy` resource that no longer exists
+
+The generated manifest set includes a `PodSecurityPolicy` object meant to enforce the same baseline the namespace's PSA labels already declare. Proven directly:
+
+```text
+$ kubectl apply -f psp.yaml
+error: resource mapping not found for name: "platform-restricted" namespace: "" from "psp.yaml": no matches for kind "PodSecurityPolicy" in version "policy/v1beta1"
+ensure CRDs are installed first
+```
+
+<SpotTheBug code={`apiVersion: policy/v1beta1
+kind: PodSecurityPolicy`}>
+PodSecurityPolicy was **removed** (not merely deprecated) in Kubernetes 1.25, the same release Pod Security Admission became GA specifically as its built-in replacement — this course's own [Pod and Cluster Security](/kubernetes/en/observability-and-security/pod-and-cluster-security/) lesson already established this fact. The API server has no route for this kind at all on a current cluster, so it fails at the same discovery-layer stage as the removed API versions in the other two reviews in this module. The fix isn't a newer PSP shape — there isn't one — it's deleting this object entirely, since the namespace's `pod-security.kubernetes.io/enforce: restricted` label (already present and already proven, above, to really reject `privileged: true`) is doing this job correctly on its own.
+</SpotTheBug>
+
+## The corrected code
+
+```yaml
+# k8s/worked-review-3/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+```
+
+```yaml
+# k8s/worked-review-3/quota-and-limitrange.yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: platform-quota
+  namespace: platform
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+    pods: "20"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: platform-limits
+  namespace: platform
+spec:
+  limits:
+  - type: Container
+    default: { cpu: 200m, memory: 256Mi }
+    defaultRequest: { cpu: 100m, memory: 128Mi }
+```
+
+```yaml
+# k8s/worked-review-3/rbac.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: platform-app
+  namespace: platform
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: platform-app-role
+  namespace: platform
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: platform-app-binding
+  namespace: platform
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: platform-app-role
+subjects:
+- kind: ServiceAccount
+  name: platform-app
+  namespace: platform
+```
+
+```yaml
+# k8s/worked-review-3/agent-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: agent
+  namespace: platform
+spec:
+  # serviceAccountName omitted -- uses the namespace's real "default" SA so this
+  # fence dry-runs standalone; a real deployment would set
+  # serviceAccountName: platform-app (defined in rbac.yaml above)
+  automountServiceAccountToken: false
+  containers:
+  - name: c
+    image: busybox:1.36
+    command: ["sh", "-c", "sleep 3600"]
+    resources:
+      requests: { cpu: 20m, memory: 32Mi }
+      limits: { cpu: 50m, memory: 64Mi }
+    securityContext:
+      allowPrivilegeEscalation: false
+      runAsNonRoot: true
+      runAsUser: 1000
+      capabilities: { drop: ["ALL"] }
+      seccompProfile: { type: RuntimeDefault }
+```
+
+```yaml
+# k8s/worked-review-3/networkpolicy.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: platform
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: platform
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - { protocol: UDP, port: 53 }
+    - { protocol: TCP, port: 53 }
+```
+
+```yaml
+# k8s/worked-review-3/vap.yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: platform-registry-allowlist
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE"]
+      resources: ["pods"]
+  validations:
+  - expression: >-
+      object.spec.containers.all(c,
+        c.image.startsWith('registry.k8s.io/') ||
+        c.image.startsWith('docker.io/library/'))
+    message: "container images must come from an allowlisted registry"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: platform-registry-allowlist-binding
+spec:
+  policyName: platform-registry-allowlist
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: platform
+```
+
+`npm run verify` dry-runs all six files above against the shared `verify-k8s` cluster with 0 errors. Every fence here declares its own `metadata.namespace: platform` (a real namespace bundle has to), so — same as this course's own [Namespaces and Resource Quotas](/kubernetes/en/storage-and-config/namespaces-and-resource-quotas/) lesson — `--apply` dry-runs them too rather than really applying into its ephemeral namespace (confirmed directly: `node tools/verify-manifests.mjs --apply reading-k8s/worked-review-3` and `--apply storage-and-config/namespaces-and-resource-quotas` both print `kubectl wait: error: no matching resources found` and an empty `get all`, since the harness only real-applies fences that let it inject `-n <ephemeral>` itself). The real, non-dry-run proof for this review's fixed set is everything already captured above on `reading-b`: a real `platform` namespace with the `restricted` PSA label really rejecting `privileged: true`, a real `ResourceQuota`+`LimitRange` pair really admitting a resources-less Pod, a real `RoleBinding` really narrowing `can-i delete secrets -A` from `yes` to `no`, and real Calico-enforced `NetworkPolicy` behavior for both the egress and DNS fixes.
+
+## What changed and why
+
+| # | Bug | Fix |
+|---|---|---|
+| 1 | ServiceAccount bound to `cluster-admin` via `ClusterRoleBinding` | Namespaced `Role`/`RoleBinding` naming only the verbs actually used — real `can-i delete secrets -A` proven `yes` before, `no` after |
+| 2 | `securityContext.privileged: true` | Full `restricted`-compliant `securityContext` — real, five-field admission rejection proven before |
+| 3 | `automountServiceAccountToken` left on for a workload that never calls the API | `automountServiceAccountToken: false` — real `kube-api-access-*` volume proven present before |
+| 4 | `ResourceQuota` with no `LimitRange` | `LimitRange` with `default`/`defaultRequest` added — real `must specify limits.cpu...` rejection proven before |
+| 5 | NetworkPolicy `policyTypes` missing `Egress` | Both directions listed — real, unrestricted HTTPS egress proven before |
+| 6 | Default-deny with no DNS egress rule | A companion `allow-dns-egress` policy — real `bad address` (DNS failure) proven before |
+| 7 | `PodSecurityPolicy` resource (removed API) | Deleted entirely — namespace's PSA labels already do this job; real `no matches for kind` proven |
+
+## Mental Model
+
+Only one of these seven bugs (7, the PSP) is the API server refusing to recognize the object at all. Two more (2, the privileged Pod; 4, the quota-less Pod) are real, immediate admission rejections — but rejections of a *different* Pod than the one that was supposed to work, which is exactly why they're easy to miss when reviewing the platform bundle in isolation from an actual workload trying to use it. The remaining four (1, 3, 5, 6) all apply cleanly and pass every check, because each is a claim about scope or completeness that nothing at apply time cross-references: that a binding grants no more than the workload needs, that a token mount is actually used by anything, that "Ingress" and "Egress" in `policyTypes` were both considered rather than one copy-pasted from a different example, that a "default-deny" policy's own infrastructure dependencies (DNS) were accounted for. A platform namespace bundle is unusually dense with this shape of bug precisely because it's several independently-plausible-looking objects that only reveal a gap when a real workload tries to actually run inside them.
+
+## Common Misconceptions
+
+- **"A workload ServiceAccount bound to `cluster-admin` is fine as long as the workload itself is trusted."** Proven above: the risk isn't today's trust, it's blast radius if that workload is ever compromised — this exact binding can delete Secrets in every namespace or delete Nodes outright, real and confirmed with `kubectl auth can-i`.
+- **"`policyTypes: [Ingress]` on a NetworkPolicy that only defines `ingress` rules is just being explicit about what this policy does."** Proven above: omitting `Egress` from `policyTypes` doesn't just mean "no egress rules are defined here," it means egress for the selected Pods is **not restricted by this policy at all** — a real HTTPS request to an arbitrary host succeeded through a policy named `default-deny`.
+- **"A `ResourceQuota` on cpu/memory implies Kubernetes fills in reasonable defaults for Pods that don't specify them."** Proven above with a real, immediate rejection: a `ResourceQuota` covering a resource makes that resource **mandatory** on every Pod in the namespace — only a `LimitRange` supplies a default.
+
+<Mermaid title="Where each bug sits in this platform namespace's admission and traffic path" code={wr3Diagram} />
+
+export const wr3Diagram = `flowchart TD
+  NS["Namespace: platform, PSA restricted"]
+  NS --> RBAC["ServiceAccount platform-app -- bound to cluster-admin"]
+  RBAC -->|"1: can delete Secrets/Nodes anywhere"| RBAC
+  NS --> POD["agent Pod: privileged=true"]
+  POD -->|"2: restricted admission rejects"| POD
+  NS --> TOK["agent Pod: automountServiceAccountToken unset"]
+  TOK -->|"3: token mounted, unused"| TOK
+  NS --> Q["ResourceQuota, no LimitRange"]
+  Q -->|"4: every Pod must specify everything"| Q
+  NS --> NP["NetworkPolicy default-deny: policyTypes=[Ingress]"]
+  NP -->|"5: egress wide open"| NP
+  NS --> DNS["default-deny-all: no egress rules"]
+  DNS -->|"6: DNS egress blocked too"| DNS
+  PSP["PodSecurityPolicy: policy/v1beta1"] -->|"7: kind removed in 1.25"| PSP
+`;
+
+<Callout title="The one-line takeaway">
+A platform namespace bundle packs seven objects that each look individually correct — an RBAC binding, a security context, a token setting, a quota, two NetworkPolicy directions, a removed-API object — and only one of them is a hard rejection on its face. The other six need a real workload trying to actually run, call the API, or reach the network through them before the gap between "looks locked down" and "is locked down" shows up at all.
+</Callout>
+
+export const quizWorkedReview3 = [
+  {
+    q: "```text\n$ kubectl auth can-i delete secrets --as=system:serviceaccount:platform:platform-app -A\nyes\n```\nA workload ServiceAccount whose app only reads its own namespace's ConfigMaps is bound to `cluster-admin` via a `ClusterRoleBinding`. What does this real `can-i` output prove, and why does the API server accept the binding without complaint?",
+    options: [
+      "It's a false positive; cluster-admin only affects RBAC objects themselves",
+      'cluster-admin grants every verb on every resource cluster-wide, so this identity really can delete Secrets in any namespace (or Nodes outright) -- the API server never checks whether a binding grants more than a workload needs, only whether the binding itself is syntactically valid',
+      'This would only be true if the ServiceAccount also had a Role bound',
+      'can-i --as always returns yes for ServiceAccounts regardless of RBAC',
+    ],
+    answer: 1,
+    explain: 'Proven above with a real `kubectl auth can-i`, both for Secrets across all namespaces and for cluster-scoped Nodes. Nothing at apply time distinguishes a right-sized grant from cluster-admin -- least privilege has to be a review-time check, not something the API server enforces.',
+  },
+  {
+    q: "```text\nError from server (Forbidden): ... violates PodSecurity \"restricted:latest\": privileged (container \"c\" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (...), unrestricted capabilities (...), runAsNonRoot != true (...), seccompProfile (...)\n```\nThis is a real rejection under a namespace labeled `pod-security.kubernetes.io/enforce: restricted`. What produced this error, and how many separate requirements does it name at once?",
+    options: [
+      'A third-party admission webhook; PSA itself only warns, never blocks',
+      "Pod Security Admission itself, built into the API server -- it names all five restricted-standard requirements this container fails simultaneously in one real rejection: privileged, allowPrivilegeEscalation, capabilities, runAsNonRoot, and seccompProfile",
+      'Only privileged is checked; the rest of the message is generic boilerplate',
+      'This error only appears in --dry-run=server mode, not on a real apply',
+    ],
+    answer: 1,
+    explain: "Proven above: this is a real, non-dry-run `Forbidden` from the API server's own built-in Pod Security Admission (GA since 1.25), which replaced the removed PodSecurityPolicy. It lists all five fields the restricted standard requires and that this container fails, in one message.",
+  },
+  {
+    q: 'A NetworkPolicy named `default-deny` sets `podSelector: {}` and `policyTypes: [Ingress]` only (no `Egress` listed). A Pod it selects is tested with a real request to an external HTTPS host. What happens, and why?',
+    options: [
+      'The request is blocked, since podSelector: {} denies all traffic by default',
+      "The request succeeds with real response headers -- omitting Egress from policyTypes means egress for these Pods is not restricted by this policy at all, regardless of the policy's name or its podSelector",
+      'The request succeeds but only because Calico is not installed',
+      'policyTypes is purely documentation and has no effect on enforcement',
+    ],
+    answer: 1,
+    explain: 'Proven above on a cluster with Calico actually enforcing NetworkPolicy: a Pod selected by this exact policy reached an arbitrary external host over HTTPS with full response headers, unrestricted. policyTypes controls which traffic direction a policy restricts at all -- a selector alone restricts nothing.',
+  },
+  {
+    q: "```text\n$ kubectl exec client -- wget -q -T 3 -O- http://web/\nwget: bad address 'web...'\n```\nA default-deny policy with `policyTypes: [Ingress, Egress]` and zero egress rules is applied. A client Pod's request fails with `bad address` rather than a connection timeout. What does that specific error text prove?",
+    options: [
+      'The web Service was deleted',
+      "It is a DNS resolution failure, not an HTTP-layer failure -- with Egress denied and no rule allowing it, the client's own lookup to CoreDNS (port 53) never leaves the Pod, so the name never resolves before any connection is attempted",
+      'bad address means the destination actively refused the connection',
+      'This proves the NetworkPolicy failed to apply',
+    ],
+    answer: 1,
+    explain: "Proven above: `bad address` (not a timeout) is exactly what a failed DNS lookup produces client-side. Adding a companion egress rule for UDP/TCP port 53 restored name resolution -- proven separately, though a subsequent HTTP connection on port 80 still timed out since no rule allowed that port specifically.",
+  },
+  {
+    q: "```text\nError from server (Forbidden): ... pods \"norequest\" is forbidden: failed quota: platform-quota: must specify limits.cpu for: c; limits.memory for: c; requests.cpu for: c; requests.memory for: c\n```\nA namespace has a ResourceQuota covering cpu/memory requests and limits, but no LimitRange. A Pod with no resources block at all is rejected with this message. What would prevent this specific rejection?",
+    options: [
+      'Nothing -- every Pod in a namespace with any ResourceQuota must always specify resources by hand, LimitRange or not',
+      'A LimitRange in the same namespace with default/defaultRequest values -- it supplies the missing fields automatically so an unadorned Pod spec is still admitted',
+      'Increasing the ResourceQuota hard limits to larger numbers',
+      'Adding requests.cpu to the ResourceQuota itself a second time',
+    ],
+    answer: 1,
+    explain: "Proven above and established by this course's own Namespaces and Resource Quotas lesson: a ResourceQuota tracking a resource makes it mandatory on every Pod unless a LimitRange in the same namespace supplies a default -- with no LimitRange, every Pod author has to already know the exact quota shape just to get admitted at all.",
+  },
+];
+
+<Quiz client:visible id="reading-k8s/worked-review-3" questions={quizWorkedReview3} />
+
+<ProgressTracker client:visible id="reading-k8s/worked-review-3" />

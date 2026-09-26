@@ -1,0 +1,526 @@
+---
+title: 'รีวิวจริง 3: platform namespace พร้อม RBAC, quota และ NetworkPolicy'
+description: 'platform namespace bundle ที่ AI generate ให้ -- Namespace, PSA labels, ResourceQuota, LimitRange, RBAC, NetworkPolicy และ ValidatingAdmissionPolicy -- รีวิวทีละ bug เทียบกับ admission rejection จริง, kubectl auth can-i จริง และพฤติกรรม drain/DNS/egress จริงบน cluster จริง'
+sidebar:
+  order: 6
+---
+
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import Mermaid from '../../../../components/Mermaid.astro';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## Feature ที่ขอ
+
+Prompt คือ: *"ตั้ง platform namespace ใหม่ให้ทีม: enforce security baseline, จำกัด resource usage, ให้ ServiceAccount ของแอปมี access ที่ต้องใช้ แล้วล็อค network ให้แน่นหนา"* นี่คือ bundle ที่ AI generate แน่นที่สุดแบบหนึ่ง -- object 7 ชนิดต่างกัน แต่ละอันแยกดูก็เป็น snippet เล็ก ๆ ที่ดูสมเหตุสมผลก็อปมาจาก tutorial คนละแหล่ง มี **bug จริง 7 ตัว** เช็ค [AI bug catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/) สำหรับ pattern ทั่วไปเบื้องหลังแต่ละตัว ทุกข้อความอ้างด้านล่างพิสูจน์จริงบน `kind` cluster 2 node เดียวกับที่ใช้ใน [รีวิวจริง 1](/kubernetes/en/reading-k8s/worked-review-1/) (`reading-b`, Kubernetes 1.37.0) พร้อมติดตั้ง **Calico v3.31.5** เพื่อบังคับใช้ `NetworkPolicy` จริง -- `kubectl apply` จริง, admission rejection จริง, `kubectl auth can-i` จริง และ network test แบบจับเวลาจริง
+
+## โค้ดที่ AI generate ให้
+
+```yaml
+# platform Namespace + Pod Security Admission labels, as generated -- see review below
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+```
+
+```yaml
+# platform-quota ResourceQuota, as generated -- see review below
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: platform-quota
+  namespace: platform
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+    pods: "20"
+```
+
+```yaml
+# platform-app ServiceAccount + ClusterRoleBinding, as generated -- see review below
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: platform-app
+  namespace: platform
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: platform-app-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: platform-app
+  namespace: platform
+```
+
+```yaml
+# platform-app agent Pod, as generated -- see review below
+apiVersion: v1
+kind: Pod
+metadata:
+  name: agent
+  namespace: platform
+spec:
+  serviceAccountName: platform-app
+  containers:
+  - name: c
+    image: busybox:1.36
+    command: ["sh", "-c", "sleep 3600"]
+    resources:
+      requests: { cpu: 20m, memory: 32Mi }
+      limits: { cpu: 50m, memory: 64Mi }
+    securityContext:
+      privileged: true
+```
+
+```yaml
+# default-deny NetworkPolicy, as generated -- see review below
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: platform
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+```
+
+```yaml
+# @expect-error no matches for kind "PodSecurityPolicy" in version "policy/v1beta1"
+apiVersion: policy/v1beta1
+kind: PodSecurityPolicy
+metadata:
+  name: platform-restricted
+spec:
+  privileged: false
+  runAsUser: { rule: MustRunAsNonRoot }
+  seLinux: { rule: RunAsAny }
+  fsGroup: { rule: RunAsAny }
+  supplementalGroups: { rule: RunAsAny }
+  volumes: ["*"]
+```
+
+## เดินรีวิวทีละจุด
+
+### RBAC: workload ServiceAccount ที่ผูกกับ `cluster-admin`
+
+หน้าที่เดียวของ `platform-app` คือรันแอปของทีมในเนมสเปซตัวเอง แต่ถูกผูกกับ `ClusterRole` built-in `cluster-admin` ทั่วทั้ง cluster ผ่าน `ClusterRoleBinding` พิสูจน์ด้วยตัวตนจริงที่ container ที่ถูก compromise แล้วรันด้วย ServiceAccount นี้จะมี:
+
+```text
+$ kubectl auth can-i delete secrets --as=system:serviceaccount:platform:platform-app -A
+yes
+
+$ kubectl auth can-i delete nodes --as=system:serviceaccount:platform:platform-app
+yes
+```
+
+<SpotTheBug code={`roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin`}>
+`cluster-admin` เป็น `ClusterRole` แบบ pre-aggregated ที่ให้ทุก verb บนทุก resource ทั่วทั้ง cluster -- การผูกมันเข้ากับ ServiceAccount ของ workload คือหนึ่งใน blast radius ที่ใหญ่ที่สุดในทั้ง object model พิสูจน์แล้วด้านบน: ตัวตนนี้ลบ Secret ใน*ทุก*namespace ได้ หรือลบ Node ได้ตรง ๆ ซึ่งไม่มีอันไหนที่ "รันแอปของเรา" ต้องการเลย API server รับ binding นี้เนียนพอ ๆ กับตัวที่ scope ถูกต้อง -- ไม่มีอะไรตอน apply แยก "access ที่พอดี" ออกจาก "ทั้งหมด" เลย วิธีแก้คือ `Role` แบบ namespaced ที่ระบุแค่ verb กับ resource ที่โค้ดของแอปเรียกใช้จริง (เช่น `get`/`list`/`watch` บน ConfigMap ของตัวเอง) ผูกด้วย `RoleBinding` ที่ scope แค่ namespace `platform` ไม่ใช่ `ClusterRoleBinding` ไปที่ `cluster-admin` เด็ดขาด
+</SpotTheBug>
+
+### Pod: `securityContext.privileged: true` ใต้ namespace ที่เป็น `restricted`
+
+Namespace enforce `pod-security.kubernetes.io/enforce: restricted` แต่ agent Pod ยังตั้ง `privileged: true` อยู่ดี พิสูจน์ตรง:
+
+```text
+$ kubectl apply -f agent-pod.yaml
+Error from server (Forbidden): error when creating "agent-pod.yaml": pods "agent" is forbidden: violates PodSecurity "restricted:latest": privileged (container "c" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (container "c" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (container "c" must set securityContext.capabilities.drop=["ALL"]), runAsNonRoot != true (pod or container "c" must set securityContext.runAsNonRoot=true), seccompProfile (pod or container "c" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+```
+
+<SpotTheBug code={`securityContext:
+  privileged: true`}>
+นี่คือ API server เองปฏิเสธ object ตรง ๆ ไม่ใช่ความเห็นของ linter -- Pod Security Admission (GA ตั้งแต่ 1.25 และเป็นตัวแทน built-in ของ PodSecurityPolicy ที่ถูกลบไป) enforce Pod Security Standard `restricted` ที่ label ของ namespace ประกาศไว้ แล้วบอก field ที่ container นี้ fail *ทั้งห้า*พร้อมกันเป๊ะใน error เดียว `privileged: true` ที่เอามาแก้ permission error อื่นที่ไม่เกี่ยวกันเป็น "fix" แบบที่ AI generate บ่อยที่สุดแบบหนึ่งที่ทำให้ security posture แย่ลงกว่าเดิมแทนที่จะแก้ปัญหาจริง วิธีแก้คือระบุ capability หรือ UID จริงที่ container ต้องการ -- แทบไม่เคยเป็น `privileged: true` เลย บวก field ที่เหลืออีกสี่ตัวที่ error บอกไว้แล้ว: `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]`, `runAsNonRoot: true`, `seccompProfile.type: RuntimeDefault`
+</SpotTheBug>
+
+### Pod: `automountServiceAccountToken` ถูกปล่อย default ไว้
+
+ทั้ง ServiceAccount และ Pod ไม่ได้ตั้ง `automountServiceAccountToken: false` เลย ทั้งที่ agent ตัวนี้ไม่เคยเรียก Kubernetes API เลย พิสูจน์ด้วยการดู volume จริงของ Pod ตอนรันอยู่:
+
+```text
+$ kubectl get pod agent-ok -o jsonpath='{.spec.volumes[*].name}'
+kube-api-access-bsgwq
+
+$ kubectl get pod agent-ok -o jsonpath='{.spec.containers[0].volumeMounts[*].mountPath}'
+/var/run/secrets/kubernetes.io/serviceaccount
+```
+
+<SpotTheBug code={`apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: platform-app
+  # no automountServiceAccountToken: false anywhere`}>
+โดย default ทุก Pod จะได้ bound token ของ ServiceAccount ตัวเอง project เข้ามาเป็น volume mount ที่ `/var/run/secrets/kubernetes.io/serviceaccount` อัตโนมัติ -- เช็คแล้วด้านบน volume `kube-api-access-*` มีอยู่จริงบน spec ของ Pod นี้ ทั้งที่ไม่มีตรงไหนใน container อ่านมันเลยสักครั้ง token ที่ mount ไว้นั้นคือ attack surface ที่ไม่ได้ประโยชน์อะไรเลยสำหรับ workload ที่ไม่เคยเรียก Kubernetes API: ถ้า container ถูก compromise เมื่อไหร่ RBAC ที่ ServiceAccount นั้นถืออยู่ใช้ได้ทันทีจากข้างในเลย วิธีแก้คือ `automountServiceAccountToken: false` บน Pod (หรือบน ServiceAccount เอง) ซึ่งเอา volume กับ mount ทั้งก้อนออกไปเลย ไม่ใช่แค่เนื้อหาข้างใน -- แล้วค่อยเปิดกลับมาชัดเจนเมื่อ workload ต้องเรียก API จริง ๆ
+</SpotTheBug>
+
+### ResourceQuota: ไม่มี `LimitRange` ทุก Pod ต้องระบุทุกอย่างเอง
+
+Namespace มี `ResourceQuota` ที่ track `requests.cpu`/`requests.memory`/`limits.cpu`/`limits.memory` แต่ไม่มี `LimitRange` ให้ default พิสูจน์ด้วย Pod ที่ไม่มี `resources` block เลยจริง ๆ:
+
+```text
+$ kubectl apply -f norequest-pod.yaml
+Error from server (Forbidden): error when creating "norequest-pod.yaml": pods "norequest" is forbidden: failed quota: platform-quota: must specify limits.cpu for: c; limits.memory for: c; requests.cpu for: c; requests.memory for: c
+```
+
+<SpotTheBug code={`apiVersion: v1
+kind: ResourceQuota
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+    pods: "20"
+  # no LimitRange anywhere in this namespace`}>
+`ResourceQuota` ที่ครอบ `requests.cpu`/`requests.memory`/`limits.cpu`/`limits.memory` ตัวใดตัวหนึ่ง บังคับให้ Pod **ทุกตัว**ที่สร้างใน namespace นั้นต้องระบุครบทั้งสี่ตัวเอง ไม่มี fallback เลย พิสูจน์แล้วด้านบนด้วย `Forbidden` จริงทันทีที่บอกครบทั้งสี่ field ที่หายไปบน Pod ที่ถ้าไม่มี quota นี้ก็ valid สมบูรณ์ `LimitRange` คือตัวที่ให้ default เมื่อคนเขียน Pod ไม่ได้ระบุไว้ -- ถ้าไม่มีมัน ทุกทีมที่ deploy เข้า namespace นี้ต้องรู้ shape ของ quota แบบเป๊ะ ๆ ก่อนถึงจะสร้าง Pod อะไรก็ได้ผ่านเลย ซึ่งเป็น friction แบบที่ทำให้คนก็อปตัวเลขมาแปะมั่ว ๆ แทนที่จะคิดจริง วิธีแก้คือใส่ `LimitRange` ใน namespace เดียวกันด้วยค่า `default`/`defaultRequest` ที่สมเหตุสมผล เพื่อให้ Pod spec เปล่า ๆ ยังได้ค่าที่ใช้ได้แทนที่จะโดนปฏิเสธตรง ๆ
+</SpotTheBug>
+
+### NetworkPolicy: `policyTypes` ไม่มี `Egress`
+
+policy `default-deny` ที่ generate มาเลือก Pod ทุกตัว (`podSelector: {}`) แต่ `policyTypes` มีแค่ `Ingress` -- ไม่มี `Egress` เลย พิสูจน์ด้วย Pod จริงที่ policy นี้เลือกตรง ๆ บน cluster ที่ Calico บังคับใช้ NetworkPolicy จริง:
+
+```text
+$ kubectl exec deploy/web -- wget -q -T 3 -O /dev/null -S https://1.1.1.1
+  referrer-policy: strict-origin-when-cross-origin
+  x-content-type-options: nosniff
+  x-frame-options: DENY
+  alt-svc: h3=":443"; ma=86400
+```
+
+<SpotTheBug code={`spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  # Egress is not listed here at all`}>
+`policyTypes` ของ NetworkPolicy ไม่ใช่แค่ documentation ว่ามี rule list ไหนตามมา -- มันคุมว่า*ทิศทาง*ไหนบ้างที่ถูกจำกัดเลย การระบุ Pod ใน `podSelector` ไม่ได้จำกัด egress ของมันเลยถ้าไม่มี `Egress` อยู่ใน `policyTypes` ด้วย พิสูจน์แล้วด้านบน: Pod ที่ policy "default-deny" ตัวนี้เลือกตรง ๆ ยังไปถึง host ภายนอกผ่าน HTTPS ได้แบบไม่มีข้อจำกัดเลย พร้อม response header จริงครบ manifest ที่ชื่อ `default-deny` แต่เปิดทิศทาง traffic หนึ่งไว้กว้างเงียบ ๆ คือความผิดพลาดแบบที่อันตราย เพราะมันดูเหมือนสมบูรณ์แล้ว วิธีแก้คือระบุทั้งสองทิศทางชัดเจน: `policyTypes: [Ingress, Egress]` พร้อม `egress: []` เปล่า (หรือ scope ไว้) เพื่อจำกัด outbound traffic จริง ๆ ด้วย
+</SpotTheBug>
+
+### NetworkPolicy: default-deny ที่ไม่มี DNS egress rule
+
+พอเพิ่ม `Egress` เข้า `policyTypes` ถูกต้องแล้วแต่ไม่มี `egress` rule เลยสักตัว ทุก connection ขาออก -- รวมถึง DNS lookup ของ cluster เอง -- ก็ถูกบล็อคหมด พิสูจน์ด้วย client Pod จริง ก่อนและหลัง:
+
+```text
+$ kubectl exec client -- wget -q -T 3 -O- http://web.netpol-demo.svc.cluster.local/
+<!DOCTYPE html>
+...   # ก่อนมี NetworkPolicy ใด ๆ: ทำงานปกติ
+
+$ kubectl apply -f default-deny-all.yaml   # policyTypes: [Ingress, Egress], ไม่มี egress rule
+$ kubectl exec client -- wget -q -T 3 -O- http://web.netpol-demo.svc.cluster.local/
+wget: bad address 'web.netpol-demo.svc.cluster.local'
+```
+
+<SpotTheBug code={`spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  # no egress rules at all -- including no DNS`}>
+`bad address` ตรงนี้ไม่ใช่ failure ระดับ HTTP เลย -- เป็น **DNS resolution failure**: พอ `Egress` ถูกปฏิเสธและไม่มี rule อนุญาตเลย lookup ของ client ไปหา CoreDNS (UDP/TCP port 53) เองไม่หลุดออกจาก Pod เลย ชื่อเลย resolve ไม่ออกก่อนที่จะพยายาม connect HTTP ด้วยซ้ำ พิสูจน์แล้วด้านบนว่า request ไปไม่ถึงขั้น timeout บน connection จริงเลยด้วยซ้ำ นี่คือสาเหตุ outage แบบ default-deny ที่พบบ่อยที่สุดในโลกจริง วิธีแก้ที่ default-deny policy ทุกตัวต้องมีคือ rule คู่กันที่อนุญาต DNS egress โดยเฉพาะ -- `egress: [{ to: [{namespaceSelector: {}}], ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}] }]` -- ซึ่งคืนความสามารถ resolve ชื่อโดยไม่เปิดอะไรอื่นเพิ่ม (test แยกอีกอันยืนยันว่า DNS-only egress ทำให้ resolve ชื่อได้ แต่ HTTP connection ถัดมาบน port 80 ยัง timeout อยู่ดี เพราะไม่มี rule อนุญาต port นั้น)
+</SpotTheBug>
+
+### PSP: `PodSecurityPolicy` resource ที่ไม่มีอยู่แล้ว
+
+manifest set ที่ generate มามี object `PodSecurityPolicy` ที่ตั้งใจ enforce baseline เดียวกับที่ PSA label ของ namespace ประกาศไว้แล้ว พิสูจน์ตรง:
+
+```text
+$ kubectl apply -f psp.yaml
+error: resource mapping not found for name: "platform-restricted" namespace: "" from "psp.yaml": no matches for kind "PodSecurityPolicy" in version "policy/v1beta1"
+ensure CRDs are installed first
+```
+
+<SpotTheBug code={`apiVersion: policy/v1beta1
+kind: PodSecurityPolicy`}>
+PodSecurityPolicy ถูก**ลบ**ไป (ไม่ใช่แค่ deprecate) ใน Kubernetes 1.25 release เดียวกับที่ Pod Security Admission กลายเป็น GA ในฐานะตัวแทน built-in ของมันเป๊ะ -- บทเรียน [Pod and Cluster Security](/kubernetes/en/observability-and-security/pod-and-cluster-security/) ของคอร์สนี้ยืนยันข้อเท็จจริงนี้ไว้แล้ว API server ไม่มี route ให้ kind นี้เลยบน cluster ปัจจุบัน เลย fail ที่ discovery-layer stage เดียวกับ API version ที่ถูกลบในรีวิวอื่นสองอันของโมดูลนี้ วิธีแก้ไม่ใช่ PSP shape ใหม่ -- เพราะไม่มีแล้ว -- แต่คือลบ object นี้ทิ้งไปเลย เพราะ label `pod-security.kubernetes.io/enforce: restricted` ของ namespace (มีอยู่แล้วและพิสูจน์แล้วด้านบนว่าปฏิเสธ `privileged: true` ได้จริง) ทำหน้าที่นี้ถูกต้องด้วยตัวเองอยู่แล้ว
+</SpotTheBug>
+
+## โค้ดที่แก้แล้ว
+
+```yaml
+# k8s/worked-review-3/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+```
+
+```yaml
+# k8s/worked-review-3/quota-and-limitrange.yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: platform-quota
+  namespace: platform
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+    pods: "20"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: platform-limits
+  namespace: platform
+spec:
+  limits:
+  - type: Container
+    default: { cpu: 200m, memory: 256Mi }
+    defaultRequest: { cpu: 100m, memory: 128Mi }
+```
+
+```yaml
+# k8s/worked-review-3/rbac.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: platform-app
+  namespace: platform
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: platform-app-role
+  namespace: platform
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: platform-app-binding
+  namespace: platform
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: platform-app-role
+subjects:
+- kind: ServiceAccount
+  name: platform-app
+  namespace: platform
+```
+
+```yaml
+# k8s/worked-review-3/agent-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: agent
+  namespace: platform
+spec:
+  # serviceAccountName omitted -- uses the namespace's real "default" SA so this
+  # fence dry-runs standalone; a real deployment would set
+  # serviceAccountName: platform-app (defined in rbac.yaml above)
+  automountServiceAccountToken: false
+  containers:
+  - name: c
+    image: busybox:1.36
+    command: ["sh", "-c", "sleep 3600"]
+    resources:
+      requests: { cpu: 20m, memory: 32Mi }
+      limits: { cpu: 50m, memory: 64Mi }
+    securityContext:
+      allowPrivilegeEscalation: false
+      runAsNonRoot: true
+      runAsUser: 1000
+      capabilities: { drop: ["ALL"] }
+      seccompProfile: { type: RuntimeDefault }
+```
+
+```yaml
+# k8s/worked-review-3/networkpolicy.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: platform
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: platform
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - { protocol: UDP, port: 53 }
+    - { protocol: TCP, port: 53 }
+```
+
+```yaml
+# k8s/worked-review-3/vap.yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: platform-registry-allowlist
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE"]
+      resources: ["pods"]
+  validations:
+  - expression: >-
+      object.spec.containers.all(c,
+        c.image.startsWith('registry.k8s.io/') ||
+        c.image.startsWith('docker.io/library/'))
+    message: "container images must come from an allowlisted registry"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: platform-registry-allowlist-binding
+spec:
+  policyName: platform-registry-allowlist
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: platform
+```
+
+`npm run verify` dry-run ทั้ง 6 ไฟล์ด้านบนกับ `verify-k8s` cluster ที่ใช้ร่วมกัน ได้ 0 error ทุก fence ในนี้ประกาศ `metadata.namespace: platform` ของตัวเอง (namespace bundle จริงต้องทำแบบนี้) เลย -- เหมือนกับบทเรียน [Namespaces and Resource Quotas](/kubernetes/en/storage-and-config/namespaces-and-resource-quotas/) ของคอร์สนี้เอง -- `--apply` ก็แค่ dry-run มันแทนที่จะ apply จริงลง namespace ชั่วคราว (เช็คตรงแล้ว: `node tools/verify-manifests.mjs --apply reading-k8s/worked-review-3` กับ `--apply storage-and-config/namespaces-and-resource-quotas` ทั้งคู่ print `kubectl wait: error: no matching resources found` และ `get all` ว่างเปล่า เพราะ harness apply จริงได้แค่ fence ที่ปล่อยให้มัน inject `-n <ephemeral>` เองเท่านั้น) หลักฐาน apply จริงแบบไม่ dry-run สำหรับ fixed set ของรีวิวนี้คือทุกอย่างที่พิสูจน์ไปแล้วด้านบนบน `reading-b`: namespace `platform` จริงที่ label `restricted` PSA ปฏิเสธ `privileged: true` จริง, `ResourceQuota`+`LimitRange` คู่จริงที่ admit Pod ไม่มี resources ได้จริง, `RoleBinding` จริงที่ทำให้ `can-i delete secrets -A` แคบลงจาก `yes` เป็น `no` จริง และพฤติกรรม `NetworkPolicy` ที่ Calico บังคับใช้จริงทั้งสำหรับ egress fix กับ DNS fix
+
+## สรุปว่าแก้อะไรทำไม
+
+| # | Bug | วิธีแก้ |
+|---|---|---|
+| 1 | ServiceAccount ผูกกับ `cluster-admin` ผ่าน `ClusterRoleBinding` | `Role`/`RoleBinding` แบบ namespaced ที่ระบุแค่ verb ที่ใช้จริง -- `can-i delete secrets -A` พิสูจน์จริง `yes` ก่อน `no` หลัง |
+| 2 | `securityContext.privileged: true` | `securityContext` ที่ compliant กับ `restricted` เต็มรูปแบบ -- admission rejection ห้า field จริงพิสูจน์ก่อน |
+| 3 | `automountServiceAccountToken` ถูกปล่อย default สำหรับ workload ที่ไม่เรียก API เลย | `automountServiceAccountToken: false` -- volume `kube-api-access-*` จริงพิสูจน์ว่ามีอยู่ก่อน |
+| 4 | `ResourceQuota` ไม่มี `LimitRange` | เพิ่ม `LimitRange` พร้อม `default`/`defaultRequest` -- `must specify limits.cpu...` จริงพิสูจน์ก่อน |
+| 5 | NetworkPolicy `policyTypes` ไม่มี `Egress` | ระบุทั้งสองทิศทาง -- HTTPS egress ที่ไม่ถูกจำกัดจริงพิสูจน์ก่อน |
+| 6 | Default-deny ไม่มี DNS egress rule | policy คู่กัน `allow-dns-egress` -- `bad address` (DNS fail) จริงพิสูจน์ก่อน |
+| 7 | Object `PodSecurityPolicy` (API ที่ถูกลบ) | ลบทิ้งทั้งหมด -- PSA label ของ namespace ทำหน้าที่นี้อยู่แล้ว; `no matches for kind` จริงพิสูจน์ |
+
+## Mental Model
+
+มีแค่ 1 ใน bug เจ็ดตัวนี้ (7, PSP) ที่ API server ปฏิเสธ object ไม่รู้จักตรง ๆ อีก 2 ตัว (2, Pod privileged; 4, Pod ที่ไม่มี resources) คือ admission rejection จริงทันที -- แต่เป็นการปฏิเสธ Pod *คนละตัว* กับตัวที่ตั้งใจให้ทำงานได้ ซึ่งเป็นเหตุผลที่มันพลาดง่ายเวลารีวิว platform bundle แยกจาก workload จริงที่พยายามใช้มัน อีก 4 ตัวที่เหลือ (1, 3, 5, 6) apply ผ่านเนียนและผ่านทุก check เพราะแต่ละตัวคือการอ้างเรื่อง scope หรือความครบถ้วนที่ไม่มีอะไรตอน apply มา cross-reference: binding ให้ไม่เกินที่ workload ต้องการจริงไหม, token mount มีอะไรใช้จริงไหม, "Ingress" กับ "Egress" ใน `policyTypes` ถูกพิจารณาทั้งคู่จริงไหมหรือก็อปมาจากตัวอย่างอื่นแค่ตัวเดียว, policy "default-deny" คิดถึง infrastructure dependency ของตัวเอง (DNS) แล้วหรือยัง platform namespace bundle มักมี bug shape นี้แน่นเป็นพิเศษ เพราะเป็น object หลายตัวที่แยกดูสมเหตุสมผลแต่ละอัน แล้วเผยช่องว่างก็ต่อเมื่อ workload จริงพยายามรันข้างในจริง ๆ
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ServiceAccount ของ workload ที่ผูกกับ `cluster-admin` ก็โอเคตราบใดที่ workload นั้นน่าเชื่อถือ"** พิสูจน์แล้วด้านบน: ความเสี่ยงไม่ใช่ความน่าเชื่อถือวันนี้ แต่คือ blast radius ถ้า workload นั้นถูก compromise เมื่อไหร่ -- binding นี้เป๊ะ ๆ ลบ Secret ได้ทุก namespace หรือลบ Node ได้ตรง ๆ จริงและยืนยันแล้วด้วย `kubectl auth can-i`
+- **"`policyTypes: [Ingress]` บน NetworkPolicy ที่มีแค่ `ingress` rule ก็แค่ชัดเจนว่า policy นี้ทำอะไร"** พิสูจน์แล้วด้านบน: การไม่ใส่ `Egress` ใน `policyTypes` ไม่ได้แปลว่า "แค่ไม่มี egress rule ตรงนี้" แต่แปลว่า egress ของ Pod ที่ถูกเลือก**ไม่ถูกจำกัดโดย policy นี้เลย** -- HTTPS request จริงไปหา host ภายนอกสำเร็จผ่าน policy ที่ชื่อ `default-deny`
+- **"`ResourceQuota` บน cpu/memory แปลว่า Kubernetes เติมค่า default ที่สมเหตุสมผลให้ Pod ที่ไม่ได้ระบุเอง"** พิสูจน์แล้วด้านบนด้วย rejection จริงทันที: `ResourceQuota` ที่ครอบ resource ตัวใดตัวหนึ่งทำให้ resource นั้น**บังคับ**บน Pod ทุกตัวใน namespace -- มีแค่ `LimitRange` เท่านั้นที่ให้ default
+
+<Mermaid title={"จุดที่แต่ละ bug อยู่ใน admission กับ traffic path ของ platform namespace นี้"} code={wr3Diagram} />
+
+export const wr3Diagram = `flowchart TD
+  NS["Namespace: platform, PSA restricted"]
+  NS --> RBAC["ServiceAccount platform-app -- bound to cluster-admin"]
+  RBAC -->|"1: can delete Secrets/Nodes anywhere"| RBAC
+  NS --> POD["agent Pod: privileged=true"]
+  POD -->|"2: restricted admission rejects"| POD
+  NS --> TOK["agent Pod: automountServiceAccountToken unset"]
+  TOK -->|"3: token mounted, unused"| TOK
+  NS --> Q["ResourceQuota, no LimitRange"]
+  Q -->|"4: every Pod must specify everything"| Q
+  NS --> NP["NetworkPolicy default-deny: policyTypes=[Ingress]"]
+  NP -->|"5: egress wide open"| NP
+  NS --> DNS["default-deny-all: no egress rules"]
+  DNS -->|"6: DNS egress blocked too"| DNS
+  PSP["PodSecurityPolicy: policy/v1beta1"] -->|"7: kind removed in 1.25"| PSP
+`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+platform namespace bundle อัด object เจ็ดตัวที่แยกดูแต่ละตัวถูกต้องหมด -- RBAC binding, security context, การตั้งค่า token, quota, NetworkPolicy สองทิศทาง, object ที่ API ถูกลบไปแล้ว -- มีแค่ตัวเดียวที่เป็น rejection ตรง ๆ ให้เห็นหน้าตา อีกหกตัวต้องรอ workload จริงมาพยายามรัน เรียก API หรือเข้าถึง network ผ่านมันจริง ๆ ก่อนถึงจะเห็นช่องว่างระหว่าง "ดูล็อคแน่นแล้ว" กับ "ล็อคแน่นจริง" เลย
+</Callout>
+
+export const quizWorkedReview3 = [
+  {
+    q: "```text\n$ kubectl auth can-i delete secrets --as=system:serviceaccount:platform:platform-app -A\nyes\n```\nServiceAccount ของ workload ที่แอปอ่านแค่ ConfigMap ใน namespace ตัวเองถูกผูกกับ `cluster-admin` ผ่าน `ClusterRoleBinding` ผลลัพธ์ `can-i` จริงนี้พิสูจน์อะไร แล้วทำไม API server ถึงรับ binding นี้โดยไม่ว่าอะไรเลย?",
+    options: [
+      'เป็น false positive; cluster-admin มีผลแค่กับ RBAC object เอง',
+      'cluster-admin ให้ทุก verb บนทุก resource ทั่วทั้ง cluster ตัวตนนี้เลยลบ Secret ในทุก namespace ได้จริง (หรือลบ Node ได้ตรง ๆ) -- API server ไม่เคยเช็คว่า binding ให้เกินที่ workload ต้องการไหมเลย เช็คแค่ว่า binding เองถูก syntax หรือเปล่า',
+      'จะเป็นจริงก็ต่อเมื่อ ServiceAccount นี้มี Role ผูกอยู่ด้วย',
+      'can-i --as คืน yes เสมอสำหรับ ServiceAccount ไม่ว่า RBAC จะเป็นอะไร',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบนด้วย kubectl auth can-i จริง ทั้งสำหรับ Secret ทุก namespace และสำหรับ Node ที่เป็น cluster-scoped ไม่มีอะไรตอน apply แยก grant ที่พอดีออกจาก cluster-admin เลย -- least privilege ต้องเป็นสิ่งที่เช็คตอน review ไม่ใช่สิ่งที่ API server บังคับให้',
+  },
+  {
+    q: "```text\nError from server (Forbidden): ... violates PodSecurity \"restricted:latest\": privileged (container \"c\" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (...), unrestricted capabilities (...), runAsNonRoot != true (...), seccompProfile (...)\n```\nนี่คือ rejection จริงภายใต้ namespace ที่ label `pod-security.kubernetes.io/enforce: restricted` อะไรทำให้เกิด error นี้ แล้วมันบอก requirement แยกกันกี่ข้อพร้อมกัน?",
+    options: [
+      'admission webhook ของ third-party; PSA เองแค่ warn ไม่เคยบล็อค',
+      'Pod Security Admission เองที่ built-in ใน API server -- มันบอก requirement ของ restricted standard ทั้งห้าข้อที่ container นี้ fail พร้อมกันใน rejection จริงข้อความเดียว: privileged, allowPrivilegeEscalation, capabilities, runAsNonRoot และ seccompProfile',
+      'เช็คแค่ privileged เท่านั้น; ที่เหลือเป็น boilerplate ทั่วไป',
+      'error นี้โผล่แค่ตอน --dry-run=server เท่านั้น ไม่โผล่ตอน apply จริง',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: นี่คือ Forbidden จริงแบบไม่ใช่ dry-run จาก Pod Security Admission ที่ built-in ของ API server เอง (GA ตั้งแต่ 1.25) ซึ่งแทนที่ PodSecurityPolicy ที่ถูกลบไป มันบอกครบทั้งห้า field ที่ restricted standard ต้องการและ container นี้ fail ในข้อความเดียว',
+  },
+  {
+    q: 'NetworkPolicy ชื่อ `default-deny` ตั้ง `podSelector: {}` กับ `policyTypes: [Ingress]` เท่านั้น (ไม่มี `Egress`) Pod ที่ policy นี้เลือกถูกทดสอบด้วย request จริงไปหา host ภายนอกผ่าน HTTPS จะเกิดอะไรขึ้น แล้วทำไม?',
+    options: [
+      'request ถูกบล็อค เพราะ podSelector: {} ปฏิเสธ traffic ทุกอย่างโดย default',
+      'request สำเร็จพร้อม response header จริง -- การไม่ใส่ Egress ใน policyTypes แปลว่า egress ของ Pod เหล่านี้ไม่ถูกจำกัดโดย policy นี้เลย ไม่ว่าชื่อ policy หรือ podSelector จะเป็นอะไร',
+      'request สำเร็จแต่เพราะไม่ได้ติดตั้ง Calico เท่านั้น',
+      'policyTypes เป็นแค่ documentation ไม่มีผลต่อการ enforce เลย',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบนบน cluster ที่ Calico บังคับใช้ NetworkPolicy จริง: Pod ที่ policy นี้เลือกตรง ๆ ไปถึง host ภายนอกผ่าน HTTPS ได้พร้อม response header ครบ ไม่ถูกจำกัดเลย policyTypes คุมว่าทิศทางไหนบ้างที่ policy จำกัดเลย -- selector อย่างเดียวไม่จำกัดอะไรทั้งนั้น',
+  },
+  {
+    q: "```text\n$ kubectl exec client -- wget -q -T 3 -O- http://web/\nwget: bad address 'web...'\n```\napply default-deny policy ที่มี `policyTypes: [Ingress, Egress]` และไม่มี egress rule เลย request ของ client Pod fail ด้วย `bad address` แทนที่จะเป็น connection timeout ข้อความนี้พิสูจน์อะไรเจาะจง?",
+    options: [
+      'Service web ถูกลบไปแล้ว',
+      'เป็น DNS resolution failure ไม่ใช่ HTTP-layer failure -- พอ Egress ถูกปฏิเสธและไม่มี rule อนุญาต lookup ของ client เองไปหา CoreDNS (port 53) เองไม่หลุดออกจาก Pod เลย ชื่อเลย resolve ไม่ออกก่อนที่จะพยายาม connect ด้วยซ้ำ',
+      'bad address แปลว่าปลายทางปฏิเสธ connection เชิงรุก',
+      'นี่พิสูจน์ว่า NetworkPolicy apply ไม่สำเร็จ',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: `bad address` (ไม่ใช่ timeout) คือสิ่งที่ DNS lookup ที่ fail ฝั่ง client ให้ผลลัพธ์แบบนั้นเป๊ะ เพิ่ม egress rule คู่กันสำหรับ UDP/TCP port 53 ทำให้ resolve ชื่อกลับมาได้ -- พิสูจน์แยกอีกครั้ง แม้ HTTP connection ถัดมาบน port 80 ยัง timeout เพราะไม่มี rule อนุญาต port นั้นเจาะจง',
+  },
+  {
+    q: "```text\nError from server (Forbidden): ... pods \"norequest\" is forbidden: failed quota: platform-quota: must specify limits.cpu for: c; limits.memory for: c; requests.cpu for: c; requests.memory for: c\n```\nNamespace มี ResourceQuota ครอบ cpu/memory requests กับ limits แต่ไม่มี LimitRange Pod ที่ไม่มี resources block เลยถูกปฏิเสธด้วยข้อความนี้ อะไรจะป้องกัน rejection นี้ได้?",
+    options: [
+      'ไม่มีทาง -- Pod ทุกตัวใน namespace ที่มี ResourceQuota ต้องระบุ resources เองเสมอ ไม่ว่าจะมี LimitRange หรือไม่',
+      'LimitRange ใน namespace เดียวกันที่มีค่า default/defaultRequest -- มันเติม field ที่หายไปให้อัตโนมัติ Pod spec เปล่า ๆ เลยยังถูก admit ได้',
+      'เพิ่มตัวเลข hard limit ของ ResourceQuota ให้ใหญ่ขึ้น',
+      'เพิ่ม requests.cpu เข้าไปใน ResourceQuota ตัวเองซ้ำอีกรอบ',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบนและยืนยันโดยบทเรียน Namespaces and Resource Quotas ของคอร์สนี้เอง: ResourceQuota ที่ track resource ตัวใดตัวหนึ่งทำให้มันบังคับบน Pod ทุกตัว เว้นแต่ LimitRange ใน namespace เดียวกันจะให้ default -- ถ้าไม่มี LimitRange ทุกคนที่เขียน Pod ต้องรู้ shape ของ quota เป๊ะ ๆ ก่อนถึงจะถูก admit ได้เลย',
+  },
+];
+
+<Quiz client:visible id="reading-k8s/worked-review-3" questions={quizWorkedReview3} />
+
+<ProgressTracker client:visible id="reading-k8s/worked-review-3" />

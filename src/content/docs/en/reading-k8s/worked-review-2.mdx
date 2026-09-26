@@ -1,0 +1,476 @@
+---
+title: 'Worked review 2: a stateful database with a backup CronJob'
+description: 'An AI-generated stateful database — StatefulSet, headless Service, PVCs, a backup CronJob, and a Secret — reviewed bug by bug against real dry-run/apply errors, real kubectl events, and real DNS/drain/timing behaviour on a live cluster.'
+sidebar:
+  order: 5
+---
+
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import Mermaid from '../../../../components/Mermaid.astro';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## The feature
+
+The prompt was: *"Run a 3-replica database as a StatefulSet with per-Pod storage, a nightly backup job, and its password in a Secret."* What follows is a first draft with the same surface plausibility as review 1 — every object individually looks like a real StatefulSet tutorial. It has **7 real bugs**; check the [AI bug catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/) for the general pattern behind each one. Every claim below was proven on the same real two-node `kind` cluster used in [worked review 1](/kubernetes/en/reading-k8s/worked-review-1/) (`reading-b`, Kubernetes 1.37.0) — real `kubectl apply`, real `nslookup` from inside a Pod, a real timed `kubectl drain`, and a real ~3-minute CronJob schedule run.
+
+## The generated code
+
+```yaml
+# db headless Service, as generated -- see review below
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+spec:
+  clusterIP: None
+  selector:
+    app: db
+  ports:
+  - port: 5432
+```
+
+```yaml
+# db StatefulSet, as generated -- see review below
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+spec:
+  serviceName: db-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      containers:
+      - name: db
+        image: busybox:1.36
+        command: ["sh", "-c", "sleep 3600"]
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/db
+      volumes:
+      - name: data
+        hostPath:
+          path: /mnt/db-data
+```
+
+```yaml
+# db-credentials Secret, as generated -- see review below
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-credentials
+# "encrypted" -- see review
+data:
+  password: c3VwZXJzZWNyZXQxMjMh
+```
+
+```yaml
+# @expect-error Job is invalid: spec.template.spec.restartPolicy: Required value: valid values: "OnFailure", "Never"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-backup-manual
+spec:
+  template:
+    spec:
+      restartPolicy: Always
+      containers:
+      - name: backup
+        image: busybox:1.36
+        command: ["sh", "-c", "echo backing up && sleep 2"]
+```
+
+```yaml
+# db-backup CronJob, as generated -- see review below
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: db-backup
+spec:
+  schedule: '0 2 * * *'
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: backup
+            image: busybox:1.36
+            command: ["sh", "-c", "echo backup start; sleep 90; echo backup done"]
+```
+
+```yaml
+# db-app PodDisruptionBudget, as generated -- see review below
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: db-app-pdb
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app: db-app
+```
+
+## The review walk
+
+### StatefulSet: `serviceName` drifted from the Service that was actually created
+
+The StatefulSet says `serviceName: db-headless`; the Service block right above it is named `db`. The API server never validates `serviceName` against a real Service — both apply cleanly, all 3 Pods reach `Running`. Proven with a real per-Pod DNS lookup from inside `db-0`:
+
+```text
+$ kubectl exec db-0 -- nslookup db-1.db-headless.wr2.svc.cluster.local
+
+** server can't find db-1.db-headless.wr2.svc.cluster.local: NXDOMAIN
+```
+
+<SpotTheBug code={`spec:
+  serviceName: db-headless   # the Service above is actually named "db"`}>
+A StatefulSet's `spec.serviceName` sets each Pod's own `spec.subdomain` (confirmed directly: `kubectl get pod db-1 -o jsonpath='{.spec.subdomain}'` returned `db-headless`) — and per-Pod DNS records are published only under a Service whose **own name** matches that subdomain, regardless of whether that Service selects the right Pods. Here, no Service is named `db-headless` at all, so there is nothing for CoreDNS to publish under, and the lookup is a clean `NXDOMAIN` — while `kubectl get statefulset db` reports the StatefulSet itself perfectly healthy, `3/3`. This is exactly the kind of rename-drift an AI assistant introduces when it writes the Service and the StatefulSet as separate steps and doesn't re-check the second against the first. The fix is making the two names agree: `serviceName: db` (matching the Service that actually exists), or renaming the Service to `db-headless` if that was the intended name project-wide.
+</SpotTheBug>
+
+### StatefulSet: `hostPath` for a database's persistent data
+
+The container mounts a `hostPath` volume (`/mnt/db-data`) instead of a per-Pod `volumeClaimTemplates` entry. This course's [Volumes and Volume Types](/kubernetes/en/storage-and-config/volumes-and-volume-types/) lesson already proved directly that `hostPath` data does not follow a rescheduled Pod (a marker file written on one node was simply absent — real `No such file or directory` — from an identical Pod pinned to a different node); the same fact applies here without needing to re-derive it.
+
+<SpotTheBug code={`volumes:
+- name: data
+  hostPath:
+    path: /mnt/db-data`}>
+`hostPath` ties data to whichever **node** a Pod happens to land on, not to the Pod's own identity — the opposite of what a StatefulSet's ordinal identity (`db-0`, `db-1`, `db-2`) is supposed to guarantee. Three replicas sharing the literal path `/mnt/db-data` is doubly wrong: if all three land on the same node, they silently share one directory instead of having independent data; if the scheduler spreads them (the common case, and what `PersistentVolumeClaim`s exist to make safe), a rescheduled `db-1` starts with an empty (or some other Pod's leftover) directory on its new node, with zero error anywhere. The fix is a per-replica `volumeClaimTemplates` entry backed by a real `PersistentVolumeClaim` — storage that exists independently of any single node and follows the ordinal, not the node.
+</SpotTheBug>
+
+### Secret: a comment claiming "encrypted"
+
+The manifest's own comment calls the Secret's data "encrypted." Proven with the exact same command anyone with API read access can run:
+
+```text
+$ kubectl get secret db-credentials -o jsonpath='{.data.password}'
+c3VwZXJzZWNyZXQxMjMh
+
+$ kubectl get secret db-credentials -o jsonpath='{.data.password}' | base64 --decode
+supersecret123!
+```
+
+<SpotTheBug code={`# "encrypted" -- see review
+data:
+  password: c3VwZXJzZWNyZXQxMjMh`}>
+A Secret's `data` values are base64-**encoded**, not encrypted — an encoding, not a cipher, reversible by anyone with read access to the object (or to etcd directly) in one command, with no key involved at all, proven above. This comment is exactly the kind of confident-sounding, wrong claim an AI assistant writes when it pattern-matches "Secret object" to "this is the secure one." The fix isn't a YAML field — it's process: real confidentiality needs encryption at rest (a cluster-level `EncryptionConfiguration`, out of this Secret object's control entirely), tight RBAC on who can `get`/`list` Secrets, or sourcing the value from an external secret manager instead of a plaintext-adjacent `data` field.
+</SpotTheBug>
+
+### Job: `restartPolicy: Always` on a manual backup Job
+
+```text
+$ kubectl apply -f db-backup-manual.yaml
+The Job "db-backup-manual" is invalid: spec.template.spec.restartPolicy: Required value: valid values: "OnFailure", "Never"
+```
+
+<SpotTheBug code={`spec:
+  template:
+    spec:
+      restartPolicy: Always`}>
+A Job's entire point is to run to completion and stop — `restartPolicy: Always` (the Pod default, and the only legal value for a Deployment) is specifically the one value a Job's Pod template can never use, and the API server rejects it outright rather than accepting it and behaving strangely. The fix is `OnFailure` (retry the same Pod in place, counted against `backoffLimit`) or `Never` (create a fresh Pod on failure) — the CronJob's own `jobTemplate` below already uses the correct `OnFailure`, so this manual, one-off Job copy is where the drift crept in.
+</SpotTheBug>
+
+### CronJob: no `concurrencyPolicy`, so backups overlap
+
+The CronJob has no `concurrencyPolicy` at all (defaulting to `Allow`) and a backup body that runs for 90 seconds — longer than the 1-minute schedule interval. Proven with the schedule set to `* * * * *` and a real ~3-minute run against two otherwise-identical CronJobs, one left at the default and one with `concurrencyPolicy: Forbid`:
+
+```text
+# default (Allow): every tick creates a new Job, no matter what the previous one is doing
+$ kubectl describe cronjob backup-noconcurrency
+Events:
+  Normal  SuccessfulCreate  2m59s  cronjob-controller  Created job backup-noconcurrency-29840476
+  Normal  SuccessfulCreate  119s   cronjob-controller  Created job backup-noconcurrency-29840477
+  Normal  SawCompletedJob   86s    cronjob-controller  Saw completed job: backup-noconcurrency-29840476, condition: Complete
+  Normal  SuccessfulCreate  59s    cronjob-controller  Created job backup-noconcurrency-29840478
+```
+
+`backup-noconcurrency-29840476` was created at :16:00 and (93s duration) finished around :17:33; `...-29840477` was created at :17:00 — a real ~33-second window where **two backup Jobs ran at once** against the same database.
+
+```text
+# concurrencyPolicy: Forbid: the controller skips/delays instead of overlapping
+$ kubectl describe cronjob backup-fixed
+Events:
+  Normal  SuccessfulCreate  2m59s               cronjob-controller  Created job backup-fixed-29840476
+  Normal  SawCompletedJob   86s                 cronjob-controller  Saw completed job: backup-fixed-29840476, condition: Complete
+  Normal  SuccessfulCreate  86s                 cronjob-controller  Created job backup-fixed-29840477
+  Normal  JobAlreadyActive  59s (x4 over 119s)  cronjob-controller  Not starting job because prior execution is running and concurrency policy is Forbid
+```
+
+<SpotTheBug code={`spec:
+  schedule: '0 2 * * *'
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: backup
+            command: ["sh", "-c", "echo backup start; sleep 90; echo backup done"]`}>
+This course's own [Jobs and CronJobs](/kubernetes/en/workloads/jobs-and-cronjobs/) lesson already established that `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` default to `3`/`1` — so "no history limits" is not, by itself, an unbounded-accumulation bug on a current cluster. The real, proven-above risk is `concurrencyPolicy` left at its default `Allow`: with a Job body slower than the schedule interval, the CronJob controller creates the next Job on schedule regardless of whether the previous one finished, confirmed above with a genuine overlapping pair (`-29840476` still running when `-29840477` started). Two backup processes against the same database at once is a real risk (lock contention, an inconsistent snapshot, or duplicate/competing writes to the same destination), not just wasted compute. The fix is `concurrencyPolicy: Forbid` (skip a tick if the previous run hasn't finished, proven above with the real `JobAlreadyActive` event) — or `Replace` if the newest run should always win.
+</SpotTheBug>
+
+### PodDisruptionBudget: `minAvailable` equal to the full replica count
+
+`db-app-pdb` sets `minAvailable: 3` for a Deployment with exactly 3 replicas. Proven with a real, timed drain of the node hosting all 3 Pods:
+
+```text
+$ kubectl get pdb db-app-pdb
+NAME          MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+db-app-pdb    3               N/A               0                     1s
+
+$ kubectl drain reading-b-worker --ignore-daemonsets --delete-emptydir-data --timeout=15s
+evicting pod wr2/db-app-64bfd95585-m686z
+error when evicting pods/"db-app-64bfd95585-m686z" -n "wr2" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+evicting pod wr2/db-app-64bfd95585-8pcpn
+error when evicting pods/"db-app-64bfd95585-8pcpn" -n "wr2" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+evicting pod wr2/db-app-64bfd95585-l4xwj
+error when evicting pods/"db-app-64bfd95585-l4xwj" -n "wr2" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+... (repeats every 5s until the timeout)
+error: unable to drain node "reading-b-worker" due to error: [... global timeout reached: 15s ...]
+
+$ kubectl get pods -o wide -l app=db-app
+NAME                      READY   STATUS    NODE
+db-app-64bfd95585-8pcpn   1/1     Running   reading-b-worker
+db-app-64bfd95585-l4xwj   1/1     Running   reading-b-worker
+db-app-64bfd95585-m686z   1/1     Running   reading-b-worker
+```
+
+<SpotTheBug code={`spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app: db-app`}>
+With `minAvailable` equal to the full replica count, `ALLOWED DISRUPTIONS` is genuinely `0` — not "very cautious," but a real, permanent floor that no voluntary eviction can ever cross while all 3 replicas are meant to stay up. A real `kubectl drain` (a node upgrade, a scale-down, cordoning for maintenance) blocks **forever**, proven above by the identical `Cannot evict pod as it would violate the pod's disruption budget` repeating for the entire timeout with all 3 Pods still `Running` on the node at the end. The fix is a budget that actually tolerates losing at least one replica — `minAvailable: 2` (or `maxUnavailable: 1`) for a 3-replica workload, so a real drain can make progress one Pod at a time instead of being wedged indefinitely.
+</SpotTheBug>
+
+### StatefulSet: no `podManagementPolicy`, when independent shards don't need ordering
+
+The database's 3 replicas bootstrap fully independently (each owns its own data, no leader-follower join sequence) — a shape where `OrderedReady`'s guarantee buys nothing. This course's [StatefulSets and DaemonSets](/kubernetes/en/workloads/statefulsets-and-daemonsets/) lesson already measured the cost directly (`18.37s` `OrderedReady` vs `6.17s` `Parallel` for 3 identically-timed replicas — roughly 3x). A repeat of that same timing on this review's own cluster, with a 3-replica StatefulSet using a 5-second startup delay per Pod, confirmed the same shape at different absolute numbers:
+
+```text
+# podManagementPolicy left unset (OrderedReady, the default)
+$ kubectl apply -f sts-shard.yaml   # then poll until all 3 are 1/1
+OrderedReady (default) time: 19s
+
+# identical StatefulSet, only podManagementPolicy: Parallel added
+Parallel time: 7s
+```
+
+<SpotTheBug code={`spec:
+  serviceName: shard
+  replicas: 3
+  # no podManagementPolicy -- defaults to OrderedReady`}>
+`OrderedReady` (the default, left implicit here) creates and waits for each ordinal to become `Ready` before even **creating** the next one — proven above, `19s` for 3 replicas with a 5-second-per-Pod startup, versus `7s` with `podManagementPolicy: Parallel` creating all three at once. That serialization is exactly the right default for a workload where a later ordinal's bootstrap logic assumes an earlier one is already up — but it is pure, avoidable latency for a set of shards or replicas that never depend on each other at startup, which is the case this manifest actually describes. The fix is adding `podManagementPolicy: Parallel` explicitly once independence is confirmed — it only removes the startup **ordering** guarantee, not per-Pod identity or per-Pod storage, both of which stay intact.
+</SpotTheBug>
+
+## The corrected code
+
+```yaml
+# k8s/worked-review-2/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+spec:
+  clusterIP: None
+  selector:
+    app: db
+  ports:
+  - port: 5432
+```
+
+```yaml
+# k8s/worked-review-2/statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+spec:
+  serviceName: db
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      containers:
+      - name: db
+        image: busybox:1.36
+        command: ["sh", "-c", "sleep 3600"]
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/db
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 1Gi
+```
+
+```yaml
+# k8s/worked-review-2/secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-credentials
+# base64-encoded, NOT encrypted -- see review
+data:
+  password: c3VwZXJzZWNyZXQxMjMh
+```
+
+```yaml
+# k8s/worked-review-2/cronjob.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: db-backup
+spec:
+  schedule: '0 2 * * *'
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: backup
+            image: busybox:1.36
+            command: ["sh", "-c", "echo backup start; sleep 90; echo backup done"]
+```
+
+```yaml
+# k8s/worked-review-2/pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: db-app-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: db-app
+```
+
+`npm run verify` dry-runs all five files above against the shared `verify-k8s` cluster with 0 errors, and `node tools/verify-manifests.mjs --apply reading-k8s/worked-review-2` really applies them into a temp namespace: the StatefulSet's 3 Pods reach `Running` with a real bound PVC each (`db-data-db-0`/`-1`/`-2`), and `serviceName: db` matches the real headless Service that was actually created.
+
+## What changed and why
+
+| # | Bug | Fix |
+|---|---|---|
+| 1 | `serviceName: db-headless` but the Service created is named `db` | Names match — real `NXDOMAIN` on the per-Pod DNS name before, resolves after |
+| 2 | `hostPath` for the database's persistent data | Per-replica `volumeClaimTemplates` — cited proof: data does not follow a rescheduled Pod under `hostPath` |
+| 3 | Comment claims the Secret's data is "encrypted" | Comment corrected to base64-encoded, not encrypted — real offline `base64 --decode` proves it |
+| 4 | `restartPolicy: Always` on a manual backup Job | `OnFailure` — real, immediate API-server rejection otherwise |
+| 5 | No `concurrencyPolicy` on the backup CronJob | `concurrencyPolicy: Forbid` — real overlapping Jobs proven before, real `JobAlreadyActive` skip after |
+| 6 | `PodDisruptionBudget.minAvailable` equal to the full replica count | `minAvailable: 2` — real, permanently blocked drain proven before |
+| 7 | No `podManagementPolicy` on a StatefulSet of independent shards | `podManagementPolicy: Parallel` — real ~3x slower startup proven before |
+
+## Mental Model
+
+Only one of these seven bugs (4, the Job's `restartPolicy`) is a hard API-server rejection. The other six all apply cleanly, because each one is a claim about a fact the API server has no way to check against: that a `serviceName` actually names a real, matching Service; that a mounted path is genuinely shared, durable storage rather than one node's local disk; that "the data is in a Secret object" is the same thing as "the data is protected"; that a backup body reliably finishes inside one schedule tick; that a disruption budget still leaves *some* legal room for a voluntary eviction; that Pods without any real startup dependency still benefit from paying for one. None of the six produce an error — they surface only as a real, silent gap between "the controller reports healthy" and what actually happens under DNS lookups, a node drain, or a live schedule.
+
+## Common Misconceptions
+
+- **"If the StatefulSet and its Service both exist, `serviceName` must be pointing at the right one."** Proven above: the API server never validates `serviceName` against any real Service object — a rename on either side, with no matching update on the other, leaves the StatefulSet reporting perfectly healthy while every per-Pod DNS lookup returns `NXDOMAIN`.
+- **"A Secret is inherently more protected than a ConfigMap."** Proven above with an offline `base64 --decode`: the object's own `data` field is exactly as reversible as a ConfigMap's — the only structural difference is convention; real protection is encryption at rest, RBAC, or an external secret manager, none of which the Secret object provides by itself.
+- **"Skipping `podManagementPolicy` is always the safe, conservative choice."** Proven above: `OrderedReady` is only "safe" for workloads that genuinely need startup ordering. For independent shards it is pure, measured latency (roughly 3x slower to reach full readiness in this test) with zero correctness benefit.
+
+<Mermaid title="Where each bug sits in this database's manifest set" code={wr2Diagram} />
+
+export const wr2Diagram = `flowchart TD
+  S["Service: db (headless)"]
+  ST["StatefulSet: serviceName=db-headless"] -->|"1: name drift -- NXDOMAIN"| ST
+  ST --> V["hostPath /mnt/db-data"]
+  V -->|"2: not portable across nodes"| V
+  ST --> PM["no podManagementPolicy"]
+  PM -->|"7: 3x slower than needed"| PM
+  SEC["Secret: db-credentials"] -->|"3: 'encrypted' comment is false"| SEC
+  J["Job: db-backup-manual, restartPolicy Always"] -->|"4: real API rejection"| J
+  CJ["CronJob: db-backup, no concurrencyPolicy"] -->|"5: overlapping backups"| CJ
+  PDB["PDB: minAvailable == replicas"] -->|"6: blocks drain forever"| PDB
+`;
+
+<Callout title="The one-line takeaway">
+Six of these seven bugs apply cleanly and pass every schema check, because each one is a claim about something the API server cannot see from inside the object alone — a `serviceName` that actually names a real Service, a volume that is genuinely portable across nodes, a Secret that is protected rather than merely renamed, a backup body that finishes inside its own schedule window, a disruption budget that leaves real room to evict, a StatefulSet paying for ordering guarantees it doesn't need. Only a real DNS lookup, a real drain, or a real multi-minute schedule run tells you which side of that claim you're actually on.
+</Callout>
+
+export const quizWorkedReview2 = [
+  {
+    q: "```text\n$ kubectl exec db-0 -- nslookup db-1.db-headless.wr2.svc.cluster.local\n\n** server can't find db-1.db-headless.wr2.svc.cluster.local: NXDOMAIN\n```\nThe StatefulSet's `serviceName` is `db-headless`, but the Service that was actually created is named `db`. Both objects applied without error, and all 3 Pods are `Running`. What does this NXDOMAIN prove?",
+    options: [
+      'The StatefulSet failed to create, so DNS was never set up',
+      "`spec.serviceName` sets each Pod's `spec.subdomain`, and per-Pod DNS is only published under a Service whose OWN name matches that subdomain -- since no Service is named `db-headless`, the API server (which never validates this field) leaves the StatefulSet reporting healthy while the name silently resolves to nothing",
+      'nslookup always fails for StatefulSet Pods regardless of configuration',
+      'The Service needs `clusterIP` set to a real IP for this to work',
+    ],
+    answer: 1,
+    explain: "Proven above: `kubectl get pod db-1 -o jsonpath='{.spec.subdomain}'` returned `db-headless`, and no Service by that name exists, so CoreDNS has nothing to publish under -- a clean, real NXDOMAIN, with the StatefulSet itself reporting `3/3` the entire time.",
+  },
+  {
+    q: "```text\nThe Job \"db-backup-manual\" is invalid: spec.template.spec.restartPolicy: Required value: valid values: \"OnFailure\", \"Never\"\n```\nWhy is `restartPolicy: Always` specifically rejected for a Job's Pod template, when it's the normal default for a Deployment's Pods?",
+    options: [
+      "It isn't actually rejected; this is a client-side kubectl lint warning",
+      "A Job's entire contract is to run to completion and then stop -- `Always` (restart forever) is incompatible with that contract at the API level, so the server rejects it outright rather than accepting a Job that could never finish",
+      'Always only works with `backoffLimit: 0`',
+      'This error only appears when `parallelism` is also set',
+    ],
+    answer: 1,
+    explain: 'Proven above with the real API-server error. `OnFailure` (retry the same Pod) or `Never` (create a fresh Pod on failure) are the only legal values -- both leave the Job able to actually reach a Complete/Failed terminal state.',
+  },
+  {
+    q: 'A CronJob with no `concurrencyPolicy` (default `Allow`) and a backup body that runs 90 seconds, on a 1-minute schedule. Real events showed job `-29840476` created at :16:00 (93s duration, finishing ~:17:33) and job `-29840477` created at :17:00. What does this timing prove, and what real event does `concurrencyPolicy: Forbid` produce instead?',
+    options: [
+      'Nothing unusual -- CronJob always waits for the previous Job to finish regardless of concurrencyPolicy',
+      'A real ~33-second window where two backup Jobs ran concurrently against the same database; with Forbid, the controller instead produces a real `JobAlreadyActive` event and only creates the next Job once the previous one actually completes',
+      '`concurrencyPolicy` only affects failed Jobs, not overlapping successful ones',
+      'The default missing successfulJobsHistoryLimit is what causes the overlap, not concurrencyPolicy',
+    ],
+    answer: 1,
+    explain: "Proven above with real CronJob events on both a default-Allow and a Forbid CronJob: Allow creates a new Job every tick regardless of overlap (a genuine ~33s double-run, arithmetically certain from the create/duration timestamps); Forbid's controller logged the real event `Not starting job because prior execution is running and concurrency policy is Forbid`, delaying the next Job until the prior one actually finished.",
+  },
+  {
+    q: "```text\n$ kubectl drain reading-b-worker --timeout=15s\nerror when evicting pods/\"...\": Cannot evict pod as it would violate the pod's disruption budget.\n... (repeats every 5s until the timeout)\n```\nA PodDisruptionBudget sets `minAvailable: 3` for a Deployment with exactly 3 replicas. What does `kubectl get pods -o wide` show at the end of the 15-second drain attempt?",
+    options: [
+      'All 3 Pods evicted and rescheduled to another node, just slower than usual',
+      'All 3 Pods still `Running` on the original node -- `ALLOWED DISRUPTIONS` is a real, permanent `0`, so every eviction attempt is rejected for as long as all 3 replicas are required to stay up, not just slowed down',
+      'Exactly 1 Pod evicted, since drain always makes some minimum progress',
+      'The drain command itself fails to start because the PDB blocks node cordoning',
+    ],
+    answer: 1,
+    explain: "Proven above with a real, timed drain: the identical `Cannot evict pod as it would violate the pod's disruption budget` repeated for the entire 15-second timeout, and all 3 Pods were still `Running` on the node afterward -- a genuinely, indefinitely blocked drain, not a slow one.",
+  },
+  {
+    q: "```text\nOrderedReady (default) time: 19s\nParallel time: 7s\n```\nSame 3-replica StatefulSet, same ~5-second-per-Pod startup, only `podManagementPolicy` changed, for a database whose 3 replicas bootstrap fully independently (no leader-follower join). What does this real timing argue for?",
+    options: [
+      'Parallel should always replace OrderedReady as the default for every StatefulSet',
+      "OrderedReady's serialized creation genuinely costs real time (roughly 3x here) with zero correctness benefit when replicas have no real startup dependency on each other -- so `podManagementPolicy: Parallel` should be set explicitly for this specific shape",
+      'The timing difference is measurement noise, not a real effect',
+      'podManagementPolicy only affects deletion order, never creation',
+    ],
+    answer: 1,
+    explain: "Proven above: OrderedReady genuinely creates (not just reports) each ordinal one at a time, waiting for the previous one's readiness first -- for a workload where nothing actually depends on that order, it's paying real latency for a guarantee it doesn't need.",
+  },
+];
+
+<Quiz client:visible id="reading-k8s/worked-review-2" questions={quizWorkedReview2} />
+
+<ProgressTracker client:visible id="reading-k8s/worked-review-2" />

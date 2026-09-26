@@ -39,6 +39,7 @@ export default defineConfig({
         { label: 'Observability & Security', items: [{ autogenerate: { directory: 'observability-and-security' } }] },
         { label: 'Production & Ecosystem', items: [{ autogenerate: { directory: 'production-and-ecosystem' } }] },
         { label: 'How Kubernetes Works', translations: { th: 'Kubernetes ทำงานอย่างไรข้างใน' }, items: [{ autogenerate: { directory: 'k8s-internals' } }] },
+        { label: 'Reading AI-generated Kubernetes', translations: { th: 'อ่านโค้ด Kubernetes ที่ AI เขียน' }, items: [{ autogenerate: { directory: 'reading-k8s' } }] },
         { label: 'Glossary', translations: { th: 'อภิธานศัพท์' }, link: 'glossary' },
       ],
       }), preact()],

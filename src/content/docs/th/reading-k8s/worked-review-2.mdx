@@ -1,0 +1,476 @@
+---
+title: 'รีวิวจริง 2: stateful database พร้อม backup CronJob'
+description: 'stateful database ที่ AI generate ให้ -- StatefulSet, headless Service, PVC, backup CronJob และ Secret -- รีวิวทีละ bug เทียบกับ dry-run/apply error จริง, kubectl events จริง และพฤติกรรม DNS/drain/timing จริงบน cluster จริง'
+sidebar:
+  order: 5
+---
+
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import Mermaid from '../../../../components/Mermaid.astro';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## Feature ที่ขอ
+
+Prompt คือ: *"รัน database 3 replica แบบ StatefulSet มี storage แยกต่อ Pod, มี backup job รายคืน แล้ว password เก็บใน Secret"* สิ่งที่ตามมาคือ draft แรกที่ดูสมเหตุสมผลพอ ๆ กับรีวิว 1 -- ทุก object แยกดูก็เหมือน StatefulSet tutorial จริง มี **bug จริง 7 ตัว** เช็ค [AI bug catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/) สำหรับ pattern ทั่วไปเบื้องหลังแต่ละตัว ทุกข้อความอ้างด้านล่างพิสูจน์จริงบน `kind` cluster 2 node เดียวกับที่ใช้ใน [รีวิวจริง 1](/kubernetes/en/reading-k8s/worked-review-1/) (`reading-b`, Kubernetes 1.37.0) -- `kubectl apply` จริง, `nslookup` จริงจากใน Pod, `kubectl drain` แบบจับเวลาจริง และรัน CronJob schedule จริงประมาณ 3 นาที
+
+## โค้ดที่ AI generate ให้
+
+```yaml
+# db headless Service, as generated -- see review below
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+spec:
+  clusterIP: None
+  selector:
+    app: db
+  ports:
+  - port: 5432
+```
+
+```yaml
+# db StatefulSet, as generated -- see review below
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+spec:
+  serviceName: db-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      containers:
+      - name: db
+        image: busybox:1.36
+        command: ["sh", "-c", "sleep 3600"]
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/db
+      volumes:
+      - name: data
+        hostPath:
+          path: /mnt/db-data
+```
+
+```yaml
+# db-credentials Secret, as generated -- see review below
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-credentials
+# "encrypted" -- see review
+data:
+  password: c3VwZXJzZWNyZXQxMjMh
+```
+
+```yaml
+# @expect-error Job is invalid: spec.template.spec.restartPolicy: Required value: valid values: "OnFailure", "Never"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-backup-manual
+spec:
+  template:
+    spec:
+      restartPolicy: Always
+      containers:
+      - name: backup
+        image: busybox:1.36
+        command: ["sh", "-c", "echo backing up && sleep 2"]
+```
+
+```yaml
+# db-backup CronJob, as generated -- see review below
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: db-backup
+spec:
+  schedule: '0 2 * * *'
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: backup
+            image: busybox:1.36
+            command: ["sh", "-c", "echo backup start; sleep 90; echo backup done"]
+```
+
+```yaml
+# db-app PodDisruptionBudget, as generated -- see review below
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: db-app-pdb
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app: db-app
+```
+
+## เดินรีวิวทีละจุด
+
+### StatefulSet: `serviceName` เพี้ยนไปจาก Service ที่สร้างจริง
+
+StatefulSet บอก `serviceName: db-headless` แต่ Service block ด้านบนชื่อ `db` API server ไม่เคย validate `serviceName` กับ Service จริงเลย -- ทั้งคู่ apply ผ่านเนียน ๆ Pod ทั้ง 3 ถึง `Running` หมด พิสูจน์ด้วย per-Pod DNS lookup จริงจากใน `db-0`:
+
+```text
+$ kubectl exec db-0 -- nslookup db-1.db-headless.wr2.svc.cluster.local
+
+** server can't find db-1.db-headless.wr2.svc.cluster.local: NXDOMAIN
+```
+
+<SpotTheBug code={`spec:
+  serviceName: db-headless   # the Service above is actually named "db"`}>
+`spec.serviceName` ของ StatefulSet ตั้ง `spec.subdomain` ของแต่ละ Pod (เช็คตรงแล้ว: `kubectl get pod db-1 -o jsonpath='{.spec.subdomain}'` คืน `db-headless`) -- และ per-Pod DNS record จะถูก publish ก็ต่อเมื่ออยู่ใต้ Service ที่**ชื่อของมันเอง**ตรงกับ subdomain นั้น ไม่ว่า Service นั้นจะ select Pod ถูกหรือไม่ก็ตาม ตรงนี้ไม่มี Service ชื่อ `db-headless` เลย เลยไม่มีอะไรให้ CoreDNS publish ใต้ชื่อนั้น lookup เลยได้ `NXDOMAIN` สะอาด ๆ -- ขณะที่ `kubectl get statefulset db` รายงานว่า StatefulSet เองแข็งแรงดี `3/3` นี่คือ rename-drift แบบที่ AI assistant มักทำเวลาเขียน Service กับ StatefulSet แยกเป็นคนละ step แล้วไม่กลับมาเช็คตัวที่สองกับตัวแรกอีกที วิธีแก้คือทำให้ชื่อสองฝั่งตรงกัน: `serviceName: db` (ให้ตรงกับ Service ที่มีอยู่จริง) หรือเปลี่ยนชื่อ Service เป็น `db-headless` ถ้านั่นคือชื่อที่ตั้งใจไว้ทั้งโปรเจกต์
+</SpotTheBug>
+
+### StatefulSet: `hostPath` สำหรับข้อมูล persistent ของ database
+
+Container mount volume แบบ `hostPath` (`/mnt/db-data`) แทนที่จะใช้ `volumeClaimTemplates` แยกต่อ Pod บทเรียน [Volumes and Volume Types](/kubernetes/en/storage-and-config/volumes-and-volume-types/) ของคอร์สนี้พิสูจน์ตรงไปแล้วว่าข้อมูล `hostPath` ไม่ตามไปกับ Pod ที่ถูก reschedule (marker file ที่เขียนไว้บน node หนึ่งหายไปเฉย ๆ -- `No such file or directory` จริง -- จาก Pod ที่เหมือนกันเป๊ะแต่ถูก pin ไปคนละ node) ข้อเท็จจริงเดียวกันนี้ใช้ได้ตรงนี้โดยไม่ต้องพิสูจน์ซ้ำ
+
+<SpotTheBug code={`volumes:
+- name: data
+  hostPath:
+    path: /mnt/db-data`}>
+`hostPath` ผูกข้อมูลไว้กับ**node**ที่ Pod บังเอิญไปตกอยู่ ไม่ใช่กับตัวตนของ Pod เอง -- ตรงข้ามกับสิ่งที่ ordinal identity ของ StatefulSet (`db-0`, `db-1`, `db-2`) ควรจะรับประกันให้ 3 replica ใช้ path `/mnt/db-data` เดียวกันเป๊ะผิดสองต่อ: ถ้าทั้งสามไปตกที่ node เดียวกัน ก็แชร์ directory เดียวกันเงียบ ๆ แทนที่จะมีข้อมูลแยกกันจริง; ถ้า scheduler กระจาย (กรณีปกติ และเป็นเหตุผลที่ `PersistentVolumeClaim` มีอยู่เพื่อทำให้ปลอดภัย) `db-1` ที่ถูก reschedule จะเริ่มด้วย directory ว่างเปล่า (หรือของเหลือจาก Pod อื่น) บน node ใหม่ โดยไม่มี error ที่ไหนเลย วิธีแก้คือใช้ `volumeClaimTemplates` แยกต่อ replica ที่ backed ด้วย `PersistentVolumeClaim` จริง -- storage ที่อยู่ได้เองไม่ขึ้นกับ node ไหน แล้วตามไปกับ ordinal ไม่ใช่ตาม node
+</SpotTheBug>
+
+### Secret: comment ที่อ้างว่า "encrypted"
+
+comment ในตัว manifest เองเรียกข้อมูลของ Secret ว่า "encrypted" พิสูจน์ด้วย command เดียวกันเป๊ะที่ใครก็ตามที่มี API read access รันได้:
+
+```text
+$ kubectl get secret db-credentials -o jsonpath='{.data.password}'
+c3VwZXJzZWNyZXQxMjMh
+
+$ kubectl get secret db-credentials -o jsonpath='{.data.password}' | base64 --decode
+supersecret123!
+```
+
+<SpotTheBug code={`# "encrypted" -- see review
+data:
+  password: c3VwZXJzZWNyZXQxMjMh`}>
+ค่า `data` ของ Secret เป็นแค่ base64-**encode** ไม่ใช่ encrypt -- เป็นการ encode ไม่ใช่ cipher ใครก็ตามที่มี read access เข้าถึง object นี้ (หรือเข้าถึง etcd ตรง ๆ) reverse กลับได้ในคำสั่งเดียว ไม่ต้องใช้ key เลย พิสูจน์แล้วด้านบน comment นี้คือแบบที่ AI assistant เขียนตอน pattern-match "เป็น Secret object" เข้ากับ "นี่คือตัวที่ปลอดภัยแล้ว" อย่างมั่นใจแต่ผิด วิธีแก้ไม่ใช่ field ใน YAML -- แต่เป็นเรื่อง process: ความลับจริงต้องอาศัย encryption at rest (`EncryptionConfiguration` ระดับ cluster ซึ่งอยู่นอกเหนือการควบคุมของ Secret object นี้เลย), RBAC ที่รัดกุมว่าใคร `get`/`list` Secret ได้บ้าง หรือดึงค่าจาก external secret manager แทนการเก็บใน field `data` ที่ใกล้เคียง plaintext
+</SpotTheBug>
+
+### Job: `restartPolicy: Always` บน manual backup Job
+
+```text
+$ kubectl apply -f db-backup-manual.yaml
+The Job "db-backup-manual" is invalid: spec.template.spec.restartPolicy: Required value: valid values: "OnFailure", "Never"
+```
+
+<SpotTheBug code={`spec:
+  template:
+    spec:
+      restartPolicy: Always`}>
+หน้าที่ทั้งหมดของ Job คือรันจนเสร็จแล้วหยุด -- `restartPolicy: Always` (ค่า default ของ Pod และเป็นค่าเดียวที่ Deployment ใช้ได้) เป็นค่าเดียวที่ Pod template ของ Job ใช้ไม่ได้เลย API server ปฏิเสธตรง ๆ แทนที่จะรับแล้วพฤติกรรมประหลาด วิธีแก้คือ `OnFailure` (retry Pod เดิมซ้ำ นับรวมกับ `backoffLimit`) หรือ `Never` (สร้าง Pod ใหม่เมื่อ fail) -- `jobTemplate` ของ CronJob ด้านล่างใช้ `OnFailure` ถูกต้องอยู่แล้ว เลยเห็นได้ว่า drift เกิดขึ้นตรงสำเนา Job แบบ manual นี้เอง
+</SpotTheBug>
+
+### CronJob: ไม่มี `concurrencyPolicy` ทำให้ backup ซ้อนกัน
+
+CronJob ไม่มี `concurrencyPolicy` เลย (default เป็น `Allow`) และ backup body รันนาน 90 วินาที -- นานกว่า schedule interval 1 นาที พิสูจน์ด้วยการตั้ง schedule เป็น `* * * * *` แล้วรันจริงประมาณ 3 นาทีกับ CronJob สองตัวที่เหมือนกันทุกอย่างยกเว้นตัวหนึ่งปล่อย default อีกตัวตั้ง `concurrencyPolicy: Forbid`:
+
+```text
+# default (Allow): ทุก tick สร้าง Job ใหม่ ไม่สนว่าตัวก่อนหน้าทำอะไรอยู่
+$ kubectl describe cronjob backup-noconcurrency
+Events:
+  Normal  SuccessfulCreate  2m59s  cronjob-controller  Created job backup-noconcurrency-29840476
+  Normal  SuccessfulCreate  119s   cronjob-controller  Created job backup-noconcurrency-29840477
+  Normal  SawCompletedJob   86s    cronjob-controller  Saw completed job: backup-noconcurrency-29840476, condition: Complete
+  Normal  SuccessfulCreate  59s    cronjob-controller  Created job backup-noconcurrency-29840478
+```
+
+`backup-noconcurrency-29840476` สร้างตอน :16:00 และ (duration 93s) เสร็จประมาณ :17:33; `...-29840477` สร้างตอน :17:00 -- มีช่วงจริงประมาณ 33 วินาทีที่ **backup Job สองตัวรันพร้อมกัน**
+
+```text
+# concurrencyPolicy: Forbid: controller ข้าม/เลื่อนแทนการซ้อนกัน
+$ kubectl describe cronjob backup-fixed
+Events:
+  Normal  SuccessfulCreate  2m59s               cronjob-controller  Created job backup-fixed-29840476
+  Normal  SawCompletedJob   86s                 cronjob-controller  Saw completed job: backup-fixed-29840476, condition: Complete
+  Normal  SuccessfulCreate  86s                 cronjob-controller  Created job backup-fixed-29840477
+  Normal  JobAlreadyActive  59s (x4 over 119s)  cronjob-controller  Not starting job because prior execution is running and concurrency policy is Forbid
+```
+
+<SpotTheBug code={`spec:
+  schedule: '0 2 * * *'
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: backup
+            command: ["sh", "-c", "echo backup start; sleep 90; echo backup done"]`}>
+บทเรียน [Jobs and CronJobs](/kubernetes/en/workloads/jobs-and-cronjobs/) ของคอร์สนี้เองยืนยันไว้แล้วว่า `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` default เป็น `3`/`1` -- ดังนั้น "ไม่มี history limit" เองไม่ใช่ bug แบบสะสมไม่จำกัดบน cluster ปัจจุบัน ความเสี่ยงจริงที่พิสูจน์แล้วด้านบนคือ `concurrencyPolicy` ที่ปล่อย default `Allow` ไว้: พอ backup body ช้ากว่า schedule interval controller ของ CronJob ก็สร้าง Job ถัดไปตามตารางไม่สนว่าตัวก่อนหน้าเสร็จหรือยัง พิสูจน์แล้วด้านบนด้วยคู่ที่ซ้อนกันจริง (`-29840476` ยังรันอยู่ตอน `-29840477` เริ่ม) backup process สองตัวชนกับ database เดียวกันพร้อมกันคือความเสี่ยงจริง (lock contention, snapshot ไม่สอดคล้อง หรือเขียนแข่งกันไปที่ปลายทางเดียวกัน) ไม่ใช่แค่เปลือง compute วิธีแก้คือ `concurrencyPolicy: Forbid` (ข้าม tick ถ้าตัวก่อนหน้ายังไม่เสร็จ พิสูจน์แล้วด้านบนด้วย event `JobAlreadyActive` จริง) -- หรือ `Replace` ถ้าอยากให้ run ล่าสุดชนะเสมอ
+</SpotTheBug>
+
+### PodDisruptionBudget: `minAvailable` เท่ากับจำนวน replica เต็ม
+
+`db-app-pdb` ตั้ง `minAvailable: 3` ให้ Deployment ที่มี 3 replica พอดี พิสูจน์ด้วยการ drain node ที่ host Pod ทั้ง 3 ตัวจริงแบบจับเวลา:
+
+```text
+$ kubectl get pdb db-app-pdb
+NAME          MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+db-app-pdb    3               N/A               0                     1s
+
+$ kubectl drain reading-b-worker --ignore-daemonsets --delete-emptydir-data --timeout=15s
+evicting pod wr2/db-app-64bfd95585-m686z
+error when evicting pods/"db-app-64bfd95585-m686z" -n "wr2" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+evicting pod wr2/db-app-64bfd95585-8pcpn
+error when evicting pods/"db-app-64bfd95585-8pcpn" -n "wr2" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+evicting pod wr2/db-app-64bfd95585-l4xwj
+error when evicting pods/"db-app-64bfd95585-l4xwj" -n "wr2" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+... (ซ้ำทุก 5 วินาทีจนกว่าจะ timeout)
+error: unable to drain node "reading-b-worker" due to error: [... global timeout reached: 15s ...]
+
+$ kubectl get pods -o wide -l app=db-app
+NAME                      READY   STATUS    NODE
+db-app-64bfd95585-8pcpn   1/1     Running   reading-b-worker
+db-app-64bfd95585-l4xwj   1/1     Running   reading-b-worker
+db-app-64bfd95585-m686z   1/1     Running   reading-b-worker
+```
+
+<SpotTheBug code={`spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app: db-app`}>
+พอ `minAvailable` เท่ากับจำนวน replica เต็ม `ALLOWED DISRUPTIONS` เป็น `0` จริง ๆ -- ไม่ใช่แค่ "ระมัดระวังมาก" แต่เป็นเพดานจริงถาวรที่ voluntary eviction ข้ามไม่ได้เลยตราบใดที่ต้องมีครบ 3 replica `kubectl drain` จริง (node upgrade, scale-down, cordon เพื่อ maintenance) จะบล็อค**ตลอดไป** พิสูจน์แล้วด้านบนด้วย `Cannot evict pod as it would violate the pod's disruption budget` ซ้ำเดิมตลอดทั้ง timeout และ Pod ทั้ง 3 ยัง `Running` บน node ตอนจบ วิธีแก้คือตั้ง budget ที่ยอมให้เสีย replica ไปอย่างน้อย 1 ตัวได้จริง -- `minAvailable: 2` (หรือ `maxUnavailable: 1`) สำหรับ workload 3 replica เพื่อให้ drain จริงเดินหน้าได้ทีละ Pod แทนที่จะค้างไม่มีกำหนด
+</SpotTheBug>
+
+### StatefulSet: ไม่มี `podManagementPolicy` ตอนที่ shard เป็นอิสระต่อกัน
+
+3 replica ของ database นี้ bootstrap แบบอิสระจากกันเต็มที่ (แต่ละตัวมีข้อมูลของตัวเอง ไม่มีลำดับ leader-follower join) -- shape แบบที่การรับประกันของ `OrderedReady` ไม่ได้ประโยชน์อะไรเลย บทเรียน [StatefulSets and DaemonSets](/kubernetes/en/workloads/statefulsets-and-daemonsets/) ของคอร์สนี้วัดต้นทุนตรงไว้แล้ว (`18.37s` ของ `OrderedReady` เทียบ `6.17s` ของ `Parallel` สำหรับ 3 replica ที่ timing เหมือนกัน -- ประมาณ 3 เท่า) ทำ timing เดิมซ้ำบน cluster ของรีวิวนี้เอง ด้วย StatefulSet 3 replica ที่มี startup delay 5 วินาทีต่อ Pod ยืนยัน shape เดียวกันแม้ตัวเลขจริงจะต่างกัน:
+
+```text
+# podManagementPolicy ไม่ได้ตั้ง (OrderedReady, default)
+$ kubectl apply -f sts-shard.yaml   # แล้ว poll จนกว่าทั้ง 3 จะเป็น 1/1
+OrderedReady (default) time: 19s
+
+# StatefulSet เดียวกันเป๊ะ เพิ่มแค่ podManagementPolicy: Parallel
+Parallel time: 7s
+```
+
+<SpotTheBug code={`spec:
+  serviceName: shard
+  replicas: 3
+  # no podManagementPolicy -- defaults to OrderedReady`}>
+`OrderedReady` (default ที่ปล่อยไว้ไม่ได้ตั้งตรงนี้) สร้างแล้วรอแต่ละ ordinal ให้ `Ready` ก่อนที่จะ**สร้าง**ตัวถัดไปด้วยซ้ำ -- พิสูจน์แล้วด้านบน `19s` สำหรับ 3 replica ที่ startup 5 วินาทีต่อตัว เทียบกับ `7s` ตอนใส่ `podManagementPolicy: Parallel` ที่สร้างทั้งสามพร้อมกัน การ serialize แบบนั้นเหมาะมากถ้า bootstrap logic ของ ordinal ถัดไปสมมติว่าตัวก่อนหน้าขึ้นแล้ว -- แต่เป็น latency เปล่า ๆ ที่หลีกเลี่ยงได้สำหรับ shard หรือ replica ที่ไม่พึ่งพากันตอน startup เลย ซึ่งตรงกับสิ่งที่ manifest นี้อธิบายจริง ๆ วิธีแก้คือใส่ `podManagementPolicy: Parallel` ให้ชัดเจนเมื่อยืนยันความอิสระต่อกันแล้ว -- มันแค่เอาการรับประกัน**ลำดับ** startup ออก ไม่กระทบตัวตนหรือ storage ต่อ Pod ที่ยังอยู่เหมือนเดิม
+</SpotTheBug>
+
+## โค้ดที่แก้แล้ว
+
+```yaml
+# k8s/worked-review-2/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+spec:
+  clusterIP: None
+  selector:
+    app: db
+  ports:
+  - port: 5432
+```
+
+```yaml
+# k8s/worked-review-2/statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+spec:
+  serviceName: db
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      containers:
+      - name: db
+        image: busybox:1.36
+        command: ["sh", "-c", "sleep 3600"]
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/db
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 1Gi
+```
+
+```yaml
+# k8s/worked-review-2/secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-credentials
+# base64-encoded, NOT encrypted -- see review
+data:
+  password: c3VwZXJzZWNyZXQxMjMh
+```
+
+```yaml
+# k8s/worked-review-2/cronjob.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: db-backup
+spec:
+  schedule: '0 2 * * *'
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: backup
+            image: busybox:1.36
+            command: ["sh", "-c", "echo backup start; sleep 90; echo backup done"]
+```
+
+```yaml
+# k8s/worked-review-2/pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: db-app-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: db-app
+```
+
+`npm run verify` dry-run ทั้ง 5 ไฟล์ด้านบนกับ `verify-k8s` cluster ที่ใช้ร่วมกัน ได้ 0 error และ `node tools/verify-manifests.mjs --apply reading-k8s/worked-review-2` apply จริงลง namespace ชั่วคราว: Pod ทั้ง 3 ของ StatefulSet ถึง `Running` พร้อม PVC bound จริงต่อตัว (`db-data-db-0`/`-1`/`-2`) และ `serviceName: db` ตรงกับ headless Service ที่สร้างขึ้นจริง
+
+## สรุปว่าแก้อะไรทำไม
+
+| # | Bug | วิธีแก้ |
+|---|---|---|
+| 1 | `serviceName: db-headless` แต่ Service ที่สร้างจริงชื่อ `db` | ชื่อตรงกัน -- `NXDOMAIN` จริงบน per-Pod DNS name ก่อน resolve ได้หลัง |
+| 2 | `hostPath` สำหรับข้อมูล persistent ของ database | `volumeClaimTemplates` แยกต่อ replica -- อ้างพิสูจน์: ข้อมูลไม่ตาม Pod ที่ reschedule ไปเมื่อใช้ `hostPath` |
+| 3 | Comment อ้างว่าข้อมูลของ Secret "encrypted" | แก้ comment เป็น base64-encoded ไม่ใช่ encrypted -- `base64 --decode` แบบ offline พิสูจน์จริง |
+| 4 | `restartPolicy: Always` บน manual backup Job | `OnFailure` -- API server ปฏิเสธจริงทันทีถ้าไม่แก้ |
+| 5 | ไม่มี `concurrencyPolicy` บน backup CronJob | `concurrencyPolicy: Forbid` -- Job ซ้อนกันจริงพิสูจน์ก่อน, event `JobAlreadyActive` จริงหลัง |
+| 6 | `PodDisruptionBudget.minAvailable` เท่ากับจำนวน replica เต็ม | `minAvailable: 2` -- drain ค้างถาวรจริงพิสูจน์ก่อน |
+| 7 | ไม่มี `podManagementPolicy` บน StatefulSet ของ shard ที่อิสระต่อกัน | `podManagementPolicy: Parallel` -- startup ช้าจริงประมาณ 3 เท่าพิสูจน์ก่อน |
+
+## Mental Model
+
+มีแค่ 1 ใน bug เจ็ดตัวนี้ (4, `restartPolicy` ของ Job) ที่ API server ปฏิเสธตรง ๆ ทันที อีก 6 ตัวที่เหลือ apply ผ่านเนียนหมด เพราะแต่ละตัวเป็นการอ้างข้อเท็จจริงที่ API server ไม่มีทางเช็คได้เลย: `serviceName` ชี้ไปที่ Service จริงที่ตรงกันไหม, path ที่ mount ไว้เป็น storage ที่ทนทานและแชร์ได้จริงหรือแค่ disk local ของ node เดียว, "ข้อมูลอยู่ใน Secret object" เหมือนกับ "ข้อมูลถูกป้องกันแล้ว" จริงไหม, backup body จะเสร็จภายใน schedule tick เดียวเสมอไหม, disruption budget ยังเหลือช่องให้ evict ได้จริงไหม, Pod ที่ไม่มี dependency ตอน startup จริง ๆ ได้ประโยชน์จากการจ่ายต้นทุนรอคิวไหม ไม่มีตัวไหนโผล่เป็น error เลย มีแต่ช่องว่างจริงแต่เงียบระหว่าง "controller รายงานว่าแข็งแรงดี" กับสิ่งที่เกิดขึ้นจริงตอน DNS lookup, node drain หรือ schedule จริง
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ถ้า StatefulSet กับ Service ของมันมีอยู่ทั้งคู่ `serviceName` ต้องชี้ไปตัวที่ถูกต้องแน่ ๆ"** พิสูจน์แล้วด้านบน: API server ไม่เคย validate `serviceName` กับ Service object จริงเลย -- เปลี่ยนชื่อฝั่งใดฝั่งหนึ่งโดยไม่อัปเดตอีกฝั่ง StatefulSet ยังรายงานว่าแข็งแรงดี ขณะที่ per-Pod DNS lookup ทุกอันคืน `NXDOMAIN`
+- **"Secret ปลอดภัยกว่า ConfigMap โดยธรรมชาติ"** พิสูจน์แล้วด้านบนด้วย `base64 --decode` แบบ offline: field `data` ของมันเอง reverse กลับได้ง่ายพอ ๆ กับ ConfigMap -- ต่างกันแค่ convention ความปลอดภัยจริงต้องอาศัย encryption at rest, RBAC หรือ external secret manager ซึ่งไม่มีอันไหนที่ Secret object ให้มาเองเลย
+- **"ข้าม `podManagementPolicy` ไปเลยคือทางเลือกที่ปลอดภัยและระมัดระวังเสมอ"** พิสูจน์แล้วด้านบน: `OrderedReady` "ปลอดภัย" จริงเฉพาะ workload ที่ต้องการลำดับ startup จริง ๆ สำหรับ shard ที่อิสระต่อกัน มันคือ latency เปล่า ๆ ที่วัดได้ (ช้ากว่าประมาณ 3 เท่าในการทดสอบนี้) โดยไม่ได้ correctness เพิ่มเลย
+
+<Mermaid title={"จุดที่แต่ละ bug อยู่ใน manifest set ของ database นี้"} code={wr2Diagram} />
+
+export const wr2Diagram = `flowchart TD
+  S["Service: db (headless)"]
+  ST["StatefulSet: serviceName=db-headless"] -->|"1: name drift -- NXDOMAIN"| ST
+  ST --> V["hostPath /mnt/db-data"]
+  V -->|"2: not portable across nodes"| V
+  ST --> PM["no podManagementPolicy"]
+  PM -->|"7: 3x slower than needed"| PM
+  SEC["Secret: db-credentials"] -->|"3: 'encrypted' comment is false"| SEC
+  J["Job: db-backup-manual, restartPolicy Always"] -->|"4: real API rejection"| J
+  CJ["CronJob: db-backup, no concurrencyPolicy"] -->|"5: overlapping backups"| CJ
+  PDB["PDB: minAvailable == replicas"] -->|"6: blocks drain forever"| PDB
+`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+หก ใน bug เจ็ดตัวนี้ apply ผ่านเนียนและผ่านทุก schema check เพราะแต่ละตัวคือการอ้างสิ่งที่ API server มองไม่เห็นจากใน object เดียวนั้นเอง -- `serviceName` ชี้ไปที่ Service จริงที่ตรงกันไหม, volume พกพาข้ามโหนดได้จริงไหม, Secret ถูกป้องกันจริงหรือแค่เปลี่ยนชื่อ, backup body เสร็จทันใน schedule window ของตัวเองไหม, disruption budget ยังเหลือที่ให้ evict ไหม, StatefulSet จ่ายค่าการรับประกันลำดับที่ไม่ต้องการอยู่หรือเปล่า มีแต่ DNS lookup จริง, drain จริง หรือรัน schedule จริงหลายนาทีเท่านั้นที่บอกได้ว่าคุณอยู่ฝั่งไหนของข้ออ้างนั้น
+</Callout>
+
+export const quizWorkedReview2 = [
+  {
+    q: "```text\n$ kubectl exec db-0 -- nslookup db-1.db-headless.wr2.svc.cluster.local\n\n** server can't find db-1.db-headless.wr2.svc.cluster.local: NXDOMAIN\n```\n`serviceName` ของ StatefulSet คือ `db-headless` แต่ Service ที่สร้างจริงชื่อ `db` ทั้งสอง object apply ผ่านไม่มี error และ Pod ทั้ง 3 เป็น `Running` NXDOMAIN นี้พิสูจน์อะไร?",
+    options: [
+      'StatefulSet สร้างไม่สำเร็จ เลยไม่มี DNS ตั้งไว้เลย',
+      '`spec.serviceName` ตั้ง `spec.subdomain` ของแต่ละ Pod และ per-Pod DNS จะ publish ก็ต่อเมื่ออยู่ใต้ Service ที่ชื่อตัวเองตรงกับ subdomain นั้น -- ไม่มี Service ชื่อ `db-headless` เลย เลย (API server ที่ไม่เคย validate field นี้) ปล่อยให้ StatefulSet รายงานว่าแข็งแรงดี ขณะที่ชื่อ resolve ไม่ออกอย่างเงียบ ๆ',
+      'nslookup fail เสมอสำหรับ Pod ของ StatefulSet ไม่ว่าตั้งค่าอย่างไร',
+      'Service ต้องตั้ง `clusterIP` เป็น IP จริงถึงจะทำงานแบบนี้ได้',
+    ],
+    answer: 1,
+    explain: "พิสูจน์แล้วด้านบน: `kubectl get pod db-1 -o jsonpath='{.spec.subdomain}'` คืน `db-headless` และไม่มี Service ชื่อนั้นอยู่จริง เลยไม่มีอะไรให้ CoreDNS publish ใต้ชื่อนั้น -- NXDOMAIN จริงสะอาด ๆ ขณะที่ StatefulSet เองรายงาน `3/3` ตลอด",
+  },
+  {
+    q: "```text\nThe Job \"db-backup-manual\" is invalid: spec.template.spec.restartPolicy: Required value: valid values: \"OnFailure\", \"Never\"\n```\nทำไม `restartPolicy: Always` ถึงโดนปฏิเสธเฉพาะสำหรับ Pod template ของ Job ทั้งที่มันเป็นค่า default ปกติของ Pod ใน Deployment?",
+    options: [
+      'จริง ๆ ไม่ได้โดนปฏิเสธ นี่เป็นแค่ lint warning ฝั่ง client ของ kubectl',
+      'สัญญาทั้งหมดของ Job คือรันจนเสร็จแล้วหยุด -- `Always` (restart ตลอดไป) เข้ากันไม่ได้กับสัญญานั้นในระดับ API เลย server เลยปฏิเสธตรง ๆ แทนที่จะรับ Job ที่ไม่มีทางจบได้',
+      'Always ใช้ได้แค่ตอน `backoffLimit: 0` เท่านั้น',
+      'error นี้จะโผล่ก็ต่อเมื่อตั้ง `parallelism` ไว้ด้วย',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบนด้วย API-server error จริง `OnFailure` (retry Pod เดิม) หรือ `Never` (สร้าง Pod ใหม่เมื่อ fail) เป็นค่าที่ถูกกฎหมายเท่านั้น -- ทั้งคู่ทำให้ Job ไปถึง state สุดท้าย Complete/Failed ได้จริง',
+  },
+  {
+    q: 'CronJob ไม่มี `concurrencyPolicy` (default `Allow`) และ backup body รันนาน 90 วินาที บน schedule 1 นาที event จริงโชว์ job `-29840476` สร้างตอน :16:00 (duration 93s เสร็จ ~:17:33) กับ job `-29840477` สร้างตอน :17:00 timing นี้พิสูจน์อะไร แล้ว `concurrencyPolicy: Forbid` ให้ event จริงแบบไหนแทน?',
+    options: [
+      'ไม่มีอะไรผิดปกติ -- CronJob รอ Job ก่อนหน้าเสมอไม่ว่า concurrencyPolicy จะเป็นอะไร',
+      'มีช่วงจริงประมาณ 33 วินาทีที่ backup Job สองตัวรันพร้อมกันชนกับ database เดียวกัน; ถ้าใช้ Forbid controller จะสร้าง event จริง `JobAlreadyActive` แทน แล้วสร้าง Job ถัดไปก็ต่อเมื่อตัวก่อนหน้าเสร็จจริง ๆ',
+      '`concurrencyPolicy` มีผลแค่กับ Job ที่ fail ไม่เกี่ยวกับ Job ที่ซ้อนกันแต่สำเร็จ',
+      'สาเหตุที่ซ้อนกันคือ successfulJobsHistoryLimit ที่ไม่ได้ตั้ง ไม่ใช่ concurrencyPolicy',
+    ],
+    answer: 1,
+    explain: "พิสูจน์แล้วด้านบนด้วย event จริงทั้งบน CronJob ที่ default-Allow และตัวที่ Forbid: Allow สร้าง Job ใหม่ทุก tick ไม่สนว่าซ้อนกันไหม (ซ้อนกันจริงประมาณ 33 วินาที คำนวณได้แน่นอนจาก timestamp การสร้าง/duration); ตัว Forbid controller log event จริง Not starting job because prior execution is running and concurrency policy is Forbid แล้วเลื่อน Job ถัดไปจนกว่าตัวก่อนหน้าจะเสร็จจริง",
+  },
+  {
+    q: "```text\n$ kubectl drain reading-b-worker --timeout=15s\nerror when evicting pods/\"...\": Cannot evict pod as it would violate the pod's disruption budget.\n... (ซ้ำทุก 5 วินาทีจนกว่าจะ timeout)\n```\nPodDisruptionBudget ตั้ง `minAvailable: 3` ให้ Deployment ที่มี 3 replica พอดี `kubectl get pods -o wide` ตอนจบ drain 15 วินาทีจะโชว์อะไร?",
+    options: [
+      'Pod ทั้ง 3 ถูก evict ไปแล้วและ reschedule ไป node อื่น แค่ช้ากว่าปกติ',
+      'Pod ทั้ง 3 ยัง `Running` บน node เดิม -- `ALLOWED DISRUPTIONS` เป็น `0` จริงถาวร ทุกความพยายาม evict โดนปฏิเสธตราบใดที่ต้องมีครบ 3 replica ไม่ใช่แค่ช้าลง',
+      'Pod ถูก evict ไป 1 ตัวพอดี เพราะ drain ต้อง progress ขั้นต่ำเสมอ',
+      'คำสั่ง drain เองจะ fail ตั้งแต่เริ่ม เพราะ PDB บล็อคการ cordon node',
+    ],
+    answer: 1,
+    explain: "พิสูจน์แล้วด้านบนด้วย drain จริงแบบจับเวลา: ข้อความ Cannot evict pod as it would violate the pod's disruption budget ซ้ำเดิมตลอด 15 วินาที และ Pod ทั้ง 3 ยัง Running บน node หลังจากนั้น -- ค้างจริงไม่มีกำหนด ไม่ใช่แค่ช้า",
+  },
+  {
+    q: "```text\nOrderedReady (default) time: 19s\nParallel time: 7s\n```\nStatefulSet 3 replica เดิม startup ~5 วินาทีต่อ Pod เดิม เปลี่ยนแค่ `podManagementPolicy` สำหรับ database ที่ 3 replica bootstrap อิสระเต็มที่ (ไม่มี leader-follower join) timing จริงนี้สนับสนุนอะไร?",
+    options: [
+      'Parallel ควรแทนที่ OrderedReady เป็น default สำหรับ StatefulSet ทุกตัวเสมอ',
+      'การสร้างแบบ serialize ของ OrderedReady มีต้นทุนเวลาจริง (ประมาณ 3 เท่าในที่นี้) โดยไม่ได้ correctness เพิ่มเลยเมื่อ replica ไม่ได้พึ่งพากันตอน startup จริง -- เลยควรตั้ง `podManagementPolicy: Parallel` ให้ชัดเจนสำหรับ shape แบบนี้',
+      'ความต่างของ timing เป็นแค่ noise ของการวัด ไม่ใช่ effect จริง',
+      'podManagementPolicy มีผลแค่ลำดับตอนลบเท่านั้น ไม่เกี่ยวกับตอนสร้าง',
+    ],
+    answer: 1,
+    explain: "พิสูจน์แล้วด้านบน: OrderedReady สร้าง (ไม่ใช่แค่รายงาน) แต่ละ ordinal ทีละตัวจริง รอความพร้อมของตัวก่อนหน้าก่อนเสมอ -- สำหรับ workload ที่ไม่มีอะไรพึ่งพาลำดับนั้นจริง ๆ มันคือการจ่าย latency จริงเพื่อการรับประกันที่ไม่ต้องการ",
+  },
+];
+
+<Quiz client:visible id="reading-k8s/worked-review-2" questions={quizWorkedReview2} />
+
+<ProgressTracker client:visible id="reading-k8s/worked-review-2" />

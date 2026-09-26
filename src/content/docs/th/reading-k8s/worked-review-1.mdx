@@ -1,0 +1,486 @@
+---
+title: 'รีวิวจริง 1: web app Deployment, Service, Ingress และ HPA'
+description: 'web app rollout ที่ AI generate ให้ -- Deployment, Service, Ingress และ HorizontalPodAutoscaler -- รีวิวทีละ bug เทียบกับ dry-run/apply error จริง, kubectl events จริง และพฤติกรรม endpoint/probe/rollout จริงบน cluster จริง'
+sidebar:
+  order: 4
+---
+
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import Mermaid from '../../../../components/Mermaid.astro';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## Feature ที่ขอ
+
+Prompt คือ: *"Deploy web app ไว้หลัง Service กับ Ingress พร้อม HPA ให้ scale ตอน load สูง"* สิ่งที่ตามมาคือ draft แรกแบบที่ AI assistant ตอบกลับมาสำหรับ prompt นี้จริง ๆ -- ทุกไฟล์ดูเหมือนก็อปมาจาก tutorial เก่าหน่อย ๆ และ shape ของแต่ละ object ก็ดูสมเหตุสมผลเมื่อดูทีละไฟล์ อ่านตามที่ [review checklist](/kubernetes/en/reading-k8s/review-checklist/) แนะนำ: เช็คความถูกต้องตอน apply ก่อน (API server รับ object นี้ไหม) แล้วค่อยดู rollout behavior แล้วค่อยดู traffic shape มี **bug จริง 7 ตัว** เช็ค [AI bug catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/) สำหรับ pattern ทั่วไปเบื้องหลังแต่ละตัว ทุกข้อความอ้างด้านล่างพิสูจน์จริงบน `kind` cluster 2 node (`kind create cluster --name reading-b`, Kubernetes 1.37.0, `metrics-server` patch `--kubelet-insecure-tls`) -- `kubectl apply` จริง, `kubectl describe`/`get events` จริง, พฤติกรรม endpoint กับ probe จริง
+
+## โค้ดที่ AI generate ให้
+
+```yaml
+# web-app Deployment, as generated -- see review below
+apiVersion: apps/v1beta1
+kind: Deployment
+metadata:
+  name: web-app
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 0
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+        tier: frontend
+    spec:
+      containers:
+      - name: web-app
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        livenessProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 3
+          failureThreshold: 1
+        readinessProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 3
+          failureThreshold: 1
+```
+
+```yaml
+# web-app Service, as generated -- see review below
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-app
+spec:
+  selector:
+    app: web-app
+    tier: backend
+  ports:
+  - port: 80
+    targetPort: 80
+```
+
+```yaml
+# web-app HorizontalPodAutoscaler, as generated -- see review below
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target: { type: Utilization, averageUtilization: 60 }
+```
+
+```yaml
+# @expect-error no matches for kind "Ingress" in version "networking.k8s.io/v1beta1"
+apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: web-app
+spec:
+  rules:
+  - host: web.example.com
+    http:
+      paths:
+      - path: /
+        backend:
+          serviceName: web-app
+          servicePort: 80
+```
+
+## เดินรีวิวทีละจุด
+
+### Deployment: `apiVersion` ที่ถูกลบไปหลายปีแล้ว
+
+`apps/v1beta1` คือ shape ของ Deployment ก่อน 1.16 แบบเป๊ะ ๆ ที่ training example เก่ายังใช้อยู่ พิสูจน์ตรงกับ API server จริง:
+
+```text
+$ kubectl apply -f deployment.yaml
+error: resource mapping not found for name: "web-app" namespace: "wr1" from "deployment.yaml": no matches for kind "Deployment" in version "apps/v1beta1"
+ensure CRDs are installed first
+```
+
+<SpotTheBug code={`apiVersion: apps/v1beta1
+kind: Deployment`}>
+นี่ไม่ใช่ deprecation warning แต่คือการลบทิ้งจริง -- `apps/v1beta1` กับ `apps/v1beta2` เลิก serve ตั้งแต่ Kubernetes 1.16 ย้ายไป `apps/v1` API server ไม่มี REST mapping ให้ group/version นี้เลย เลย fail ตอน routing ก่อนจะไปดู field ไหนเลยด้วยซ้ำ วิธีแก้ง่าย ๆ คือ `apiVersion: apps/v1` -- ที่เหลือของ Deployment ใต้ `apps/v1` shape เหมือนเดิมทุกอย่าง
+</SpotTheBug>
+
+### Service: `selector` ที่ไม่ตรงกับ Pod ของ Deployment ตัวเอง
+
+Service เลือก `app: web-app, tier: backend` ส่วน Pod template ของ Deployment มี label `app: web-app, tier: frontend` ทั้งสอง object apply ผ่านเนียน ๆ -- API server ไม่เคยเช็ค selector ของ Service ข้ามกับ Deployment ไหนเลย พิสูจน์ด้วย endpoints จริง หลังจากทั้ง Deployment กับ Service apply แล้วและ Pod เป็น `2/2 Running`:
+
+```text
+$ kubectl get endpoints web-app
+Warning: v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice
+NAME      ENDPOINTS   AGE
+web-app   <none>      24s
+
+$ kubectl get endpointslices -l kubernetes.io/service-name=web-app
+NAME            ADDRESSTYPE   PORTS     ENDPOINTS   AGE
+web-app-985wj   IPv4          <unset>   <unset>     24s
+```
+
+<SpotTheBug code={`selector:
+  app: web-app
+  tier: backend`}>
+ทุก field ตรงนี้ valid YAML และเป็น Service selector ที่ถูกต้องตามหลัก ไม่มีอะไรให้ schema validation ปฏิเสธเลย Service แค่เลือก Pod set ที่ว่างเปล่า แล้วก็เงียบแบบนั้นไปเรื่อย ๆ: `kubectl get svc` บอกว่า Service healthy, Deployment บอก `3/3` Ready อาการเดียวที่เห็นได้คือ EndpointSlice ที่ไม่มี address เลย วิธีแก้คือทำให้ label สองฝั่งตรงกัน -- ใส่ `tier: frontend` ใน selector หรือถ้าไม่จำเป็นต้องแยกด้วย `tier` ก็ตัด key นี้ออกจาก selector ไปเลย
+</SpotTheBug>
+
+### Deployment: ไม่มี `resources.requests` เลย ทำให้ HPA ทำงานไม่ได้
+
+Container ไม่มี `resources` block เลย ทั้ง Deployment กับ HPA apply ผ่านเนียน ๆ -- อาการนี้โผล่มาก็ตอน HPA พยายามคำนวณเปอร์เซ็นต์จริง ๆ พิสูจน์ด้วย HPA จริงกับ Deployment นี้บน `metrics-server`:
+
+```text
+$ kubectl get hpa web-app-hpa
+NAME          REFERENCE                TARGETS              MINPODS   MAXPODS   REPLICAS   AGE
+web-app-hpa   Deployment/web-app-hpa   cpu: <unknown>/60%   2         10        2          35s
+
+$ kubectl describe hpa web-app-hpa
+...
+  Type            Status  Reason                   Message
+  ----            ------  ------                   -------
+  ScalingActive   False   FailedGetResourceMetric  the HPA was unable to compute the replica count: failed to get cpu utilization: missing request for cpu in container web-app of Pod web-app-hpa-f94bdb95c-knmc2
+Events:
+  Warning  FailedGetResourceMetric  failed to get cpu utilization: missing request for cpu in container web-app of Pod web-app-hpa-f94bdb95c-knmc2
+```
+
+<SpotTheBug code={`containers:
+- name: web-app
+  image: nginx:alpine
+  ports:
+  - containerPort: 80`}>
+มีจุดที่ต้องรู้ก่อนไปหา bug นี้ในของจริง: การตั้ง `resources.limits.cpu` **โดยไม่มี** `resources.requests.cpu` **ไม่** ทำให้เกิด error นี้ -- API server จะ default `requests.cpu` ที่ไม่ได้ตั้งให้เท่ากับ `limits.cpu` ที่มีอยู่ทันที (เช็คตรงแล้ว: apply container ที่มีแค่ `limits: { cpu: 500m }` ได้ผลลัพธ์กลับมาเป็น `requests: { cpu: 500m }` ใส่ให้เรียบร้อยแล้ว) bug จริงต้องเป็น container ที่**ไม่มี resources block เลย** -- `{}` บน wire เช็คแล้วด้วย `kubectl get pod -o jsonpath='{.spec.containers[0].resources}'` ซึ่งตรงกับตอนที่ `kubectl describe hpa` โชว์ข้อความ `FailedGetResourceMetric`/`missing request for cpu` จริง การคำนวณ utilization ของ HPA อิง requests เสมอ ไม่ fallback ไป limits ไม่ว่ากรณีไหน วิธีแก้คือใส่ `resources.requests.cpu` ให้ชัดเจน (แล้วก็ใส่ `resources.limits` ไปด้วยเพื่อ QoS ที่ดี)
+</SpotTheBug>
+
+### Deployment: liveness กับ readiness ใช้ endpoint เดียวกัน
+
+ทั้งสอง probe ยิง `GET /` port 80 ทุก 3 วินาที `failureThreshold: 1` และไม่มี `startupProbe` เลย พิสูจน์ด้วย container ที่ warm-up ช้าจริง (20 วินาที) ด้วย probe shape เดียวกันนี้:
+
+```text
+$ kubectl describe pod slow-warm-bad
+Events:
+  Type     Reason     Age                From      Message
+  ----     ------     ----               ----      -------
+  Warning  Unhealthy  15s (x2 over 33s)  kubelet   Liveness probe failed: Get "http://10.244.1.11:8080/": dial tcp 10.244.1.11:8080: connect: connection refused
+  Normal   Killing    15s (x2 over 33s)  kubelet   Container web failed liveness probe, will be restarted
+  Warning  Unhealthy  3s (x15 over 35s)  kubelet   Readiness probe failed: Get "http://10.244.1.11:8080/": dial tcp 10.244.1.11:8080: connect: connection refused
+
+$ kubectl get pod slow-warm-bad
+NAME            READY   STATUS    RESTARTS     AGE
+slow-warm-bad   0/1     Running   2 (0s ago)   50s
+```
+
+<SpotTheBug code={`livenessProbe:
+  httpGet: { path: /, port: 80 }
+  periodSeconds: 3
+  failureThreshold: 1
+readinessProbe:
+  httpGet: { path: /, port: 80 }
+  periodSeconds: 3
+  failureThreshold: 1`}>
+liveness probe ตอบคำถาม "container นี้ค้างต้อง restart ไหม" ส่วน readiness probe ตอบ "ตอนนี้ควรส่ง traffic มาที่ container นี้ไหม" การชี้ทั้งคู่ไป endpoint เดียวกันโดยไม่มี `startupProbe` ทำให้สองความหมายนี้แยกกันไม่ออกเลย: container ที่แค่ยัง warm-up อยู่จะดูเหมือนกันเป๊ะกับตัวที่ค้างถาวรในสายตา kubelet แล้วก็โดนฆ่าทิ้งด้วยเหตุผลที่ restart แก้ไม่ได้ เพราะ restart รีเซ็ตนาฬิกา warm-up กลับไปศูนย์ พิสูจน์แล้วด้านบนด้วย restart จริงที่นับเพิ่มขึ้นเรื่อย ๆ (`RESTARTS: 2 (0s ago)`) วิธีแก้คือใส่ `startupProbe` เฉพาะ (ซึ่งจะปิด liveness/readiness ทั้งคู่จนกว่าจะสำเร็จครั้งแรก) ให้ขนาดพอดีกับเวลา startup แย่สุดจริง บวก liveness probe ที่ผ่อนปรนกว่า readiness มากพอหลัง startup เสร็จ
+</SpotTheBug>
+
+### Deployment: ไม่มี `preStop` ทำให้ rolling delete หลุด request ที่กำลังวิ่งอยู่
+
+Container ไม่มี `lifecycle.preStop` เลย พิสูจน์ด้วย Service จริง + client pod ที่ curl วนลูปตอน Pod ที่ serve อยู่ถูกลบกลางลูป 40 request ทุก 250ms สั่ง delete หลัง request ที่ 8:
+
+```text
+$ kubectl exec loadgen -- sh -c 'for i in $(seq 1 40); do wget -q -T1 -O /dev/null -S http://web-app/ 2>&1 | grep -o "HTTP/[0-9.]* [0-9]*"; sleep 0.25; done' &
+$ kubectl delete pod web-app-<hash>
+```
+
+```text
+# request  status (ไม่มี preStop)
+8   HTTP/1.1 200
+9   HTTP/1.1 200
+10  (ไม่มี response -- connection refused/reset)
+11  HTTP/1.1 200
+...
+39/40 สำเร็จ หลุดไปแค่ 1 request ตรงจังหวะ delete พอดี
+```
+
+ทดสอบชุดเดียวกันเป๊ะกับ Pod ที่เพิ่ม `preStop: sleep 5` ผลคือตัวที่หลุดย้ายไปเป็น request #1 แทน (เป็น cold-start blip ก่อน delete ไม่เกี่ยวกัน) -- ทุก request ตั้งแต่จุด delete เป็นต้นไปสำเร็จหมด `40/40` นับจากจุดนั้น
+
+<SpotTheBug code={`containers:
+- name: web-app
+  image: nginx:alpine
+  # no lifecycle.preStop here`}>
+`kubectl delete pod` ส่ง SIGTERM ให้ container พร้อม ๆ กับที่ลบ Pod ออกจาก Endpoints ของ Service คร่าว ๆ -- มัน**ไม่**รอให้ kube-proxy ทุกตัวบนทุก node reprogram iptables/ipvs เสร็จก่อน ถ้าไม่มี `preStop` nginx อาจหยุดรับ connection ใหม่ก่อนที่การลบ endpoint จะกระจายไปทั่วเสร็จ request ที่วิ่งมาโดนช่วงแคบ ๆ นี้พอดีก็ fail `preStop` hook ที่แค่ sleep ไม่กี่วินาทีไม่ได้ไปแตะ Service/endpoint machinery เลยสักนิด -- มันแค่ทำให้ listening socket ของ container เปิดอยู่นานขึ้นอีกหน่อย ซึ่งพิสูจน์แล้วด้านบนว่าพอสำหรับดูดซับ race เดียวกันเป๊ะที่หลุด request ไปตอนไม่มี preStop วิธีแก้คือ `lifecycle.preStop.exec.command: ["sh", "-c", "sleep 5"]` บวก `terminationGracePeriodSeconds` ที่ใหญ่พอจะครอบคลุมมันได้
+</SpotTheBug>
+
+### Deployment: `maxUnavailable: 0` กับ `maxSurge: 0` พร้อมกัน
+
+ตั้งค่าทั้งคู่เป็น `0` ใน `rollingUpdate` block เดียวกัน พิสูจน์ตรงกับ API server จริง:
+
+```text
+$ kubectl apply -f deployment-zerozero.yaml
+The Deployment "web-app-zz" is invalid: spec.strategy.rollingUpdate.maxUnavailable: Invalid value: 0: may not be 0 when `maxSurge` is 0
+```
+
+<SpotTheBug code={`strategy:
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 0`}>
+มองแค่ชื่อ field ดูเหมือน "ปลอดภัยสุด" -- unavailable ศูนย์ surge ศูนย์ จะพังตรงไหน API server ปฏิเสธตรง ๆ เพราะสองค่านี้รวมกันอธิบาย rollout ที่ไม่มีทางถูกกฎหมายให้ progress ต่อได้เลย: เอา Pod ลงก็ไม่ได้ (`maxUnavailable: 0`) เอา Pod ใหม่ขึ้นก่อนก็ไม่ได้เหมือนกัน (`maxSurge: 0`) ต้องมีอย่างน้อยตัวใดตัวหนึ่งไม่เป็นศูนย์ วิธีแก้คือเลือก trade-off ที่ตั้งใจจริง ๆ -- `maxUnavailable: 0, maxSurge: 1` เพื่อ zero-downtime แลกกับ Pod พิเศษ 1 ตัวระหว่าง rollout หรือ `maxUnavailable: 1, maxSurge: 0` เพื่อไม่ต้องมี capacity เพิ่ม แลกกับ Pod หายไปสั้น ๆ 1 ตัว
+</SpotTheBug>
+
+### Ingress: shape แบบก่อน 1.19
+
+```text
+$ kubectl apply -f ingress.yaml
+error: resource mapping not found for name: "web-app" namespace: "wr1" from "ingress.yaml": no matches for kind "Ingress" in version "networking.k8s.io/v1beta1"
+ensure CRDs are installed first
+```
+
+<SpotTheBug code={`apiVersion: networking.k8s.io/v1beta1
+...
+backend:
+  serviceName: web-app
+  servicePort: 80`}>
+bug ประเภทเดียวกับ `apps/v1beta1` ของ Deployment: นี่คือ shape ของ Ingress ก่อน Kubernetes 1.19 ทั้ง API version กับชื่อ field `backend.serviceName`/`backend.servicePort` ถูกลบทิ้งจริง ไม่ใช่แค่ deprecate วิธีแก้คือ `networking.k8s.io/v1` ที่ต้องมี `pathType` แล้ว backend เขียนเป็น `backend.service.name`/`backend.service.port.number` -- หรือถ้ามองสถานะ frozen ของ Ingress API กับการ retire ของ ingress-nginx ก็ย้ายไปใช้ `HTTPRoute` ของ Gateway API แทนการอัปเดตแบบเดิม
+</SpotTheBug>
+
+## โค้ดที่แก้แล้ว
+
+```yaml
+# k8s/worked-review-1/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+        tier: frontend
+    spec:
+      terminationGracePeriodSeconds: 15
+      containers:
+      - name: web-app
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        resources:
+          requests: { cpu: 100m, memory: 64Mi }
+          limits: { cpu: 250m, memory: 128Mi }
+        startupProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 2
+          failureThreshold: 15
+        readinessProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 3
+          failureThreshold: 1
+        livenessProbe:
+          httpGet: { path: /, port: 80 }
+          periodSeconds: 10
+          failureThreshold: 3
+        lifecycle:
+          preStop:
+            exec:
+              command: ["sh", "-c", "sleep 5"]
+```
+
+```yaml
+# k8s/worked-review-1/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-app
+spec:
+  selector:
+    app: web-app
+    tier: frontend
+  ports:
+  - port: 80
+    targetPort: 80
+```
+
+```yaml
+# k8s/worked-review-1/hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target: { type: Utilization, averageUtilization: 60 }
+```
+
+```yaml
+# k8s/worked-review-1/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web-app
+spec:
+  rules:
+  - host: web.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: web-app
+            port:
+              number: 80
+```
+
+`npm run verify` dry-run ทั้ง 4 ไฟล์ด้านบนกับ `verify-k8s` cluster ที่ใช้ร่วมกัน ได้ 0 error และ `node tools/verify-manifests.mjs --apply reading-k8s/worked-review-1` apply จริงลง namespace ชั่วคราว: Deployment ถึง `3/3` Ready และ EndpointSlice ของ Service มี Pod IP ครบ 3 ตัว (selector ตรงแล้ว) `verify-k8s` ไม่มี `metrics-server` ติดตั้งไว้ เลย HPA ตรงนั้นยังโชว์ `<unknown>` -- เป็นสภาพแวดล้อมของ cluster ที่ใช้ร่วมกันเอง ไม่ใช่การถอยกลับของ fix เอา fix เดียวกันเป๊ะ (เพิ่ม `resources.requests.cpu` block) ไปใช้กับ cluster `reading-b` ของรีวิวนี้เองซึ่งมี `metrics-server` ยืนยันการเปลี่ยนพฤติกรรมจริงตรง ๆ: `kubectl get hpa` เปลี่ยนจาก `cpu: <unknown>/60%` เป็น `cpu: 0%/60%` จริง และ `kubectl describe hpa` ตอนนี้โชว์ `ScalingActive: True, Reason: ValidMetricFound` แทนที่ `FailedGetResourceMetric` เดิม
+
+## สรุปว่าแก้อะไรทำไม
+
+| # | Bug | วิธีแก้ |
+|---|---|---|
+| 1 | Deployment `apiVersion: apps/v1beta1` | `apps/v1` -- `no matches for kind` จริงบน group/version เก่า |
+| 2 | Service selector (`tier: backend`) ไม่ตรง Pod template (`tier: frontend`) | selector ตรงกับ label จริงของ Pod -- พิสูจน์ด้วย EndpointSlice ว่างก่อน กับเต็มหลัง |
+| 3 | Container ไม่มี `resources` block เลย | มี `resources.requests.cpu` -- `<unknown>`/`FailedGetResourceMetric` จริงก่อน เป็นเปอร์เซ็นต์จริงหลัง |
+| 4 | `livenessProbe` กับ `readinessProbe` endpoint เดียวกัน ไม่มี `startupProbe` | `startupProbe` เฉพาะ + `livenessProbe` ที่ผ่อนปรนกว่า -- restart loop จริงพิสูจน์ก่อน |
+| 5 | ไม่มี `lifecycle.preStop` | `preStop: sleep 5` -- request หลุดจริงพิสูจน์ก่อน ไม่หลุดเลยหลัง |
+| 6 | `maxUnavailable: 0` กับ `maxSurge: 0` พร้อมกัน | ต้องมีตัวใดตัวหนึ่งไม่เป็นศูนย์ -- ไม่งั้น API server ปฏิเสธจริงทันที |
+| 7 | Ingress `apiVersion: networking.k8s.io/v1beta1` กับ `backend.serviceName`/`servicePort` | `networking.k8s.io/v1` กับ `pathType` + `backend.service.name`/`port.number` -- `no matches for kind` จริงบน version เก่า |
+
+## Mental Model
+
+สองใน bug เจ็ดตัวนี้ (1, 7) คือ API server ปฏิเสธ object ตรง ๆ ตั้งแต่แรก -- training example เก่าที่ใช้ API version ที่ถูกลบไปหลายปีแล้ว จับได้ทันทีชัดเจน อีกห้าตัวที่เหลือ apply ผ่านเนียนหมดและผ่าน schema check ทุกอัน เพราะแต่ละตัวเป็นการอ้างสิ่งที่*อยู่นอกไฟล์นั้นเอง* -- selector ของ Service ตรงกับ label ของ Deployment จริงไหม, มี resource request ให้ autoscaler อ่านไหม, endpoint เดียวกันตอบทั้ง liveness กับ readiness ได้จริงไหมสำหรับ app นี้, endpoint bookkeeping ของ Service เร็วพอไม่ต้องมี grace window ไหม, rollout strategy ที่ฟังดูระมัดระวังสุด ๆ เป็น combination ที่ถูกกฎหมายจริงไหม -- ไม่มีตัวไหนโผล่เป็น error ที่ไหนเลย มีแต่ช่องว่างจริงแต่เงียบระหว่างที่ `kubectl get` บอกว่าเขียวหมด กับสิ่งที่เกิดขึ้นจริงกับ traffic จริง
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ถ้า `kubectl apply` ผ่าน แปลว่า object เชื่อมกันถูกต้องแล้ว"** พิสูจน์แล้วด้านบน: Service ที่ selector ไม่ตรงกับอะไรเลย apply ผ่านเนียนพอ ๆ กับตัวที่ตรงทุกอย่าง -- API server ไม่เคย cross-validate Service กับ Deployment ไหนเลย
+- **"Container ที่ตั้ง `resources.limits` ปลอดภัยสำหรับ HPA แม้ไม่มี `resources.requests`"** พิสูจน์แล้วด้านบนตรงกับพฤติกรรมจริงของ API server: `limits.cpu` ที่ไม่มี `requests.cpu` จะโดน**default `requests.cpu` ให้เท่ากับ limit**เอง -- bug ที่ทำ HPA พังจริงคือ container ที่ไม่มี `resources` block เลย ไม่ใช่ "มี limits แต่ไม่มี requests"
+- **"`preStop` hook แก้ bug request หลุดด้วยการบอก Service ให้เลิก route มาที่นี่"** พิสูจน์แล้วด้านบน: `preStop` ไม่ได้ไปแตะ Service/endpoint machinery เลย -- มันแค่ทำให้ listening socket ของ container ตัวเองเปิดอยู่นานขึ้นอีกหน่อย ซึ่งบังเอิญพอดีกับเวลาที่การลบ endpoint จริง (คนละ mechanism แยกกัน) กระจายเสร็จ
+
+<Mermaid title={"จุดที่แต่ละ bug อยู่ใน request/rollout path ของ web app นี้"} code={wr1Diagram} />
+
+export const wr1Diagram = `flowchart TD
+  A["Deployment: apps/v1beta1"] -->|"1: apiVersion removed"| A
+  A --> B["Pod template: tier=frontend"]
+  C["Service: selector tier=backend"] -->|"2: selector mismatch -- 0 endpoints"| C
+  B -.->|"traffic, if selector matched"| C
+  A --> D["livenessProbe == readinessProbe"]
+  D -->|"4: restart loop on slow start"| D
+  A --> E["no lifecycle.preStop"]
+  E -->|"5: dropped request on delete"| E
+  A --> F["maxUnavailable: 0, maxSurge: 0"]
+  F -->|"6: rollout rejected outright"| F
+  G["HPA: scaleTargetRef Deployment"] -->|"3: no resources.requests -- unknown"| G
+  A --> G
+  H["Ingress: networking.k8s.io/v1beta1"] -->|"7: apiVersion removed"| H
+  C --> H
+`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+สองใน bug เจ็ดตัวนี้คือ API server ปฏิเสธตรง ๆ ทันที ส่วนอีกห้าตัวที่เหลือ apply ผ่านเนียนและผ่านทุก schema check เพราะแต่ละตัวคือการอ้างข้อเท็จจริง*นอกตัว object เอง* -- selector นี้ตรงกับ Pod จริงไหม, มี resource request ให้ autoscaler อ่านไหม, endpoint นี้เป็นสัญญาณที่ใช่ทั้ง liveness กับ readiness ไหม, endpoint bookkeeping ของ Service ตามทันตอน delete ไหม -- มีแต่ endpoint list จริง, HPA condition จริง หรือ curl ระหว่าง delete จริงเท่านั้นที่เช็คได้
+</Callout>
+
+export const quizWorkedReview1 = [
+  {
+    q: "```text\nerror: resource mapping not found for name: \"web-app\" ... : no matches for kind \"Deployment\" in version \"apps/v1beta1\"\n```\nทำไม error นี้ถึงเกิดก่อนที่ API server จะดู field ของ Deployment ด้วยซ้ำ?",
+    options: [
+      'เป็น schema validation error บน Deployment spec',
+      '`apps/v1beta1` ถูกลบตั้งแต่ Kubernetes 1.16 -- API server ไม่มี REST mapping ให้ group/version นี้เลย เลย fail ตอน routing ก่อนจะไป validate field ไหนทั้งนั้น',
+      'fail เพราะ `replicas` หายไปแค่นั้น',
+      'เป็นแค่ warning ฝั่ง client ของ kubectl, server จะรับ',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: error จริงคือ "no matches for kind ... in version" เป็น discovery/REST-mapping failure -- API server ไม่ serve group/version นี้เลย เลยไม่ถึงขั้น schema validation ของ field ที่เหลือ',
+  },
+  {
+    q: 'Deployment (`tier: frontend` บน Pod) กับ Service (`selector: {app: web-app, tier: backend}`) apply ผ่านทั้งคู่ `kubectl get pods`/`get deployment` ก็บอกว่าเขียวหมด `kubectl get endpointslices` จะโชว์อะไร?',
+    options: [
+      'error เพราะ Service selector ไม่ตรงกับ Deployment ไหนเลย',
+      'EndpointSlice object จริงที่ไม่มี address เลย -- Service apply ผ่านและมีอยู่จริง แค่เลือก Pod ไม่ได้เลยสักตัว',
+      'Service จะ fallback ไปเลือก Pod ทุกตัวใน namespace แทนแบบเงียบ ๆ',
+      'kubectl ปฏิเสธไม่สร้าง Service ให้เลย',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: `kubectl get endpointslices` ของ Service ตัวนี้โชว์ ADDRESSTYPE IPv4, PORTS <unset>, ENDPOINTS <unset> -- EndpointSlice จริง valid แต่ว่างเปล่า API server ไม่เคย cross-check selector ของ Service กับ object อื่นเลย',
+  },
+  {
+    q: "```yaml\ncontainers:\n- name: web-app\n  image: nginx:alpine\n```\nไม่มี `resources` block เลย ถูก HPA target บน cpu utilization `kubectl describe hpa` รายงานอะไร แล้วทำไมตั้งแค่ `resources.limits.cpu` (ไม่มี `requests.cpu`) ถึงไม่ทำให้เกิด bug เดียวกัน?",
+    options: [
+      '0% ตลอดไปเหมือนกันทั้งสองแบบ -- limits กับ requests ไม่ต่างกัน',
+      '`FailedGetResourceMetric` / `missing request for cpu` เพราะการคำนวณของ HPA อิง requests เสมอ; ตั้งแค่ `limits.cpu` ไม่ทำให้เกิด bug นี้ เพราะ API server จะ default `requests.cpu` ที่ไม่ได้ตั้งให้เท่ากับ `limits.cpu` ที่มีอยู่เอง',
+      'HPA จะ fallback ไปใช้ `limits.cpu` เองอัตโนมัติเมื่อไม่มี `requests.cpu`',
+      'HPA object จะ apply ไม่ผ่านเลยในกรณีนี้',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตรงกับ API server จริง: container ที่มีแค่ `limits: {cpu: 500m}` ได้ผลลัพธ์กลับมาเป็น `requests: {cpu: 500m}` ใส่ให้เรียบร้อยแล้ว bug จริงต้องมี container ที่ไม่มี resources block เลย -- เช็คแล้วด้วย `kubectl get pod -o jsonpath=\'{.spec.containers[0].resources}\'` ที่คืน `{}` ตรงกับตอนที่ `kubectl describe hpa` โชว์ `FailedGetResourceMetric`/`missing request for cpu` จริง',
+  },
+  {
+    q: 'Container มี `livenessProbe` กับ `readinessProbe` เหมือนกันเป๊ะ (path เดียวกัน port เดียวกัน) ไม่มี `startupProbe` และใช้เวลา 20 วินาทีจริงกว่าจะเริ่ม listen `kubectl describe pod` จะโชว์อะไร?',
+    options: [
+      'ไม่มีอะไรผิดปกติ -- ทั้งสอง probe แค่ fail พร้อมกันไปเรื่อย ๆ จนกว่า container จะพร้อม',
+      'restart loop จริงที่วนซ้ำ: "Liveness probe failed" ตามด้วย "Container ... failed liveness probe, will be restarted" นับ RESTARTS เพิ่มขึ้นเรื่อย ๆ -- เพราะ container ที่แค่ยัง warm-up อยู่ดูเหมือนตัวที่ค้างถาวรเป๊ะในสายตา kubelet',
+      'มีแค่ readiness probe ที่ fail; liveness ผ่านเสมอตอน startup',
+      'Kubernetes จะ infer grace period จาก container image ให้เอง',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบนด้วย event จริง: "Killing ... Container web failed liveness probe, will be restarted" วนซ้ำ และ `kubectl get pod` โชว์ restart count จริงที่นับเพิ่มขึ้น restart แก้ "ยัง warm-up อยู่" ไม่ได้ -- มันรีเซ็ตนาฬิกา warm-up กลับไปศูนย์ ซึ่งเป็นสาเหตุที่มันวนเป็น loop แบบนี้เป๊ะ',
+  },
+  {
+    q: "```text\n8   HTTP/1.1 200\n9   HTTP/1.1 200\n10  (ไม่มี response)\n11  HTTP/1.1 200\n```\n40 request ทุก 250ms ยิงหา Service ที่ backed ด้วย Pod เดียวไม่มี `lifecycle.preStop`, ลบ Pod ตรงจังหวะ request 8 พอดี เพิ่ม `preStop: sleep 5` แล้วทำซ้ำ test เดียวกันเป๊ะ ตัวที่หลุดย้ายไปเป็น request #1 แทน สิ่งนี้พิสูจน์อะไร?",
+    options: [
+      'preStop บอก Service ให้เลิก route มาที่ Pod ทันที เลี่ยงการหลุดได้เลย',
+      'preStop ทำให้ container ยัง listen อยู่นานขึ้นอีกไม่กี่วินาที ซึ่งพอดีกับเวลาที่การลบ endpoint แบบ asynchronous แยกกันกระจายเสร็จทั่วทุกที่ -- มันไม่ได้ไปแตะ Service/endpoint machinery เลย',
+      'ตัวที่หลุดตอน request #1 ใน run ที่แก้แล้วพิสูจน์ว่า preStop ไม่ได้ช่วยอะไรจริง',
+      'SIGTERM กับการลบ endpoint sync กันเป๊ะเสมอ เลย test นี้วัดอย่างอื่นอยู่',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: ไม่มี preStop มี request หลุดพอดี 1 ตัวตรงจังหวะ delete (การลบ endpoint ยังไม่กระจายไปทุก node แต่ container หยุดรับ connection ไปแล้ว) ใส่ preStop: sleep 5 ทุก request ตั้งแต่จุด delete เป็นต้นไปสำเร็จหมด -- ตัวที่หลุดที่เหลือ (request #1) เกิดก่อน delete เป็น cold-start blip ไม่เกี่ยวกัน',
+  },
+  {
+    q: "```text\nThe Deployment \"web-app-zz\" is invalid: spec.strategy.rollingUpdate.maxUnavailable: Invalid value: 0: may not be 0 when `maxSurge` is 0\n```\nทำไม API server ถึงปฏิเสธ `maxUnavailable: 0` คู่กับ `maxSurge: 0` ทั้งที่แยกกันแต่ละตัวเป็นค่าที่ใช้กันปกติ?",
+    options: [
+      'เป็นข้อจำกัดที่ตั้งขึ้นมาลอย ๆ ปิดได้ด้วย feature gate',
+      'รวมกันแล้วอธิบาย rollout ที่ไม่มีทาง progress ต่อได้ถูกกฎหมายเลย: เอา Pod ลงก็ไม่ได้ เอา Pod ใหม่ขึ้นก่อนก็ไม่ได้ -- ต้องมีตัวใดตัวหนึ่งไม่เป็นศูนย์',
+      'maxSurge: 0 เป็น deprecated เลยโดนปฏิเสธเสมอไม่ว่า maxUnavailable จะเป็นอะไร',
+      'fail เฉพาะตอน replicas เป็นเลขคี่เท่านั้น',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบนด้วย API-server error จริง `maxUnavailable: 0, maxSurge: 1` (zero-downtime แลก Pod พิเศษ 1 ตัวระหว่าง rollout) หรือ `maxUnavailable: 1, maxSurge: 0` (ไม่ต้องมี capacity เพิ่ม แลก Pod หายสั้น ๆ 1 ตัว) ถูกกฎหมายทั้งคู่ -- แต่ศูนย์คู่กับศูนย์ไม่ได้',
+  },
+];
+
+<Quiz client:visible id="reading-k8s/worked-review-1" questions={quizWorkedReview1} />
+
+<ProgressTracker client:visible id="reading-k8s/worked-review-1" />
