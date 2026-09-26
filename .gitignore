@@ -4,6 +4,8 @@ dist/
 .astro/
 # deps
 node_modules/
+# verify-manifests ts probe (scaffolded on demand)
+tools/probe/
 # env
 .env
 .env.production
