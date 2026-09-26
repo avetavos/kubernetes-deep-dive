@@ -10,7 +10,8 @@
     "astro": "astro",
     "test": "echo \"no tests\" && exit 0",
     "check": "node tools/check-parity.mjs",
-    "verify": "node tools/verify-manifests.mjs"
+    "verify": "node tools/verify-manifests.mjs",
+    "gen:k8s-schemas": "node tools/gen-k8s-schemas.mjs"
   },
   "dependencies": {
     "@astrojs/preact": "^5.1.5",
@@ -23,6 +24,7 @@
     "@preact/preset-vite": "^2.10.5",
     "@testing-library/preact": "^3.2.4",
     "jsdom": "^29.1.1",
+    "playwright": "^1.63.0",
     "vitest": "^4.1.9"
   }
 }

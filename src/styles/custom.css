@@ -151,3 +151,20 @@ html.read-mode .readmode-toggle {
 
 /* ---- Paper read mode: keep content clear of the sticky header ---- */
 html.read-mode .main-frame { padding-top: var(--sl-nav-height, 3.5rem) !important; }
+
+/* K8sSchemaCheck */
+.ksc { margin:1rem 0; }
+.ksc__title { font-weight:600; margin:0 0 .25rem; }
+.ksc__ta { width:100%; min-height:170px; font-family:ui-monospace,monospace; font-size:.85rem; padding:.5rem; border:1px solid var(--sl-color-gray-5); border-radius:6px; background:var(--sl-color-bg); color:var(--sl-color-text); resize:vertical; }
+.ksc__bar { display:flex; flex-wrap:wrap; align-items:center; gap:.6rem; margin:.35rem 0 .25rem; }
+.ksc__check { cursor:pointer; font-size:.78rem; border:1px solid var(--sl-color-accent); border-radius:4px; padding:.15rem .6rem; background:var(--sl-color-accent); color:#fff; }
+.ksc__check:disabled { opacity:.5; cursor:default; }
+.ksc__badge { font-size:.72rem; opacity:.75; }
+.ksc__hint { font-size:.8rem; opacity:.7; margin:.25rem 0; }
+.ksc__results { margin:.35rem 0; display:flex; flex-direction:column; gap:.5rem; }
+.ksc__doc { border-left:3px solid var(--sl-color-gray-5); padding:.4rem .6rem; border-radius:0 6px 6px 0; background:var(--sl-color-gray-6); font-size:.85rem; }
+.ksc__doc-head { font-weight:600; margin:0 0 .2rem; }
+.ksc__doc--ok { border-left-color:#339933; }
+.ksc__doc--warn { border-left-color:#d9a441; }
+.ksc__doc--err { border-left-color:var(--sl-color-red); color:var(--sl-color-red-high); }
+.ksc__row { margin:.15rem 0; font-family:ui-monospace,monospace; font-size:.8rem; white-space:pre-wrap; }

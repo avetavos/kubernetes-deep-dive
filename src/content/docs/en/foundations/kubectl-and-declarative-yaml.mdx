@@ -10,6 +10,7 @@ import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 import SpotTheBug from '../../../../components/SpotTheBug.astro';
+import K8sSchemaCheck from '../../../../components/K8sSchemaCheck.astro';
 
 ## The idea in one sentence
 
@@ -261,6 +262,32 @@ export const kubectlYamlDiagram = `flowchart LR
   cmd["kubectl apply -f pod.yaml"] --> api["kube-apiserver"]
   api --> etcd["etcd"]
   api --> ctrl["Controllers notice the change and react"]`;
+
+## Checking your YAML statically
+
+A generated manifest that "looks right" can still have a field in the wrong place — `privileged` belongs under a container's `securityContext`, not directly on the container, and nothing about the indentation makes that obviously wrong at a glance. Edit the manifest below and press Check to validate it in your browser against this course's bundled Kubernetes 1.37 OpenAPI schema (generated from the real cluster, not hand-typed):
+
+<K8sSchemaCheck id="ksc-kubectl-declarative" code={kscSample} />
+
+export const kscSample = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.31
+          privileged: true
+`;
 
 ## Reading AI-generated code
 

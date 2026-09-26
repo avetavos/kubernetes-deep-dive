@@ -10,6 +10,7 @@ import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 import SpotTheBug from '../../../../components/SpotTheBug.astro';
+import K8sSchemaCheck from '../../../../components/K8sSchemaCheck.astro';
 
 ## ไอเดียหลักในหนึ่งประโยค
 
@@ -261,6 +262,32 @@ export const kubectlYamlDiagram = `flowchart LR
   cmd["kubectl apply -f pod.yaml"] --> api["kube-apiserver"]
   api --> etcd["etcd"]
   api --> ctrl["Controllers notice the change and react"]`;
+
+## ตรวจ YAML แบบ static
+
+Manifest ที่ AI สร้างแล้ว "ดูถูกต้อง" อาจมี field อยู่ผิดที่ได้ — `privileged` ต้องอยู่ใต้ `securityContext` ของ container ไม่ใช่วางตรง ๆ บน container และการเยื้องบรรทัด (indentation) ก็ไม่ได้ทำให้เห็นว่าผิดตรงไหนเลย แก้ manifest ด้านล่างแล้วกด Check เพื่อตรวจในเบราว์เซอร์ของคุณเทียบกับ Kubernetes 1.37 OpenAPI schema ที่คอร์สนี้ bundle ไว้ (สร้างจาก cluster จริง ไม่ได้พิมพ์เอง):
+
+<K8sSchemaCheck id="ksc-kubectl-declarative" code={kscSample} />
+
+export const kscSample = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.31
+          privileged: true
+`;
 
 ## อ่านโค้ดที่ AI เขียน
 

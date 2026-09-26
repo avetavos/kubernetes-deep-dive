@@ -150,3 +150,15 @@ comment: **54 of 60 yaml fences collected, 6 skipped, 2 errors**.
 Bash fences: 48 in the corpus today, all still skipped-no-path (no
 `# scripts/*.sh` lessons yet). Ts fences: 0. See the harness's own final
 report for the exact per-module breakdown at any given commit.
+
+## K8sSchemaCheck
+
+`<K8sSchemaCheck>` (embedded in `foundations/kubectl-and-declarative-yaml.mdx`)
+validates pasted YAML in the browser against a bundled, description-stripped
+JSON Schema draft-07 subset of the real cluster's Kubernetes 1.37 OpenAPI
+schema — static only (no defaulting/admission/cross-object checks; `kubectl
+apply --dry-run=server` remains the real test). Regenerate the bundled
+schemas from the shared `verify-k8s` cluster with
+`node tools/gen-k8s-schemas.mjs` (writes `public/k8s-schemas/`, ~400 KiB
+total). Run its Playwright spec against a local build:
+`npx astro build --outDir dist && npx astro preview --outDir dist --port 4961 & node tools/k8s-schema-check.spec.mjs http://localhost:4961/kubernetes`.

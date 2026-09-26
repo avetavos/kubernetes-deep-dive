@@ -1,0 +1,127 @@
+---
+// K8sSchemaCheck: static-only YAML manifest checker. Parses the textarea's
+// YAML with the `yaml` package and validates each document against a
+// bundled subset of the real cluster's Kubernetes 1.37 OpenAPI schema with
+// `ajv` — both loaded lazily from esm.sh, same pattern as astro-deep-dive's
+// <AstroPlayground> (see k8s-schema-check-runtime.ts's module doc comment
+// for exactly what this can and can't catch, and why).
+interface Props {
+  code: string;
+  id?: string;
+  title?: string;
+}
+
+const { code, id, title } = Astro.props;
+// import.meta.env.BASE_URL has no guaranteed trailing slash (e.g. '/kubernetes'
+// here) — normalize so the runtime can always do `${base}k8s-schemas/...`.
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+---
+
+<div class="ksc not-content" data-code={code} data-base={base} id={id}>
+  {title && <p class="ksc__title">{title}</p>}
+  <textarea class="ksc__ta" data-ta spellcheck="false" rows="12">{code}</textarea>
+  <div class="ksc__bar">
+    <button class="ksc__check" data-check type="button">Check</button>
+    <span class="ksc__badge" data-badge></span>
+  </div>
+  <p class="ksc__hint" data-hint hidden></p>
+  <div class="ksc__results" data-results hidden></div>
+</div>
+
+<script>
+  import { checkYaml, copyFor, BADGE_TEXT, STATUS_LABEL } from './k8s-schema-check-runtime';
+  import type { DocResult } from './k8s-schema-check-runtime';
+
+  const lang = document.documentElement.lang;
+  const T = copyFor(lang);
+  const th = lang?.startsWith('th');
+
+  const STATUS_CLASS: Record<DocResult['status'], string> = {
+    valid: 'ok',
+    invalid: 'err',
+    'unknown-kind': 'warn',
+    'removed-api': 'warn',
+    'yaml-error': 'err',
+    'not-an-object': 'err',
+  };
+
+  document.querySelectorAll<HTMLElement>('.ksc').forEach((ksc) => {
+    if (ksc.dataset.wired) return;
+    ksc.dataset.wired = '1';
+
+    const base = ksc.dataset.base || '/';
+    const ta = ksc.querySelector<HTMLTextAreaElement>('[data-ta]');
+    const checkBtn = ksc.querySelector<HTMLButtonElement>('[data-check]');
+    const badge = ksc.querySelector<HTMLElement>('[data-badge]');
+    const hint = ksc.querySelector<HTMLElement>('[data-hint]');
+    const results = ksc.querySelector<HTMLElement>('[data-results]');
+
+    if (checkBtn) checkBtn.textContent = T.check;
+    if (badge) badge.textContent = th ? BADGE_TEXT.th() : BADGE_TEXT.en();
+
+    function showHint(text: string) {
+      if (!hint) return;
+      hint.textContent = text;
+      hint.hidden = false;
+    }
+    function hideHint() {
+      if (hint) hint.hidden = true;
+    }
+    function renderResults(docs: DocResult[]) {
+      if (!results) return;
+      results.innerHTML = '';
+      if (!docs.length) {
+        const p = document.createElement('p');
+        p.textContent = T.noDocs;
+        results.appendChild(p);
+      }
+      for (const doc of docs) {
+        const box = document.createElement('div');
+        box.className = `ksc__doc ksc__doc--${STATUS_CLASS[doc.status]}`;
+        const head = document.createElement('p');
+        head.className = 'ksc__doc-head';
+        const label = th ? STATUS_LABEL[doc.status].th : STATUS_LABEL[doc.status].en;
+        const gvk = doc.apiVersion && doc.kind ? ` — ${doc.apiVersion} ${doc.kind}` : '';
+        head.textContent = `${T.doc(doc.index + 1)}${gvk}: ${label}`;
+        box.appendChild(head);
+        if (doc.status === 'valid') {
+          const p = document.createElement('p');
+          p.textContent = T.valid;
+          box.appendChild(p);
+        } else {
+          for (const msg of doc.messages) {
+            const row = document.createElement('p');
+            row.className = 'ksc__row';
+            row.textContent = msg;
+            box.appendChild(row);
+          }
+        }
+        results.appendChild(box);
+      }
+      results.hidden = false;
+    }
+
+    checkBtn?.addEventListener('click', async () => {
+      checkBtn.disabled = true;
+      if (results) results.hidden = true;
+      showHint(T.checking);
+      try {
+        const docs = await checkYaml(ta?.value ?? '', base);
+        hideHint();
+        renderResults(docs);
+      } catch (e) {
+        hideHint();
+        if (results) {
+          results.hidden = false;
+          results.innerHTML = '';
+          const p = document.createElement('p');
+          p.className = 'ksc__doc ksc__doc--err';
+          p.textContent = `${T.loadFailed}\n\n(${(e as Error)?.message ?? String(e)})`;
+          results.appendChild(p);
+        }
+      } finally {
+        checkBtn.disabled = false;
+      }
+    });
+  });
+</script>
