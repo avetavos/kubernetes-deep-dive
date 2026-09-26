@@ -1,6 +1,6 @@
 ---
 title: 'Scheduler กับ Resource Requests'
-description: 'requests กับ limits คุมการ scheduling และการบังคับใช้ runtime อย่างไร QoS class ตัดสินลำดับ eviction อย่างไร และ scheduler filter score และ bind Pod เข้า Node อย่างไร'
+description: 'requests กับ limits คุมการ scheduling และการบังคับใช้ runtime อย่างไร QoS class ตัดสินลำดับ eviction อย่างไร PriorityClass กับ preemption ทำงานอย่างไร และ scheduler filter score และ bind Pod เข้า Node อย่างไร'
 sidebar:
   order: 1
 ---
@@ -9,10 +9,11 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
-Scheduler วาง Pod ลงบน Node ที่มี capacity ว่างพอจะรองรับ **requests** ของตัวเอง ส่วน **limits** คือเพดานที่จำกัดว่า Pod ใช้ resource ได้มากแค่ไหนตอนที่รันอยู่จริง
+Scheduler วาง Pod ลงบน Node ที่มี capacity ว่างพอจะรองรับ **requests** ของตัวเอง ส่วน **limits** คือเพดานที่จำกัดว่า Pod ใช้ resource ได้มากแค่ไหนตอนที่รันอยู่จริง — และเมื่อไม่มี capacity เหลือพอที่ไหนเลย **priority** กับ **preemption** จะเป็นตัวตัดสินว่า Pod ที่ priority ต่ำกว่าจะถูก evict เพื่อเปิดที่ว่างหรือไม่
 
 ## requests คือพื้นล่าง limits คือเพดานบน
 
@@ -47,6 +48,80 @@ kubectl describe node <node-name> | grep -A5 "Allocated resources"
 
 เพราะ scheduler มองแค่ requests เท่านั้น Pod ที่ไม่ตั้ง requests เลยจึงมองไม่เห็นในสายตาของ capacity planning คือถูก schedule ไปที่ไหนก็ได้ และยังแย่ง resource จน Pod ข้าง ๆ ที่ตั้ง requests ไว้ถูกต้องอาจอดได้ด้วย
 
+## requests กับ limits ตอน runtime พิสูจน์จริง: throttling กับ OOMKilled
+
+สองรูปแบบความล้มเหลวข้างบนไม่สมมาตรกัน คุ้มค่าที่จะเห็นทั้งคู่จริง ๆ ไม่ใช่แค่เชื่อตามคำบอก
+
+**CPU ที่เกิน limit จะถูก throttle** ไม่มีวันถูกฆ่า container ที่ตั้ง `limits.cpu: "200m"` แล้วรัน `stress --cpu 1` (ที่พยายามใช้ core เต็ม) แสดง cgroup throttling accounting จริงจากข้างในกันเอง
+
+```yaml
+# k8s/the-scheduler-and-resource-requests/cpu-hog.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cpu-hog
+spec:
+  restartPolicy: Never
+  containers:
+    - name: hog
+      image: polinux/stress
+      command: ["stress"]
+      args: ["--cpu", "2"]
+      resources:
+        requests:
+          cpu: "100m"
+        limits:
+          cpu: "200m"
+```
+
+```text
+$ kubectl exec cpu-hog -- sh -c 'cat /sys/fs/cgroup/cpu.max; cat /sys/fs/cgroup/cpu.stat'
+20000 100000
+usage_usec 2739831
+user_usec 2723945
+system_usec 15885
+nr_periods 136
+nr_throttled 136
+throttled_usec 12185810
+```
+
+`cpu.max` อ่านได้ `20000 100000` คือการยืนยันของ kernel เองว่า limit 200m (quota 20ms ต่อ period 100ms) `nr_throttled 136` จาก `nr_periods 136` แปลว่า **ทุก accounting period เดียว** โดนใช้ quota จนหมดและถูก throttle — `throttled_usec 12185810` คือมากกว่า 12 วินาทีของเวลาจริงที่ container นี้หยุดพัก ไม่ใช่ถูกฆ่า รอ quota window ถัดไป container ยังคงเป็น `Running` ตลอดเวลา
+
+**Memory ที่เกิน limit จะโดน OOMKilled** พร้อม exit code จริง
+
+```yaml
+# k8s/the-scheduler-and-resource-requests/mem-hog.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mem-hog
+spec:
+  restartPolicy: OnFailure
+  containers:
+    - name: hog
+      image: polinux/stress
+      command: ["stress"]
+      args: ["--vm", "1", "--vm-bytes", "300M", "--vm-hang", "1"]
+      resources:
+        requests:
+          memory: "64Mi"
+        limits:
+          memory: "100Mi"
+```
+
+```text
+$ kubectl get pod mem-hog
+NAME      READY   STATUS      RESTARTS      AGE
+mem-hog   0/1     OOMKilled   2 (16s ago)   20s
+
+$ kubectl describe pod mem-hog
+    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137
+```
+
+Exit code `137` คือ `128 + 9` (`SIGKILL`) — kernel's OOM killer ไม่ใช่ Kubernetes เป็นคนจบ process ทันทีที่ cgroup memory limit ถูกข้าม kubelet แค่รายงานผลแล้วด้วย `restartPolicy: OnFailure` ก็ restart container ซึ่งก็โดน OOMKilled ซ้ำอีกด้วย workload เดิม
+
 ## QoS class ตัดสินว่าใครโดน evict ก่อน
 
 Kubernetes คำนวณ **Quality of Service (QoS) class** ให้ทุก Pod อัตโนมัติจาก requests และ limits ของตัวเอง — คุณไม่ต้องตั้งค่า field นี้เอง
@@ -55,32 +130,249 @@ Kubernetes คำนวณ **Quality of Service (QoS) class** ให้ทุก
 - **Burstable** — มีอย่างน้อยหนึ่ง container ตั้ง requests ไว้ แต่ค่าต่างจาก limits หรือมีแค่บาง resource ที่ตั้งทั้งคู่
 - **BestEffort** — ไม่มี container ไหนตั้ง requests หรือ limits เลย
 
-```bash
-# QoS class is computed and reported on the Pod status
-kubectl get pod payments-worker -o jsonpath='{.status.qosClass}{"\n"}'
+พิสูจน์ ด้วย Pod 3 ตัวที่ตรงตาม spec ข้างบนพอดี อ่านค่ากลับ
+
+```yaml
+# k8s/the-scheduler-and-resource-requests/qos-pods.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qos-guaranteed
+spec:
+  containers:
+    - name: c
+      image: registry.k8s.io/pause:3.10
+      resources:
+        requests: { cpu: "200m", memory: "128Mi" }
+        limits: { cpu: "200m", memory: "128Mi" }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qos-burstable
+spec:
+  containers:
+    - name: c
+      image: registry.k8s.io/pause:3.10
+      resources:
+        requests: { cpu: "100m", memory: "64Mi" }
+        limits: { cpu: "500m", memory: "256Mi" }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qos-besteffort
+spec:
+  containers:
+    - name: c
+      image: registry.k8s.io/pause:3.10
 ```
 
-QoS class จะมีผลก็ต่อเมื่อ Node เริ่มขาด resource เมื่อ kubelet ต้องเรียก memory คืนภายใต้ pressure จะ evict Pod ระดับ **BestEffort** ก่อน ตามด้วย **Burstable** และจะแตะ Pod ระดับ **Guaranteed** ก็ต่อเมื่อไม่เหลือทางเลือกอื่นแล้วเท่านั้น นี่คือจุดที่การตั้ง requests และ limits อย่างระมัดระวังส่งผลตรง ๆ และเห็นชัดว่า workload ไหนของคุณจะรอดเมื่อมี noisy neighbor
+```text
+$ for p in qos-guaranteed qos-burstable qos-besteffort; do
+    echo -n "$p: "; kubectl get pod $p -o jsonpath='{.status.qosClass}{"\n"}'
+  done
+qos-guaranteed: Guaranteed
+qos-burstable: Burstable
+qos-besteffort: BestEffort
+```
+
+QoS class จะมีผลก็ต่อเมื่อ Node เริ่มขาด resource เมื่อ kubelet ต้องเรียก memory คืนภายใต้ pressure จะ evict Pod ระดับ **BestEffort** ก่อน ตามด้วย **Burstable** และจะแตะ Pod ระดับ **Guaranteed** ก็ต่อเมื่อไม่เหลือทางเลือกอื่นแล้วเท่านั้น
+
+## `LimitRange`: แอบใส่ requests ที่คุณไม่เคยเขียน
+
+`LimitRange` ตั้งค่า default ต่อ container ให้ namespace ดังนั้น Pod ที่ไม่มี `resources` block เลยจะไม่กลายเป็น BestEffort แบบเงียบ ๆ — มันจะได้ default ของ namespace ถูกฉีดเข้ามาตอน admission พิสูจน์
+
+```yaml
+# k8s/the-scheduler-and-resource-requests/limitrange.yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: "250m"
+        memory: "128Mi"
+      default:
+        cpu: "500m"
+        memory: "256Mi"
+```
+
+```yaml
+# k8s/the-scheduler-and-resource-requests/no-resources-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: no-resources
+spec:
+  containers:
+    - name: c
+      image: registry.k8s.io/pause:3.10
+```
+
+```text
+$ kubectl get pod no-resources -o jsonpath='{.spec.containers[0].resources}{"\n"}'
+{"limits":{"cpu":"500m","memory":"256Mi"},"requests":{"cpu":"250m","memory":"128Mi"}}
+```
+
+manifest ของ Pod ไม่ได้พูดถึง `resources` เลยแม้แต่นิดเดียว — `LimitRange` ใน namespace ของมันฉีด requests `250m`/`128Mi` และ limits `500m`/`256Mi` เข้าไปก่อนที่ object จะถูก persist ด้วยซ้ำ นี่คือเหตุผลที่ Pod ตัวนี้เป็น `Burstable` ไม่ใช่ `BestEffort` และทำไม "ไม่มี resources block" ไม่ได้แปลว่า "มองไม่เห็นในสายตา capacity planning" เสมอไป — ขึ้นอยู่กับว่า namespace นั้นมี `LimitRange` หรือเปล่า
+
+## Allocatable กับ Capacity
+
+`kubectl describe node` รายงานตัวเลขสองชุดแยกกัน และมีแค่ตัวเดียวที่ scheduler ใช้จริง
+
+```text
+$ kubectl describe node scheduling-worker
+Capacity:
+  cpu:                11
+  memory:             9144196Ki
+Allocatable:
+  cpu:                11
+  memory:             9144196Ki
+```
+
+**Capacity** คือ hardware ทั้งหมดของ Node **Allocatable** คือ capacity ลบด้วยส่วนที่ kubelet กับ system daemon จองไว้ให้ตัวเอง (`--system-reserved`/`--kube-reserved`) และ Allocatable ไม่ใช่ Capacity ที่ Filter phase ของ scheduler ใช้เทียบกับ requests ของ Pod บน kind node นี้ทั้งสองค่าเท่ากันเพราะ kind ไม่ได้ตั้ง flag การจองใด ๆ — บน cloud-managed node pool จริง Allocatable มักต่ำกว่า Capacity 5-10% เป็นปกติ และ Pod ที่คำนวณขนาดจากตัวเลขผิดตัวอาจดูเหมือนพอดีบนกระดาษแล้วไม่เคย schedule ได้เลยจริง ๆ
+
+## `PriorityClass` กับ preemption พิสูจน์จริง
+
+ทุก Pod มี priority — `0` โดย default `PriorityClass` ที่ตั้ง `value` สูงกว่าทำสองอย่าง: ดัน Pod ข้ามหน้า Pod priority ต่ำกว่าใน scheduling queue และถ้า cluster ยังไม่มีที่ว่างให้ scheduler จะพยายาม **preempt** (evict) Pod priority ต่ำกว่าที่อื่นเพื่อเปิดที่ว่างนั้น
+
+```yaml
+# k8s/the-scheduler-and-resource-requests/priority-classes.yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: low-priority
+value: 100
+globalDefault: false
+description: "Low priority batch work, preemptable."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority
+value: 1000000
+globalDefault: false
+description: "High priority workload, may preempt lower-priority pods."
+```
+
+`globalDefault: true` บน `PriorityClass` ทำให้มันมีผลกับทุก Pod ที่ไม่ระบุ `priorityClassName` — มีได้แค่ `PriorityClass` เดียวใน cluster ที่ตั้งค่านี้เป็น true และ API จะปฏิเสธตัวที่สอง
+
+พิสูจน์ pin Pod `low-priority` สองตัวที่ request `cpu: "5"` แต่ละตัวไปที่ Node เดียว (10 จาก 11 CPU ของมัน) แล้วสร้าง Pod `high-priority` บน Node เดียวกันที่ request `cpu: "3"` — มากกว่า 1 CPU ที่เหลืออยู่
+
+```text
+$ kubectl get pods -o wide
+NAME                      READY   STATUS    NODE
+filler-54bbb658fb-lpwpj   1/1     Running   scheduling-worker
+filler-54bbb658fb-xs2pg   1/1     Running   scheduling-worker
+important-pod             1/1     Running   scheduling-worker
+
+$ kubectl get events --sort-by=.lastTimestamp
+Warning  FailedScheduling  pod/important-pod  0/4 nodes are available: 1 Insufficient cpu, 1 node(s) had untolerated taint(s), 2 node(s) didn't match Pod's node affinity/selector. preemption: found a potential placement for pod on node scheduling-worker, preempting 1 victims
+Normal   Killing           pod/filler-54bbb658fb-xs2pg  Stopping container filler
+Normal   Preempted         pod/filler-54bbb658fb-xs2pg  Preempted by pod bd29493f-c306-4440-bded-95dc1aa81181 on node scheduling-worker
+Normal   Scheduled         pod/important-pod  Successfully assigned sched-demo/important-pod to scheduling-worker
+Warning  FailedScheduling  pod/filler-54bbb658fb-5db89  0/4 nodes are available: 1 Insufficient cpu, ... preemption: 0/4 nodes are available: 1 No preemption victims found for incoming pod, 3 Preemption is not helpful for scheduling.
+```
+
+`important-pod` ได้ `Scheduled` หลังจาก Pod filler ตัวหนึ่งถูก `Preempted` (event จริง reason จริง) เพื่อเปิด 5 CPU ของมัน — แล้ว Pod replacement ของ ReplicaSet ก็ค้างอยู่ที่ `Pending` จริง ๆ เพราะตอนนี้*มันเอง*กลายเป็น Pod priority ต่ำกว่าที่ไม่เหลืออะไรให้ preempt แล้ว
+
+`preemptionPolicy: Never` ให้ Pod priority สูงเลือกที่จะ **ไม่** evict ใครเลย — มันยังข้ามหน้า queue แต่รอ capacity ว่างขึ้นเองแทน
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: patient-pod
+spec:
+  priorityClassName: high-priority-nonpreempting
+  containers:
+    - name: c
+      image: registry.k8s.io/pause:3.10
+      resources:
+        requests:
+          cpu: "5"
+```
+
+```text
+$ kubectl describe pod patient-pod
+Events:
+  Warning  FailedScheduling  0/4 nodes are available: 1 Insufficient cpu, ... preemption: not eligible due to preemptionPolicy=Never.
+```
+
+reason ที่แม่นยำนั้น — `not eligible due to preemptionPolicy=Never` — คือหลักฐานจริง: Pod ค้างที่ `Pending` เต็ม ๆ แทนที่จะ evict เพื่อนบ้าน priority ต่ำกว่าที่ปกติแล้วเป็นเป้าได้
 
 ## Scheduler เลือก Node อย่างไร filter score bind
 
-สำหรับทุก Pod ที่ยังไม่ถูก schedule scheduler จะรันการตัดสินใจสองขั้นตอนก่อนจะฟันธง
+สำหรับทุก Pod ที่ยังไม่ถูก schedule scheduler จะรัน pipeline ของ extension point ([scheduling framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/)) ก่อนจะฟันธง แต่ละจุดถูก implement ด้วย plugin หนึ่งตัวหรือมากกว่า
 
-1. **Filtering** — ตัด Node ที่รัน Pod นี้ไม่ได้เด็ดขาดออกไปทั้งหมด ไม่ว่าจะเป็น CPU/memory ว่างไม่พอครอบคลุม requests, มี taint ที่ Pod ไม่ tolerate หรือมี affinity/anti-affinity rule ที่ตัดออก ที่เหลือคือชุด Node ที่ *เป็นไปได้*
-2. **Scoring** — จัดอันดับ Node ที่เป็นไปได้ด้วยชุด scoring plugin (กระจายข้าม zone, อัด density แบบ bin-pack และอื่น ๆ) แล้วเลือกตัวที่คะแนนสูงสุด
+1. **`PreFilter`/`Filter`** — ตัด Node ที่รัน Pod นี้ไม่ได้เด็ดขาดออกไปทั้งหมด `NodeResourcesFit` filter ตาม requests เทียบ Allocatable, `TaintToleration` filter ตาม taint ที่ไม่ tolerate, `InterPodAffinity` กับ `PodTopologySpread` filter ตามกฎ affinity/anti-affinity และ spread ที่เหลือคือชุด Node ที่ *เป็นไปได้*
+2. **`PostFilter`** — รันก็ต่อเมื่อไม่มี Node ไหนเป็นไปได้เลย นี่คือจุดที่ `DefaultPreemption` มองหา victim ที่ต่ำกว่าให้ evict ตามที่พิสูจน์ข้างบน
+3. **`PreScore`/`Score`/`NormalizeScore`** — จัดอันดับ Node ที่เป็นไปได้ (กระจายข้าม zone, อัด density แบบ bin-pack และอื่น ๆ) แล้วเลือกตัวที่คะแนนสูงสุด
+4. **`Reserve`/`Permit`/`PreBind`/`Bind`/`PostBind`** — การจอง Node ที่ชนะจะถูก commit แล้ว scheduler จะ **bind** Pod เข้ากับ Node นั้นโดยเขียน `spec.nodeName` แล้ว kubelet บน Node นั้นจะรับช่วงต่อและสั่ง start container
 
-เมื่อ Node ตัวใดชนะ scheduler จะ **bind** Pod เข้ากับ Node นั้นโดยเขียน `spec.nodeName` แล้ว kubelet บน Node นั้นจะรับช่วงต่อและสั่ง start container
-
-<Mermaid title="A Pod's requests and limits flowing through the scheduler's filter, score, and bind steps" code={schedulerPipelineDiagram} />
+<Mermaid title="requests กับ limits ของ Pod ไหลผ่านขั้นตอน filter, score และ bind ของ scheduler พร้อม preemption บนเส้นทางที่ไม่มี Node ไหนเป็นไปได้" code={schedulerPipelineDiagram} />
 
 export const schedulerPipelineDiagram = `flowchart LR
-  pod["Pod spec\\n(requests + limits)"] --> filter["Filter:\\nwhich Nodes CAN run it"]
-  filter --> score["Score:\\nrank the feasible Nodes"]
+  pod["Pod spec\\n(requests + limits + priority)"] --> filter["Filter:\\nwhich Nodes CAN run it"]
+  filter -->|feasible Nodes exist| score["Score:\\nrank the feasible Nodes"]
+  filter -->|none feasible| postfilter["PostFilter:\\nDefaultPreemption looks for victims"]
+  postfilter -->|victim found| score
   score --> bind["Bind:\\nPod assigned to winning Node"]
   bind --> node["Node"]`;
 
+## Mental Model
+
+ทุกอย่างในบทนี้คือเรื่องเดียวกัน: scheduler ให้เหตุผลแค่กับ **requests** เท่านั้น ไม่เคยดู limits ตอนตัดสินใจวาง Pod ดังนั้น `requests` คือหน่วยจริงของ "Pod ตัวนี้ใหญ่แค่ไหน" ในมุมของ scheduling และทุกอย่างที่ตามมาก็ไหลจากตรงนี้ QoS class คือชื่อเรียกของ *รูปร่าง* ของ requests/limits ของ Pod (เท่ากัน ต่างกัน หรือไม่มีเลย) และจะเห็นผลก็ต่อเมื่อ memory ตึงเท่านั้น priority กับ preemption มีไว้สำหรับตอนที่ requests อย่างเดียวไม่พอจะหาที่ว่างได้ — Pod priority สูงกว่าบังคับให้ Pod priority ต่ำกว่าหลีกทางได้ เว้นแต่จะปฏิเสธไว้ชัดเจนด้วย `preemptionPolicy: Never` `LimitRange` กับ QoS ต่างก็กำหนดรูปร่างว่า requests/limits ของ Pod *จะกลายเป็น*อะไร — scheduler กับ kubelet ทำงานกับตัวเลขสุดท้ายที่ resolve แล้วเท่านั้น ไม่ใช่สิ่งที่คุณพิมพ์หรือไม่พิมพ์ใน manifest
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ได้อะไร | เสียอะไร |
+|---|---|---|
+| `requests == limits` (Guaranteed QoS) | ไม่ถูก throttle ต่ำกว่า request เลย ถูก evict หลังสุดภายใต้ pressure (พิสูจน์ข้างบน) | ไม่มีที่ว่างให้ burst; over-provision สำหรับ workload ที่ spike |
+| `requests < limits` (Burstable QoS) | burst เกิน baseline ได้เมื่อ Node มี capacity เหลือ | ถูก evict ก่อน Guaranteed Pod ภายใต้ memory pressure; CPU ยังถูก throttle ที่ limit ได้ (พิสูจน์ข้างบน) |
+| ไม่มี `requests`/`limits` เลย (BestEffort) | ไม่ต้องตั้งค่าอะไรเลย | ถูก evict ก่อนใครเมื่อมี pressure ใด ๆ; มองไม่เห็นในสายตา capacity planning; `LimitRange` ใน namespace override ได้โดยไม่เตือน (พิสูจน์ข้างบน) |
+| `PriorityClass` value สูงพร้อม `preemptionPolicy` default | ถูก schedule ได้แม้ cluster เต็ม โดย evict Pod priority ต่ำกว่า (พิสูจน์ข้างบน) | Deployment priority สูงที่ตั้งค่าผิดอาจ cascade-evict workload priority ต่ำที่ไม่เกี่ยวข้องทั่วทั้ง Node |
+| `preemptionPolicy: Never` บน priority class สูง | ไม่เคย disrupt Pod อื่นที่กำลังรันเพื่อให้ตัวเองถูก schedule (พิสูจน์ข้างบน) | อาจรอ capacity ที่ไม่มีวันว่างขึ้นเองไปตลอดกาล |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"scheduler เช็ค limits ด้วย ไม่ใช่แค่ requests ตอนตัดสินใจว่า Pod ไปลงที่ไหน"** พิสูจน์ข้างบน (และใน `kubectl explain`/scheduler docs): มีแค่ `requests` เท่านั้นที่ถูกเทียบกับ Allocatable capacity ของ Node Pod ที่ตั้ง `limits.memory` สูงมากยังถูก schedule ไปที่ Node ที่ memory ว่างน้อยได้ ถ้า `requests.memory` เล็ก
+- **"container ที่เกิน CPU limit จะถูกฆ่า เหมือน memory"** พิสูจน์ข้างบนด้วย cgroup accounting จริง: CPU ถูก throttle (`nr_throttled`/`throttled_usec`) container ยังรันต่อ มีแค่เกิน *memory* limit เท่านั้นที่ทำให้ถูกฆ่า (`OOMKilled`, exit `137`)
+- **"Pod ที่ไม่มี `resources` block เลยเป็น BestEffort เสมอ"** พิสูจน์ข้างบน: ถ้า namespace มี `LimitRange` พร้อม `defaultRequest`/`default` admission controller จะฉีด requests/limits จริงก่อน object ถูกสร้าง ทำให้กลายเป็น `Burstable` แทน
+- **"preemption หาทางเปิดที่ว่างให้ Pod priority สูงกว่าได้เสมอ"** พิสูจน์ข้างบนด้วย `preemptionPolicy: Never`: Pod priority สูงตั้งค่าให้ไม่ evict ใครเลยได้ แล้วมันจะค้างที่ `Pending` — reason จริง `not eligible due to preemptionPolicy=Never` — แทนที่จะบังคับให้ capacity ว่างขึ้นมา
+- **"Allocatable กับ Capacity คือสิ่งเดียวกัน แค่คำต่างกัน"** พิสูจน์ข้างบน: มันเท่ากันแค่บังเอิญบน kind node ที่ไม่ได้ตั้งค่าอะไร scheduler filter เทียบกับ Allocatable ซึ่งบน cluster จริงคือ capacity ลบด้วยการจองของ kubelet/system
+
+## อ่านโค้ดที่ AI เขียน
+
+ตอน review Pod spec, Deployment หรือ `PriorityClass` ที่ AI สร้าง เช็คสิ่งเหล่านี้
+
+- container ที่ตั้ง `limits.memory` แต่ไม่ตั้ง `requests.memory` (หรือกลับกัน) — มันเป็น `Burstable` ไม่ใช่ `Guaranteed` และจะถูก evict ก่อน Pod ที่ตั้งทั้งคู่เท่ากัน พิสูจน์ข้างบน
+- โค้ดหรือ docs ที่สมมติว่า container ที่เกิน CPU limit จะถูกฆ่า — พิสูจน์ข้างบนแล้วว่ามันถูก throttle ไม่ใช่ถูกฆ่า มีแค่ memory เท่านั้นที่ทำให้ถูกฆ่าจริง (`OOMKilled`, exit `137`)
+- `globalDefault: true` ที่ copy ใส่ `PriorityClass` ใหม่โดยไม่เช็คว่า cluster มีตัวหนึ่งอยู่แล้วหรือเปล่า — API จะปฏิเสธ `globalDefault: true` ตัวที่สอง และถ้าใช้กับทุก Pod ที่มีอยู่แบบไม่ตั้งใจ นั่นมักไม่ใช่เจตนาจริง
+- `PriorityClass` ที่ตั้งไว้เพื่อรับประกันการ schedule โดยไม่คิดถึง `preemptionPolicy` เลย — ค่า default (`PreemptLowerPriority`) evict workload อื่นที่แชร์ Node เดียวกันได้ ถ้าเจตนาคือ "สำคัญแต่ไม่รบกวนใคร" ต้องใช้ `preemptionPolicy: Never` พิสูจน์ข้างบน
+- สมมติฐานเรื่อง capacity planning ที่อ้างอิงจากบรรทัด **Capacity** ของ `kubectl describe node` แทนที่จะเป็น **Allocatable** — พิสูจน์ข้างบนว่ามันเท่ากันแค่บังเอิญบน kind node ที่ไม่ได้ตั้งค่า
+
+<SpotTheBug code={`# k8s/the-scheduler-and-resource-requests/web-app.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-app
+spec:
+  containers:
+    - name: web
+      image: web-app:3.2.0
+      resources:
+        limits:
+          cpu: "500m"
+          memory: "512Mi"`}>
+Pod นี้ตั้ง `limits` แต่ไม่ตั้ง `requests` เลย ดูเหมือนปลอดภัย — มีเพดาน memory อยู่ — แต่ไม่มี `requests` ทำให้มันไม่ใช่ `Guaranteed` API server จะ default `requests` ให้เท่ากับ `limits` ก็ต่อเมื่อทั้งคู่ถูกตั้งพร้อมกันใน client tooling รุ่นใหม่เท่านั้น และถ้า namespace นี้ไม่มี `LimitRange` QoS class จริงของ Pod จะกลายเป็น `Burstable` โดย scheduler มอง requests ของมันเป็นค่าที่ resolve จาก `limits` ตอน admission ซึ่งง่ายที่จะเข้าใจผิดว่า "ฉันตั้ง limits แล้ว ก็อธิบายครบแล้ว" พิสูจน์ข้างบน: วิธีที่เชื่อถือได้ในการได้ QoS `Guaranteed` (evict หลังสุด ไม่ถูก throttle ต่ำกว่าพื้น) คือตั้ง `requests` กับ `limits` ให้เป็นค่า*เดียวกัน*ชัดเจนสำหรับทุก resource ในทุก container ไม่ใช่ตั้งแค่ `limits` แล้วหวังว่าจะได้ผล
+</SpotTheBug>
+
 <Callout title="สรุปหนึ่งบรรทัด">
-**`requests`** คือขั้นต่ำที่ scheduler จองพื้นที่ให้แน่นอน ส่วน **`limits`** คือเพดานแข็งที่บังคับใช้ตอน runtime — CPU เกิน limit จะถูก **throttle** memory เกิน limit จะทำให้ container โดน **OOMKilled** Kubernetes คำนวณ **QoS class** (**Guaranteed**, **Burstable** หรือ **BestEffort**) ให้อัตโนมัติจากค่าพวกนี้ และตัดสินลำดับ eviction เมื่อ resource ตึง — BestEffort ไปก่อน Guaranteed ไปสุดท้าย ตัว scheduler เองทำงานสองขั้น: **filtering** จนเหลือ Node ที่เป็นไปได้ แล้ว **scoring** เพื่อเลือกตัวที่เหมาะที่สุด ก่อนจะ **bind** Pod เข้าที่
+**`requests`** คือขั้นต่ำที่ scheduler จองพื้นที่ให้แน่นอน (เทียบกับ **Allocatable** ของ Node ไม่ใช่ Capacity) ส่วน **`limits`** คือเพดานแข็งที่บังคับใช้ตอน runtime — CPU เกิน limit จะถูก **throttle** (พิสูจน์ข้างบนด้วย `cpu.stat` accounting จริง) memory เกิน limit จะทำให้ container โดน **OOMKilled** exit `137` (พิสูจน์ข้างบน) Kubernetes คำนวณ **QoS class** (**Guaranteed**, **Burstable** หรือ **BestEffort**) ให้อัตโนมัติจากค่าพวกนี้ — `LimitRange` ฉีด requests/limits ที่คุณไม่เคยเขียนได้ เปลี่ยน class นั้นไปเลย (พิสูจน์ข้างบน) — และ QoS ตัดสินลำดับ eviction เมื่อ resource ตึง BestEffort ไปก่อน Guaranteed ไปสุดท้าย เมื่อยังไม่มีที่ว่าง **`PriorityClass`** ให้ Pod ข้ามหน้า queue และ **preempt** Pod priority ต่ำกว่าได้ (พิสูจน์ข้างบนด้วย event `Preempted` จริง) เว้นแต่จะปฏิเสธด้วย `preemptionPolicy: Never` (พิสูจน์ข้างบน: มันจะรอแทน reason `not eligible due to preemptionPolicy=Never`) ตัว scheduler เองทำงานผ่าน extension point ของ [scheduling framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/): **filtering** จนเหลือ Node ที่เป็นไปได้ (พร้อม **preemption** เป็นทางเลือกสำรองเมื่อไม่มี Node ไหนเป็นไปได้) แล้ว **scoring** เพื่อเลือกตัวที่เหมาะที่สุด ก่อนจะ **bind** Pod เข้าที่
 </Callout>
 
 export const quizScheduler = [
@@ -93,6 +385,7 @@ export const quizScheduler = [
       'จำนวน label ที่ติดอยู่บน Pod',
     ],
     answer: 0,
+    explain: 'พิสูจน์ข้างบน: scheduler เทียบ requests กับ Allocatable capacity ของ Node ส่วน limits ถูกบังคับใช้ทีหลังตอน runtime และไม่มีผลต่อการตัดสินใจวาง Pod เลย',
   },
   {
     q: 'container ใช้ memory เกิน limit จะเกิดอะไรขึ้น',
@@ -103,6 +396,7 @@ export const quizScheduler = [
       'Pod ถูกย้ายไป Node อื่นอัตโนมัติ',
     ],
     answer: 2,
+    explain: 'พิสูจน์ข้างบนด้วย stress container จริง: Reason OOMKilled, Exit Code 137 (128 + SIGKILL) — memory บีบอัดไม่ได้ kernel จึงฆ่า process แทนที่จะ throttle',
   },
   {
     q: 'เมื่อ Node ขาด memory QoS class ไหนโดน evict ก่อน',
@@ -113,16 +407,51 @@ export const quizScheduler = [
       'ถูก evict พร้อมกันหมดทุกตัว',
     ],
     answer: 2,
+    explain: 'BestEffort (ไม่มี requests หรือ limits เลย) ไปก่อน ตามด้วย Burstable และ Guaranteed ก็ต่อเมื่อไม่เหลือทางเลือกอื่นแล้วเท่านั้น',
   },
   {
-    q: 'scheduler รันสองขั้นตอนหลักอะไรก่อนจะ bind Pod เข้ากับ Node',
+    q: '```text\n$ kubectl exec cpu-hog -- cat /sys/fs/cgroup/cpu.stat\nnr_periods 136\nnr_throttled 136\nthrottled_usec 12185810\n```\nนี่คือ cgroup output จริงจาก container ที่ตั้ง `limits.cpu: "200m"` แล้วรัน process ที่กิน CPU เต็มที่ มันพิสูจน์อะไร',
     options: [
-      'Scoring แล้วค่อย Filtering',
-      'Filtering แล้วค่อย Scoring',
-      'Logging แล้วค่อย Binding',
-      'Binding แล้วค่อย Filtering',
+      'container โดน OOMKilled ไป 136 ครั้ง',
+      'ทุก accounting period โดนใช้ quota จนหมดและถูก throttle — container ยังรันต่อ แค่หยุดพักระหว่าง quota window',
+      'container ไม่เคยใช้ CPU เลย',
+      'Node หมด memory',
     ],
     answer: 1,
+    explain: 'nr_throttled เท่ากับ nr_periods แปลว่า 100% ของ period ถูก throttle — พิสูจน์ข้างบน นี่คือ CPU throttling ที่กำลังทำงาน ไม่ใช่การฆ่า container ยังเป็น Running ตลอด',
+  },
+  {
+    q: '```text\n$ kubectl get pod no-resources -o jsonpath=\'{.spec.containers[0].resources}\'\n{"limits":{"cpu":"500m","memory":"256Mi"},"requests":{"cpu":"250m","memory":"128Mi"}}\n```\nmanifest ของ Pod `no-resources` ไม่มี `resources` block เลย ค่าพวกนี้มาจากไหน',
+    options: [
+      'scheduler สุ่มใส่เอง',
+      'LimitRange ใน namespace ของ Pod ฉีด default requests/limits ให้ตอน admission',
+      'kubectl ใส่ default พวกนี้ให้เสมอ',
+      'มาจาก metadata ของ container image เอง',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบน: LimitRange ที่มีค่า defaultRequest/default ถูก apply โดย admission controller ก่อน Pod object จะถูก persist — Pod เป็น Burstable ไม่ใช่ BestEffort จากผลตรงนี้',
+  },
+  {
+    q: '```text\nWarning  FailedScheduling  pod/patient-pod  0/4 nodes are available: 1 Insufficient cpu, ...\npreemption: not eligible due to preemptionPolicy=Never.\n```\nทำไม Pod priority สูงตัวนี้ถึงค้างที่ Pending แทนที่จะ preempt Pod priority ต่ำกว่า',
+    options: [
+      'มัน priority ต่ำกว่า Pod ที่ยึด capacity อยู่',
+      'PriorityClass ของมันตั้ง preemptionPolicy: Never จึงข้ามหน้า Pod priority ต่ำกว่าใน queue แต่จะไม่ evict ใครเลย',
+      'PodDisruptionBudget กำลังกัน eviction อยู่',
+      'scheduler พังต้อง restart',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบน: preemptionPolicy: Never ให้ PriorityClass ปฏิเสธการ evict ใครเลย — Pod รอ capacity ว่างขึ้นเอง ตรงตาม FailedScheduling reason จริง',
+  },
+  {
+    q: 'ความสัมพันธ์ระหว่าง Capacity กับ Allocatable ของ Node คืออะไร และ scheduler ใช้ตัวไหน',
+    options: [
+      'เท่ากันเสมอ ไม่มีความต่างที่สำคัญ',
+      'Capacity คือ hardware ทั้งหมด Allocatable คือ Capacity ลบด้วยการจองของ kubelet/system และ scheduler filter เทียบกับ Allocatable',
+      'Allocatable มากกว่า Capacity เสมอ',
+      'scheduler ใช้ Capacity ส่วน Allocatable เป็นแค่ตัวเลขสวยงาม',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบน: บน kind node ที่ไม่ได้ตั้งค่า ทั้งคู่บังเอิญเท่ากัน แต่บน cluster จริงที่ตั้ง --system-reserved/--kube-reserved Allocatable จะเล็กกว่าอย่างมีนัยสำคัญ — และ Filter phase เช็ค requests กับ Allocatable',
   },
 ];
 

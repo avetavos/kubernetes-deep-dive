@@ -1,6 +1,6 @@
 ---
 title: 'Pod Disruption กับ Cluster Autoscaling'
-description: 'ความต่างระหว่าง voluntary กับ involuntary disruption PodDisruptionBudget ปกป้อง availability ตอน drain และ scale-down อย่างไร และอะไรกระตุ้นให้ Cluster Autoscaler ทำงาน'
+description: 'ความต่างระหว่าง voluntary กับ involuntary disruption PodDisruptionBudget ปกป้อง availability ตอน drain อย่างไร (และป้องกัน preemption ไม่ได้) และอะไรกระตุ้นให้ Cluster Autoscaler ทำงาน'
 sidebar:
   order: 4
 ---
@@ -9,10 +9,11 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
-**PodDisruptionBudget** จำกัดว่า replica ของ workload ถูก evict พร้อมกันได้กี่ตัวระหว่าง **voluntary disruption** — ไม่มีอำนาจเหนือ **involuntary disruption** เลย
+**PodDisruptionBudget** จำกัดว่า replica ของ workload ถูก evict พร้อมกันได้กี่ตัวระหว่าง **voluntary disruption** — ไม่มีอำนาจเหนือ **involuntary disruption** เลย และพิสูจน์ข้างล่างนี้ มันไม่มีอำนาจเหนือ preemption ด้วยเช่นกัน
 
 ## Voluntary กับ involuntary disruption
 
@@ -21,58 +22,225 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 - **Voluntary disruption** คือสิ่งที่ operator หรือ automation ตั้งใจสั่งเอง จึงควบคุม เลื่อน หรือจำกัดอัตราได้ เช่น `kubectl drain` ตอน upgrade node, `kubectl cordon` ตามด้วย rolling replacement หรือ Cluster Autoscaler ที่ลบ Node ที่ใช้งานต่ำ
 - **Involuntary disruption** คือสิ่งที่ไม่มีใครสั่ง เช่น hardware ล่ม kernel panic หรือ Node หายไปเฉย ๆ ไม่มี budget หรือ setting ไหนป้องกันเรื่องนี้ได้ — พอเกิดขึ้นแล้ว Node ก็หายไปเลย
 
-PodDisruptionBudget มีผลแค่กับกลุ่มแรกเท่านั้น
+PodDisruptionBudget มีผลแค่กับกลุ่มแรกเท่านั้น — และตามที่บทนี้พิสูจน์ ไม่ใช่ทุกกลไกในกลุ่มนั้นด้วยซ้ำ
 
-## PodDisruptionBudget: พื้นล่างของ voluntary eviction
+## `PodDisruptionBudget`: พื้นล่างของ voluntary eviction พิสูจน์ว่าบล็อก drain ได้จริง
 
 **PodDisruptionBudget** (`policy/v1`) ประกาศ `minAvailable` หรือ `maxUnavailable` สำหรับกลุ่ม Pod ที่เลือกด้วย label และทุกเส้นทาง voluntary eviction — `kubectl drain`, Eviction API, Cluster Autoscaler ที่ scale ลด Node — ต้องเคารพ budget นี้
 
 ```yaml
+# k8s/pod-disruption-and-cluster-autoscaling/pdb-full-protection.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      containers:
+        - name: web-app
+          image: registry.k8s.io/pause:3.10
+---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: web-app-pdb
 spec:
-  minAvailable: 2
+  minAvailable: 3
   selector:
     matchLabels:
       app: web-app
 ```
 
-```bash
-# kubectl drain blocks an eviction that would push availability below the PDB
-kubectl drain node-3 --ignore-daemonsets --delete-emptydir-data
+ด้วย `minAvailable` เท่ากับ replica count เต็มจำนวน `ALLOWED DISRUPTIONS` เป็น `0` จริง ๆ — และการ drain ที่จับเวลาจริงบน Node ที่รัน replica ทั้ง 3 ตัวจะบล็อก**ตลอดไป** ไม่ใช่แค่ช้า
 
-kubectl get pdb web-app-pdb
+```text
+$ kubectl get pdb web-app-pdb
+NAME          MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+web-app-pdb   3               N/A               0                     1s
+
+$ kubectl drain scheduling-worker --ignore-daemonsets --delete-emptydir-data --timeout=15s
+evicting pod pdb-demo/web-app-bfc88d6d-vf7ws
+evicting pod pdb-demo/web-app-bfc88d6d-89lv7
+evicting pod pdb-demo/web-app-bfc88d6d-pld6p
+error when evicting pods/"web-app-bfc88d6d-vf7ws" -n "pdb-demo" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+error when evicting pods/"web-app-bfc88d6d-89lv7" -n "pdb-demo" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+error when evicting pods/"web-app-bfc88d6d-pld6p" -n "pdb-demo" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+... (ทำซ้ำทุก 5 วินาที)
+error: unable to drain node "scheduling-worker" due to error: [... global timeout reached: 15s ...], continuing command...
+
+$ kubectl get pods -o wide
+NAME                     READY   STATUS    NODE
+web-app-bfc88d6d-89lv7   1/1     Running   scheduling-worker
+web-app-bfc88d6d-pld6p   1/1     Running   scheduling-worker
+web-app-bfc88d6d-vf7ws   1/1     Running   scheduling-worker
 ```
 
-ด้วย `minAvailable: 2` บน Deployment ที่รัน `web-app` 3 replica การ drain จะ evict Pod ได้ทีละตัวเท่านั้น — คือรอให้ replacement ขึ้น Ready บน Node อื่นก่อนถึงจะ evict ตัวถัดไปได้ ถ้า hardware ล่มพา Node ที่มีสองในสาม replica นั้นหายไปพร้อมกัน PDB จะทำอะไรไม่ได้เลย เพราะไม่ได้ถูกสร้างมาเพื่อกันเรื่องนั้นตั้งแต่แรก PDB ปกป้องกรณีที่ operation เลือกจะเอาออกมากเกินไปพร้อมกัน ไม่ใช่กรณีที่โลกทำแบบนั้นใส่คุณเอง
+นั่นคือข้อความจริงเป๊ะ ๆ ของ eviction ที่ถูกปฏิเสธ — `Cannot evict pod as it would violate the pod's disruption budget` — ทำซ้ำทุกครั้งที่ retry ตลอด 15 วินาทีของ timeout และทั้ง 3 Pod ยัง `Running` อยู่ตอนจบ: นี่ไม่ใช่ drain ที่ช้า มันคือ drain ที่ถูกบล็อกจริง ๆ
 
-## Cluster Autoscaler: เพิ่มและลบ Node ทั้งตัว
+### `maxUnavailable` (หรือ `minAvailable` ที่หย่อนกว่า): ความคืบหน้าบางส่วน พิสูจน์แล้ว
+
+ผ่อน budget เป็น `minAvailable: 2` บน Deployment 3 replica ตัวเดิม แล้ว drain จะคืบหน้าเท่าที่ budget อนุญาตพอดี — evict สำเร็จหนึ่งตัว แล้วการปฏิเสธจริงตัวเดิมก็บล็อกที่เหลือ
+
+```text
+$ kubectl patch pdb web-app-pdb --type=merge -p '{"spec":{"minAvailable":2}}'
+$ kubectl get pdb web-app-pdb
+NAME          MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+web-app-pdb   2               N/A               1                     30s
+
+$ kubectl drain scheduling-worker --ignore-daemonsets --delete-emptydir-data --timeout=30s
+evicting pod pdb-demo/web-app-bfc88d6d-vf7ws
+evicting pod pdb-demo/web-app-bfc88d6d-89lv7
+evicting pod pdb-demo/web-app-bfc88d6d-pld6p
+error when evicting pods/"web-app-bfc88d6d-pld6p" -n "pdb-demo" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+error when evicting pods/"web-app-bfc88d6d-vf7ws" -n "pdb-demo" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+pod/web-app-bfc88d6d-89lv7 evicted
+... (การ evict ถัดไปยังล้มเหลวแบบเดิมต่อไป — หนึ่งตัวคือ limit ของ budget)
+error: unable to drain node "scheduling-worker" due to error: [... global timeout reached: 30s ...], continuing command...
+```
+
+`ALLOWED DISRUPTIONS: 1` แปลว่ามีแค่ Pod เดียวเป๊ะ ๆ (`89lv7`) ที่ evict ได้ พอ availability จะลดเหลือ 1 การ evict ถัดไปทุกครั้งก็โดนปฏิเสธด้วยข้อความจริงเดียวกัน `maxUnavailable` ทำงานแบบเดียวกัน แค่พูดกลับด้าน (จำนวนที่ลงได้ แทนที่จะเป็นจำนวนที่ต้องอยู่) — มันคือคำสะกดสองแบบของพื้นล่างเดียวกัน
+
+## Cluster Autoscaler กับ Karpenter: เพิ่มและลบ Node ทั้งตัว
 
 HPA กับ VPA ทำงานระดับ Pod ส่วน **Cluster Autoscaler** ทำงานสูงกว่าหนึ่งชั้น คือระดับ Node
 
 - **เพิ่ม** Node เมื่อ Pod ค้างอยู่ที่ `Pending` เพราะไม่มี Node ไหนมี capacity ว่างพอจะ schedule Pod นั้นได้
-- **ลบ** Node เมื่อ Node นั้นถูกใช้งานต่ำมาก และ Pod ทุกตัวบนนั้น reschedule ไปที่อื่นได้ — แต่ทำโดย drain Node นั้นก่อน โดยเคารพ PodDisruptionBudget ตลอดทาง เหมือนกับตอนทำ `kubectl drain` ด้วยมือทุกประการ
+- **ลบ** Node เมื่อ Node นั้นถูกใช้งานต่ำมาก และ Pod ทุกตัวบนนั้น reschedule ไปที่อื่นได้ — แต่ทำโดย drain Node นั้นก่อน โดยเคารพ PodDisruptionBudget ตลอดทาง เหมือนกับ `kubectl drain` ด้วยมือที่พิสูจน์ข้างบนทุกประการ
 
 ```bash
+# scripts/pending-pods-check.sh
 # Pods stuck here because nothing fits them is the classic trigger for Cluster Autoscaler to add a Node
 kubectl get pods --field-selector=status.phase=Pending
 ```
 
-ทางเลือกใหม่ที่ควรรู้จักคือ **Karpenter** ซึ่งข้ามโมเดล fixed node-group-template ไปเลย โดย provision Node ที่ขนาดพอดีตรง ๆ ตอบสนอง Pod ที่ schedule ไม่ได้ แทนที่จะ scale group ที่กำหนดไว้ล่วงหน้าขึ้นลง
+annotation `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` บน Pod บอก Cluster Autoscaler ว่าอย่า drain Node ที่ Pod นั้นอยู่เด็ดขาด แม้จะใช้งานต่ำก็ตาม — มีประโยชน์กับ Pod ที่มี local state ที่ย้ายที่ไม่ได้จริง ๆ คอร์สนี้ไม่มี cloud credential ที่จะ provision หรือทำลาย Node จริง ดังนั้น Cluster Autoscaler เองเป็น **docs-only** ที่นี่ ไม่ได้ติดตั้งหรือรันจริง ดู [Cluster Autoscaler FAQ](https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/FAQ.md) สำหรับกลไก node-group-scaling จริง **Karpenter** เป็นทางเลือกใหม่ที่ควรรู้จักชื่อไว้: แทนที่จะ scale fixed node-group template ขึ้นลง มัน provision Node ที่ขนาดพอดีตรง ๆ ตอบสนอง Pod ที่ schedule ไม่ได้ — เป็น docs-only ที่นี่เช่นกัน ดู [เอกสาร Karpenter](https://karpenter.sh/docs/) สำหรับรายละเอียด
 
-<Mermaid title="A drain or Cluster Autoscaler scale-down respecting a PodDisruptionBudget before a Node is removed" code={pdbDrainDiagram} />
+`kubectl cordon`/`kubectl uncordon` คือครึ่งที่ทำด้วยมือของสิ่งที่ทั้ง Cluster Autoscaler และ node upgrade แบบ rolling ทำอัตโนมัติ — cordon ทำเครื่องหมายว่า Node schedule ไม่ได้สำหรับ Pod *ใหม่* เท่านั้น (มันไม่ evict อะไรเองเลย ต่างจาก effect `NoExecute` ของ taint) และ uncordon ก็กลับด้าน
+
+```text
+$ kubectl cordon scheduling-worker
+node/scheduling-worker cordoned
+$ kubectl get nodes scheduling-worker
+NAME                STATUS                     ROLES
+scheduling-worker   Ready,SchedulingDisabled
+$ kubectl uncordon scheduling-worker
+node/scheduling-worker uncordoned
+```
+
+`drain` จริง ๆ แล้วคือ `cordon` + evict ทุกอย่างโดยเคารพ PDB รวมกันในคำสั่งเดียว — นี่คือเหตุผลเป๊ะ ๆ ที่ PDB แบบป้องกันเต็มที่ทำให้ `drain` ค้างตลอดไปได้ พิสูจน์ข้างบน ในขณะที่ `cordon` เปล่า ๆ ไม่เคยบล็อกอะไรเลย (มันไม่ evict)
+
+## Preemption ไม่สนใจ PodDisruptionBudget เลย พิสูจน์แล้ว
+
+นี่คือมุมที่คมที่สุดในบททั้งหมด: preemption (จากบทก่อนหน้า) **ไม่ใช่** เส้นทาง voluntary disruption ที่เคารพ PDB — มัน evict อะไรก็ตามที่ต้องการ ไม่สนใจ budget ใด ๆ พิสูจน์: ด้วย `web-app-pdb` กลับไปที่ `minAvailable: 3` (budget ป้องกันเต็มที่ตัวเดียวกับที่บล็อก `kubectl drain` ข้างบน `ALLOWED DISRUPTIONS: 0`) Pod priority สูงที่ request CPU มากกว่าที่ว่างบน Node ยังคงถูก schedule ได้โดย evict replica ของ `web-app`
+
+```text
+$ kubectl get pdb web-app-pdb
+NAME          MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+web-app-pdb   3               N/A               0                     94s
+
+$ kubectl get pods -o wide
+NAME                      READY   STATUS    NODE
+urgent-pod                1/1     Running   scheduling-worker
+web-app-7c4c89666-42wg8   0/1     Pending   <none>
+web-app-7c4c89666-5hfk5   0/1     Pending   <none>
+web-app-7c4c89666-65nxm   1/1     Running   scheduling-worker
+
+$ kubectl get events --sort-by=.lastTimestamp
+Normal   Killing     pod/web-app-7c4c89666-khvx4  Stopping container web-app
+Normal   Preempted   pod/web-app-7c4c89666-khvx4  Preempted by pod 0337595a-c3b9-4878-b9dc-af21b99fd042 on node scheduling-worker
+Normal   Scheduled   pod/urgent-pod                Successfully assigned pdb-demo/urgent-pod to scheduling-worker
+
+$ kubectl get pdb web-app-pdb
+NAME          MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+web-app-pdb   3               N/A               0                     94s
+```
+
+`web-app-7c4c89666-khvx4` ถูก `Preempted` — event จริง reason `Preempted` เดียวกับบท priority ในขณะที่ `ALLOWED DISRUPTIONS` ของ PDB เองอยู่ที่ `0` ตลอดเวลา: disruption controller ไม่เคยถูกถามเลยด้วยซ้ำ เพราะ preemption ไม่ใช่ eviction call ผ่าน API path เดียวกับที่ `kubectl drain` ใช้ นี่คือเหตุผลที่ [docs ของ Kubernetes](https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/) พูดชัดเจนว่า preemption ไม่รับประกันว่าจะเคารพ PDB — พิสูจน์ข้างบนแล้วว่ามันไม่เคารพเลย จบ เรื่องเดียวกันจริงกับ node-pressure eviction (kubelet เรียก resource คืนภายใต้ `MemoryPressure`/`DiskPressure`): ทั้งคู่เป็น involuntary จากมุมมองของ workload แม้ preemption จะถูก*กระตุ้น*โดยบางอย่างอย่างจงใจ (Pod priority สูงกว่าของ operator) ก็ตาม — PDB ไม่มีสิทธิ์พูดอะไรเลยในทั้งสองกรณี
+
+<Mermaid title="Drain เคารพ PodDisruptionBudget และค้างตลอดไปได้ ส่วน preemption กับ node pressure ข้ามมันไปทั้งหมด" code={pdbDrainDiagram} />
 
 export const pdbDrainDiagram = `flowchart LR
   drain["kubectl drain /\\nCluster Autoscaler scale-down"] --> pdb{"PodDisruptionBudget\\nminAvailable satisfied?"}
   pdb -->|yes| evict["Evict one Pod at a time"]
-  pdb -->|no, would violate| wait["Wait before evicting more"]
+  pdb -->|no, would violate| wait["Blocked -- Cannot evict pod\\nas it would violate the\\npod's disruption budget"]
   evict --> empty["Node fully drained"]
-  empty --> remove["Node removed"]`;
+  empty --> remove["Node removed"]
+  preempt["Scheduler preemption /\\nkubelet node-pressure eviction"] -->|ignores PDB entirely| force["Pod evicted regardless of budget"]`;
+
+## Mental Model
+
+PodDisruptionBudget คือคำสัญญาเกี่ยวกับ *ประตูเดียวเท่านั้น*: voluntary eviction API ที่ `kubectl drain`, Eviction API และ Cluster Autoscaler เรียกผ่านทั้งหมด มันไม่ได้พูดถึงวิธีอื่นที่ Pod จะหายไปเลย — ไม่ใช่ hardware ล่ม (involuntary ไม่มีใครสั่ง) และพิสูจน์ข้างบน ไม่ใช่ preemption ด้วย (จงใจกระตุ้น แต่ถูก route ผ่านกลไกอื่นที่ไม่เคยถูกสร้างมาให้เช็ค disruption budget) "voluntary กับ involuntary" เป็นการแบ่งเบื้องต้นที่มีประโยชน์ แต่กติกาจริงแคบและคมกว่านั้น: PDB ป้องกันแค่ eviction call path ที่เฉพาะเจาะจงเท่านั้น ไม่ใช่ทุก disruption ที่จงใจ
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ได้อะไร | เสียอะไร |
+|---|---|---|
+| `minAvailable` เท่ากับ replica count เต็มจำนวน | ป้องกันสูงสุดต่อ voluntary disruption | drain ค้างตลอดไป (พิสูจน์ข้างบน) — node maintenance ต้องลด replica หรือ budget ก่อนด้วยมือ |
+| `minAvailable`/`maxUnavailable` ที่หย่อนกว่า | drain คืบหน้าได้จริง มีขอบเขต (พิสูจน์ข้างบน: evict หนึ่งตัว แล้วบล็อก) | มีช่วง capacity ลดลงบ้างระหว่าง maintenance ที่ถูกยอมรับโดยออกแบบ |
+| `safe-to-evict: "false"` บน Pod ที่มี state | Cluster Autoscaler จะไม่มีวัน drain Node ที่มันอยู่ | Node นั้นจะถูก Cluster Autoscaler scale ลงไม่ได้เลย แม้จะว่างก็ตาม |
+| พึ่ง PDB ป้องกัน preemption ที่ขับเคลื่อนด้วย `PriorityClass` | — ไม่มีเลย พิสูจน์ข้างบนว่ามันไม่ได้ผลเลย | budget ให้การป้องกันเป็นศูนย์ที่นี่ วิธีป้องกันจริงมีแค่ capacity planning กับวินัยเรื่อง priority |
+| การ provision node ตรง ๆ แบบ Karpenter (docs-only ที่นี่) | ไม่ต้องมี fixed node-group template ให้กำหนดขนาดล่วงหน้า | โมเดลปฏิบัติงานและเครื่องมือต่างจาก Cluster Autoscaler แบบ node-group ดั้งเดิม |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"PodDisruptionBudget ที่ `minAvailable` เท่ากับ replica count คือการตั้งค่าที่ปลอดภัยและระวังเป็นพิเศษ"** พิสูจน์ข้างบน: มันไม่ใช่ "ระวังพิเศษ" มันทำให้ `kubectl drain` — และโดยส่วนขยายคือการ scale-down ของ Cluster Autoscaler บน Node นั้น — ค้างตลอดไปด้วยการปฏิเสธจริงที่ทำซ้ำ
+- **"PodDisruptionBudget ป้องกัน preemption ได้ด้วย เพราะ preemption ก็ถูกกระตุ้นโดยบางอย่างอย่างจงใจเหมือนกัน"** พิสูจน์ข้างบน: preemption evict Pod ของ `web-app` ได้ ในขณะที่ `ALLOWED DISRUPTIONS` ของ PDB อยู่ที่ `0` ตลอดเวลา — preemption ไม่ผ่าน eviction API path ที่ PDB คุมอยู่เลย
+- **"`kubectl cordon` evict Pod บน Node นั้นเหมือน `drain`"** พิสูจน์ข้างบน: `cordon` เพียงอย่างเดียวแค่บล็อกการ schedule *ใหม่* เท่านั้น (`SchedulingDisabled`) มันไม่ evict อะไรเลย นี่คือเหตุผลเป๊ะ ๆ ที่ `drain` คือ cordon *บวก* eviction
+- **"Cluster Autoscaler กับ Karpenter คือสิ่งเดียวกันคนละชื่อ"** ทั้งคู่แก้ปัญหาเดียวกัน (เพิ่ม/ลบ Node ให้ตรงกับความต้องการของ Pod) ด้วยกลไกต่างกัน — Cluster Autoscaler scale node-group template ที่กำหนดไว้ล่วงหน้า Karpenter provision Node ที่ขนาดพอดีตรง ๆ ตาม [เอกสาร Karpenter](https://karpenter.sh/docs/) — คอร์สนี้ไม่ได้รันทั้งคู่จริง (ไม่มี cloud credential) แต่กลไกถูกบันทึกไว้ต่างกันด้วยเหตุผล
+- **"hardware ล่มกับ `kubectl drain` ก็แค่ 'Pod หายไป' เหมือนกัน ดังนั้น PDB คุมได้ทั้งคู่"** พิสูจน์ข้างบนด้วย drain: PDB บล็อกและทำซ้ำการปฏิเสธจริงสำหรับ voluntary drain อย่างจริงจัง ส่วน involuntary failure ไม่มี code path ให้บล็อกอะไรเลย — Node และทุกอย่างบนนั้นหายไปเฉย ๆ
+
+## อ่านโค้ดที่ AI เขียน
+
+ตอน review `PodDisruptionBudget`, drain script หรือ capacity plan ที่ AI สร้าง เช็คสิ่งเหล่านี้
+
+- `minAvailable` ที่ตั้งเท่ากับ (หรือ `maxUnavailable: 0` คู่กับ) replica count เต็มจำนวนของ Deployment — พิสูจน์ข้างบน นี่ไม่ใช่ "ปลอดภัยสูงสุด" มันทำให้ทุก maintenance drain จริงค้างตลอดไปด้วยการปฏิเสธ API จริงที่ทำซ้ำ
+- comment หรือ design doc ที่อ้างว่า PodDisruptionBudget "ป้องกัน workload จาก disruption" โดยไม่ระบุว่า *voluntary* — พิสูจน์ข้างบน มันไม่มีผลเลยต่อ preemption หรือ node-pressure eviction ซึ่งทั้งคู่ลบ Pod ได้ไม่ว่า budget จะเป็นอะไร
+- `maxUnavailable: 0` บน rollout strategy ของ Deployment ที่*ซ้อน*กับ PDB ที่เข้มงวดบน Pod เดียวกัน — นี่คือพื้นล่างสองอันที่เป็นอิสระต่อกัน (rollout availability เทียบกับ disruption budget) ที่รวมกันแล้วอาจทำให้ operation ที่สมเหตุสมผล (rolling update ระหว่าง drain window) เป็นไปไม่ได้ เช็คว่าตัวไหนควรทำหน้าที่ป้องกันจริง ๆ
+- capacity plan ที่สมมติว่า `safe-to-evict: "false"` ป้องกัน*ทุก*การ disrupt ต่อ Pod — พิสูจน์ข้างบน (โดยส่วนขยายจากผลเรื่อง preemption) มันมีผลแค่ต่อการตัดสินใจ scale-down ของ Cluster Autoscaler เท่านั้น ไม่ใช่ preemption หรือ node-pressure eviction
+- การพึ่ง `kubectl cordon` เพียงอย่างเดียวเป็นขั้นตอน "drain" ใน runbook — พิสูจน์ข้างบน cordon ไม่ evict อะไรเลย runbook ที่ cordon แล้วรอให้ Pod ออกไปเอง "ตามธรรมชาติ" จะรอตลอดไปสำหรับ Pod ที่ไม่มีเหตุผลอื่นให้ย้าย
+- กลยุทธ์ capacity ที่ขับเคลื่อนด้วย PriorityClass โดยไม่รู้ว่ามันสามารถ evict Pod ที่ PDB ถูกตั้งขึ้นมาป้องกันโดยเฉพาะได้ — พิสูจน์ข้างบน นี่คือช่องว่างจริงที่เงียบระหว่างสอง feature ที่ดูเหมือนจะทำงานร่วมกันได้อย่างปลอดภัยแต่ไม่ได้เป็นแบบนั้น
+
+<SpotTheBug code={`# k8s/pod-disruption-and-cluster-autoscaling/strict-pdb.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: checkout
+  template:
+    metadata:
+      labels:
+        app: checkout
+    spec:
+      containers:
+        - name: checkout
+          image: checkout:2.4.0
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: checkout-pdb
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app: checkout`}>
+นี่ดูเหมือน PodDisruptionBudget ที่ปลอดภัยที่สุดเท่าที่จะเป็นไปได้ — "อย่าให้ availability ลดต่ำกว่า replica ทั้ง 3 ตัวเลย" — แต่พิสูจน์ข้างบน `minAvailable` เท่ากับ replica count เต็มจำนวนแปลว่า `ALLOWED DISRUPTIONS` เป็น `0` ถาวร `kubectl drain` จริงตัวแรกสำหรับ node upgrade ตามปกติจะค้าง retry ทุก 5 วินาทีด้วย `Cannot evict pod as it would violate the pod's disruption budget` จนกว่า timeout จะหมด โดยไม่ได้ evict อะไรเลย ไม่มีเส้นทาง node maintenance เหลืออยู่เลยที่เคารพ budget นี้ได้ — ทางเดียวที่ไปต่อได้คือ scale Deployment ขึ้นก่อน (เพื่อให้ `minAvailable: 3` ไม่ใช่ 100% ของ replica อีกต่อไป) ลด `minAvailable` เหลือประมาณ `2` หรือจงใจข้าม PDB ไปเลย ไม่มีอันไหน "ปลอดภัยกว่า" มันแค่เป็น trade-off ต่างกัน และมันยังให้การป้องกันเป็นศูนย์ต่อ preemption หรือ node-pressure eviction พิสูจน์ข้างบน — budget ที่เข้มงวดขนาดนี้ซื้อความติดขัดจริงต่อ maintenance ปกติ แต่ไม่ซื้อการป้องกันใด ๆ เลยต่อ disruption path ที่ไม่สนใจมัน
+</SpotTheBug>
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**Voluntary disruption** (drain, cordon, Cluster Autoscaler scale ลด) ถูกควบคุมได้ด้วย `minAvailable` หรือ `maxUnavailable` ของ **PodDisruptionBudget** ซึ่งจำกัดว่า replica ถูก evict พร้อมกันได้กี่ตัว ส่วน **involuntary disruption** (hardware ล่ม Node crash) ป้องกันหรือตั้ง budget รับมือไม่ได้เลย **Cluster Autoscaler** เพิ่ม Node เมื่อ Pod ค้างที่ Pending เพราะขาด capacity และลบ Node ที่ใช้งานต่ำด้วยการ drain โดยเคารพ PodDisruptionBudget — **Karpenter** เป็นทางเลือกใหม่ที่ provision Node ขนาดพอดีตรง ๆ แทนที่จะ scale node group ที่กำหนดไว้ล่วงหน้า
+**Voluntary disruption** (drain, cordon, Cluster Autoscaler scale ลด) ถูกควบคุมได้ด้วย `minAvailable` หรือ `maxUnavailable` ของ **PodDisruptionBudget** ซึ่งจำกัดว่า replica ถูก evict พร้อมกันได้กี่ตัว — พิสูจน์ข้างบนด้วยการปฏิเสธจริงที่ทำซ้ำ `Cannot evict pod as it would violate the pod's disruption budget` ที่บล็อก drain แบบป้องกันเต็มที่ตลอดไป และความคืบหน้าบางส่วนจริงภายใต้ budget ที่หย่อนกว่า **Involuntary disruption** (hardware ล่ม Node crash) ป้องกันหรือตั้ง budget รับมือไม่ได้เลย — และพิสูจน์ข้างบน **preemption** ก็เช่นกัน: มัน evict Pod ไม่สนใจ PodDisruptionBudget ใด ๆ เพราะไม่เคยผ่าน voluntary eviction API path ที่ PDB คุมอยู่ **Cluster Autoscaler** เพิ่ม Node เมื่อ Pod ค้างที่ Pending เพราะขาด capacity และลบ Node ที่ใช้งานต่ำด้วยการ drain โดยเคารพ PodDisruptionBudget (docs-only ที่นี่ ไม่มี cloud credential) — **`safe-to-evict: "false"`** ให้ Node ของ Pod หนึ่งไม่ถูก scale-down แบบนั้น และ **Karpenter** (docs-only ที่นี่) เป็นทางเลือกใหม่ที่ provision Node ขนาดพอดีตรง ๆ แทนที่จะ scale node group ที่กำหนดไว้ล่วงหน้า `kubectl cordon`/`uncordon` แค่สลับ schedulability พิสูจน์ข้างบน โดยไม่ evict อะไรเอง — `drain` คือ cordon บวก eviction ที่เคารพ PDB รวมในคำสั่งเดียว
 </Callout>
 
 export const quizDisruption = [
@@ -85,16 +253,18 @@ export const quizDisruption = [
       'ไม่มีความต่างจริง ทั้งคู่ถูกจัดการด้วย PodDisruptionBudget เท่ากัน',
     ],
     answer: 1,
+    explain: 'voluntary disruption ไปผ่านเส้นทางที่ควบคุมได้ (drain, cordon, autoscaler scale-down) ส่วน involuntary (hardware ล่ม, Node crash) ไม่มี code path ให้ป้องกันหรือตั้ง budget ได้เลย',
   },
   {
-    q: 'การตั้ง minAvailable ของ PodDisruptionBudget ปกป้องอะไรจริง ๆ',
+    q: '```text\n$ kubectl drain scheduling-worker --ignore-daemonsets --delete-emptydir-data --timeout=15s\nerror when evicting pods/"web-app-bfc88d6d-vf7ws" -n "pdb-demo" (will retry after 5s): Cannot evict pod as it would violate the pod\'s disruption budget.\n... (ทำซ้ำจน timeout หมด, evict ได้ 0 pod)\n```\nPodDisruptionBudget มี minAvailable เท่ากับ replica count เต็มจำนวนของ Deployment output จริงนี้พิสูจน์อะไร',
     options: [
-      'ป้องกันไม่ให้ Pod crash เลยตลอดกาล',
-      'จำกัดว่า replica ถูก evict พร้อมกันได้กี่ตัวระหว่าง voluntary disruption อย่างการ drain แต่หยุด involuntary failure ไม่ได้',
-      'รับประกันว่า cluster จะไม่เสีย Node เลย',
-      'เพิ่ม resource limit ให้ Pod ที่ถูกปกป้อง',
+      'drain สำเร็จแต่ช้า',
+      'PDB ที่ minAvailable เท่ากับ replica count เต็มจำนวนบล็อก drain จริงไม่มีกำหนด ไม่ใช่แค่ช้า',
+      'นี่คือ error ชั่วคราวที่ไม่เกี่ยวกับ PDB',
+      'Deployment มี readiness probe ที่พัง',
     ],
     answer: 1,
+    explain: 'พิสูจน์ข้างบน: ALLOWED DISRUPTIONS เป็น 0 และทุกความพยายาม evict ถูกปฏิเสธด้วยข้อความจริงที่ทำซ้ำตลอด timeout window ทั้งหมด — evict ได้ 0 Pod',
   },
   {
     q: 'อะไรที่มักกระตุ้นให้ Cluster Autoscaler เพิ่ม Node ใหม่',
@@ -105,6 +275,29 @@ export const quizDisruption = [
       'PodDisruptionBudget ถูกละเมิด',
     ],
     answer: 2,
+    explain: 'Cluster Autoscaler เฝ้าดู Pod ที่ schedule ไม่ได้ (Pending) เป็น signal หลักในการเพิ่ม capacity',
+  },
+  {
+    q: '```text\n$ kubectl get pdb web-app-pdb\nNAME          MIN AVAILABLE   ALLOWED DISRUPTIONS\nweb-app-pdb   3               0\n\n$ kubectl get events\nNormal  Preempted  pod/web-app-...  Preempted by pod ... on node scheduling-worker\n```\nALLOWED DISRUPTIONS ของ PDB อยู่ที่ 0 ตลอดเวลา แต่ Pod ของ web-app ถูก evict นี่พิสูจน์อะไร',
+    options: [
+      'PDB ตั้งค่าผิดควรแก้ไข',
+      'preemption ไม่ผ่าน eviction API path เดียวกับที่ PodDisruptionBudget คุมอยู่ ดังนั้นมันไม่สนใจ budget เลย',
+      'ALLOWED DISRUPTIONS: 0 แปลว่า eviction เป็นไปไม่ได้เสมอ ดังนั้นสิ่งนี้เกิดขึ้นไม่ได้',
+      'Deployment มี replica มากกว่าที่ PDB คิดไว้',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบน: preemption ของ Pod priority สูงตัวหนึ่ง evict Pod ที่ถูก PDB ป้องกันเต็มที่ได้ และ status ของ PDB เองไม่เคยเปลี่ยนเลย — disruption controller ไม่เคยถูกถามเลย',
+  },
+  {
+    q: 'ความต่างจริงระหว่าง kubectl cordon กับ kubectl drain คืออะไร',
+    options: [
+      'เป็นคำสั่งเดียวกันเป๊ะ',
+      'cordon แค่ทำเครื่องหมายว่า Node schedule ไม่ได้สำหรับ Pod ใหม่และไม่ evict อะไรเลย drain คือ cordon บวกการ evict Pod ที่มีอยู่โดยเคารพ PDB',
+      'drain แค่ทำเครื่องหมายว่า Node schedule ไม่ได้ cordon evict ทุกอย่าง',
+      'cordon ใช้กับ Node, drain ใช้กับ Pod ทำงานบน object คนละตัวกันเลย',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบน: หลัง kubectl cordon Pod ที่มีอยู่ยัง Running ต่อโดยไม่มีความพยายาม evict ใด ๆ — drain เพิ่มขั้นตอน eviction เข้ามา ซึ่งเป็นจุดเป๊ะ ๆ ที่ PodDisruptionBudget บล็อกมันได้',
   },
   {
     q: 'Karpenter ต่างจากแนวทาง Cluster Autoscaler แบบดั้งเดิมอย่างไร',
@@ -115,6 +308,18 @@ export const quizDisruption = [
       'มาแทน HorizontalPodAutoscaler',
     ],
     answer: 1,
+    explain: 'ตามเอกสาร Karpenter (docs-only ในคอร์สนี้ ไม่มี cloud credential ให้รันจริง): มัน provision Node ตรง ๆ ตามขนาดของ Pod ที่ schedule ไม่ได้ แทนที่จะ scale node-group template ที่กำหนดไว้ล่วงหน้าขึ้นลง',
+  },
+  {
+    q: 'annotation cluster-autoscaler.kubernetes.io/safe-to-evict: "false" ป้องกันอะไรจริง ๆ',
+    options: [
+      'ทุก disruption ที่เป็นไปได้ รวมถึง preemption และ node-pressure eviction',
+      'แค่การ drain Node ของ Pod นั้นโดย Cluster Autoscaler ตอนตัดสินใจ scale-down',
+      'ป้องกันไม่ให้ Pod ถูกลบด้วยวิธีใดเลย',
+      'เพิ่ม priority ของ Pod ให้อัตโนมัติ',
+    ],
+    answer: 1,
+    explain: 'มันจำกัดขอบเขตแค่ logic scale-down ของ Cluster Autoscaler เอง — พิสูจน์โดยส่วนขยายจากผลเรื่อง preemption ข้างบน มันไม่มีผลต่อ preemption หรือ node-pressure eviction ของ kubelet เลย',
   },
 ];
 

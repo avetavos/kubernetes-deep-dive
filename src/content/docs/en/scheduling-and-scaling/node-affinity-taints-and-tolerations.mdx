@@ -1,6 +1,6 @@
 ---
 title: 'Node Affinity, Taints, and Tolerations'
-description: 'The difference between nodeSelector, node affinity, and pod affinity/anti-affinity, and how taints and tolerations repel Pods from a Node unless explicitly allowed.'
+description: 'The difference between nodeSelector, node affinity, pod affinity/anti-affinity, and topologySpreadConstraints, and how taints and tolerations repel Pods from a Node unless explicitly allowed.'
 sidebar:
   order: 2
 ---
@@ -9,10 +9,11 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
-**Affinity** pulls a Pod toward certain Nodes (or other Pods), while a **taint** repels Pods away from a Node unless the Pod carries a matching **toleration** — two mechanisms pointed in opposite directions that are often combined.
+**Affinity** pulls a Pod toward certain Nodes (or other Pods), **`topologySpreadConstraints`** spreads a group of Pods evenly across a topology, and a **taint** repels Pods away from a Node unless the Pod carries a matching **toleration** — mechanisms that are often combined.
 
 ## nodeSelector and node affinity: matching on Node labels
 
@@ -55,35 +56,42 @@ spec:
         - weight: 80
           preference:
             matchExpressions:
-              - key: topology.kubernetes.io/zone
+              - key: zone
                 operator: In
                 values:
-                  - us-central1-a
+                  - preferred
   containers:
     - name: inference
       image: inference-server:2.1.0
 ```
 
-Both suffixes end in `IgnoredDuringExecution`, meaning that once a Pod is running, a later change to Node labels never causes it to be evicted — these rules only affect the initial scheduling decision.
+Both suffixes end in `IgnoredDuringExecution`, meaning that once a Pod is running, a later change to Node labels never causes it to be evicted — these rules only affect the initial scheduling decision. Proof that `preferred` actually steers placement without forcing it: labeling exactly one worker `zone=preferred` and creating a Pod with only that soft preference (no `nodeSelector`, no hard requirement) lands it on that worker every time, out of three otherwise-identical candidates:
 
-## Pod affinity and anti-affinity: scheduling relative to other Pods
+```text
+$ kubectl label node scheduling-worker2 zone=preferred
+$ kubectl get pod prefers-zone -o wide
+NAME           READY   STATUS    NODE
+prefers-zone   1/1     Running   scheduling-worker2
+```
 
-Node affinity looks at Node labels. **Pod affinity** and **pod anti-affinity** instead look at the labels of *other Pods already running*, using a `topologyKey` to define what "nearby" means (a hostname, a zone, and so on). The most common use is spreading replicas of the same app apart for resilience:
+## Pod affinity and anti-affinity: scheduling relative to other Pods, proven all-or-nothing
+
+Node affinity looks at Node labels. **Pod affinity** and **pod anti-affinity** instead look at the labels of *other Pods already running*, using a `topologyKey` to define what "nearby" means (a hostname, a zone, and so on).
 
 ```yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: web-app
+  name: web-anti
 spec:
-  replicas: 3
+  replicas: 4
   selector:
     matchLabels:
-      app: web-app
+      app: web-anti
   template:
     metadata:
       labels:
-        app: web-app
+        app: web-anti
     spec:
       affinity:
         podAntiAffinity:
@@ -92,15 +100,127 @@ spec:
                 matchExpressions:
                   - key: app
                     operator: In
-                    values:
-                      - web-app
+                    values: ["web-anti"]
               topologyKey: kubernetes.io/hostname
       containers:
-        - name: web-app
-          image: web-app:3.2.0
+        - name: web
+          image: registry.k8s.io/pause:3.10
 ```
 
-This anti-affinity rule tells the scheduler "never put two `web-app` Pods on the same host" — losing one Node never takes down more than one replica. The mirror case, **pod affinity**, co-locates Pods instead — for example, pinning a cache sidecar onto the same Node as the service that reads from it, to keep that traffic off the network entirely.
+This rule says "never put two `web-anti` Pods on the same host." On a 3-worker cluster, 3 replicas fit — one per Node — but the 4th has nowhere left to go, and `requiredDuringScheduling` is all-or-nothing: it stays genuinely `Pending`, not "somewhat spread":
+
+```text
+$ kubectl get pods -l app=web-anti -o wide
+NAME                        READY   STATUS    NODE
+web-anti-6476995565-5dwmp   1/1     Running   scheduling-worker
+web-anti-6476995565-glvpv   0/1     Pending   <none>
+web-anti-6476995565-l9tvf   1/1     Running   scheduling-worker2
+web-anti-6476995565-rhltf   1/1     Running   scheduling-worker3
+
+$ kubectl describe pod web-anti-6476995565-glvpv
+Events:
+  Warning  FailedScheduling  0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 node(s) didn't match pod anti-affinity rules. preemption: 0/4 nodes are available: 1 Preemption is not helpful for scheduling, 3 No preemption victims found for incoming pod.
+```
+
+Compare that with `topologySpreadConstraints` below, which can express "spread evenly, allow up to N per Node" instead of this strict one-per-Node ceiling.
+
+## `topologySpreadConstraints`: even distribution with a tunable skew
+
+`topologySpreadConstraints` (`kubectl explain pod.spec.topologySpreadConstraints` on a live 1.37 cluster) spreads a group of Pods across a topology domain to within a tolerance, `maxSkew`, instead of anti-affinity's all-or-nothing rule:
+
+```yaml
+# k8s/node-affinity-taints-and-tolerations/topology-spread-deploy.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          nodeTaintsPolicy: Honor
+          matchLabelKeys:
+            - pod-template-hash
+          labelSelector:
+            matchLabels:
+              app: web
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10
+```
+
+- **`maxSkew`** — the maximum allowed difference between the most- and least-populated matching domain. `1` here means no Node may end up with 2 more matching Pods than any other.
+- **`topologyKey: kubernetes.io/hostname`** — spread per-Node; use `topology.kubernetes.io/zone` to spread per-zone instead.
+- **`whenUnsatisfiable`** — `DoNotSchedule` (hard, like `required` affinity) or `ScheduleAnyway` (soft, best-effort).
+- **`matchLabelKeys: [pod-template-hash]`** — checked live: `kubectl explain pod.spec.topologySpreadConstraints.matchLabelKeys` on a real 1.37 API server reports **"This is a beta field ... requires the `MatchLabelKeysInPodTopologySpread` feature gate (enabled by default)"** — it is *not* GA yet, still beta since 1.27, contrary to an assumption that it would have graduated by 1.37. In practice it is on by default, so it behaves as if always available. It scopes skew-counting to Pods of the *same* ReplicaSet generation (see the rollout section below).
+
+Proof of a clean 2-2-2 spread across 3 workers with 6 replicas:
+
+```text
+$ kubectl apply -f topology-spread-deploy.yaml
+$ kubectl get pods -o wide
+NAME                  READY   STATUS    NODE
+web-b8b7dc6c7-4dpx9   1/1     Running   scheduling-worker
+web-b8b7dc6c7-llb6c    1/1     Running   scheduling-worker
+web-b8b7dc6c7-csj9b   1/1     Running   scheduling-worker2
+web-b8b7dc6c7-l9qrl   1/1     Running   scheduling-worker2
+web-b8b7dc6c7-hf4pl   1/1     Running   scheduling-worker3
+web-b8b7dc6c7-nqxj9   1/1     Running   scheduling-worker3
+```
+
+### The `nodeTaintsPolicy` trap, proven
+
+The same manifest **without** `nodeTaintsPolicy: Honor` gets 3 of 6 Pods permanently stuck `Pending` on this exact cluster:
+
+```text
+$ kubectl get pods -o wide
+NAME                   READY   STATUS    NODE
+web-57c75d6bbb-7m652   0/1     Pending   <none>
+web-57c75d6bbb-gn7s7   0/1     Pending   <none>
+web-57c75d6bbb-k67n4   1/1     Running   scheduling-worker3
+web-57c75d6bbb-nwc64   1/1     Running   scheduling-worker
+web-57c75d6bbb-xjl2m   0/1     Pending   <none>
+web-57c75d6bbb-xz9lt   1/1     Running   scheduling-worker2
+
+$ kubectl describe pod web-57c75d6bbb-7m652
+Events:
+  Warning  FailedScheduling  0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 node(s) didn't match pod topology spread constraints.
+```
+
+`kubectl explain pod.spec.topologySpreadConstraints.nodeTaintsPolicy` spells out why: **"If this value is nil, the behavior is equivalent to the `Ignore` policy"** — meaning the tainted, unschedulable control-plane Node still counts as a valid topology domain with **0** matching Pods by default. With one Pod already on each of the 3 workers (1-1-1) and the control-plane counted as a 4th domain at 0, placing a 4th Pod anywhere would make the skew `2 - 0 = 2`, over the `maxSkew: 1` limit — so nothing after the first 3 Pods can schedule, cluster-wide, forever. Setting `nodeTaintsPolicy: Honor` excludes Nodes the incoming Pod cannot tolerate from the domain count, which is what fixed it above.
+
+### `matchLabelKeys` during a rolling update, proven
+
+Trigger a rolling update (`maxUnavailable: 0, maxSurge: 1`) on the spread Deployment **without** `matchLabelKeys` and watch a surge Pod land where 2 pods of the *previous* generation already sit, because the constraint counts every generation together:
+
+```text
+$ kubectl set image deploy/rollout-demo web=nginx:1.27.2-alpine
+t+8s: rollout-demo-579bddcff9-2cpvt  Running  scheduling-worker  (old gen 579bddcff9)
+t+8s: rollout-demo-579bddcff9-hmj2l  Running  scheduling-worker  (old gen 579bddcff9)
+t+8s: rollout-demo-676f6cdd75-2bdwb  Running  scheduling-worker  (NEW gen 676f6cdd75)
+```
+
+`scheduling-worker` now genuinely holds 3 Pods (2 old + 1 new) for a moment — still within `maxSkew: 1` overall (3 vs 2 vs 2), but the new generation's *own* distribution is uneven purely by coincidence of where old Pods happened to be. Add `matchLabelKeys: [pod-template-hash]` and repeat the same rollout: the constraint now counts each generation's Pods separately, so the first surge Pod of a brand-new generation always starts its *own* domain count at 0 everywhere — regardless of where the outgoing generation's Pods are:
+
+```text
+$ kubectl patch deploy rollout-demo --type=json -p='[{"op":"add","path":"/spec/template/spec/topologySpreadConstraints/0/matchLabelKeys","value":["pod-template-hash"]}]'
+$ kubectl set image deploy/rollout-demo web=nginx:1.27.3-alpine
+t+1s: rollout-demo-548b8ff4cb-djfk9  ContainerCreating  scheduling-worker   (NEW gen 548b8ff4cb, 1st of its generation)
+t+1s: rollout-demo-676f6cdd75-2bdwb  Running            scheduling-worker   (old gen 676f6cdd75)
+t+1s: rollout-demo-7b5cbfbdb7-bdd57  Running            scheduling-worker   (old gen 7b5cbfbdb7)
+```
+
+`matchLabelKeys` merges `pod-template-hash: 548b8ff4cb` into the effective `labelSelector` for that surge Pod's own admission, so its skew calculation only ever sees Pods of the *same* hash — never blocked, and never artificially concentrated, by whichever Node the outgoing generation happens to occupy.
 
 ## Taints and tolerations: a Node repelling Pods
 
@@ -139,15 +259,122 @@ spec:
 
 A toleration only cancels out a taint — it does not attract the Pod there. That is why a dedicated GPU node pool is usually built from both mechanisms at once: the Nodes are tainted so ordinary Pods stay off them, and the GPU workload's Pods both tolerate that taint and use `nodeSelector` (or node affinity) to request scheduling there, along with a GPU resource request.
 
-<Mermaid title="A taint repels an ordinary Pod while a Pod with a matching toleration is allowed through" code={taintRepelDiagram} />
+### `NoExecute` with `tolerationSeconds`, timed for real
+
+`tolerationSeconds` lets a Pod tolerate a `NoExecute` taint, but only for a bounded grace period before it is evicted anyway — useful for "ride out a short node problem, but leave if it persists":
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tolerates-briefly
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: scheduling-worker3
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: batch
+      effect: NoExecute
+      tolerationSeconds: 10
+  containers:
+    - name: c
+      image: registry.k8s.io/pause:3.10
+```
+
+```text
+$ kubectl taint nodes scheduling-worker3 dedicated=batch:NoExecute
+$ kubectl apply -f toleration-seconds-pod.yaml   # created 16:43:07, taint already present
+16:43:07  Running
+16:43:16  Running
+16:43:18  Succeeded   (deletionTimestamp set)
+16:43:19  Error from server (NotFound): pods "tolerates-briefly" not found
+```
+
+The Pod ran for roughly 10 seconds after the taint applied, then was evicted right on schedule — `tolerationSeconds` is a real, enforced clock, not a suggestion.
+
+### Built-in `node.kubernetes.io/*` taints
+
+Kubernetes applies several taints automatically, without any operator action — kind's control-plane Node carries one from the moment it is created:
+
+```text
+$ kubectl describe node scheduling-control-plane | grep Taints
+Taints:             node-role.kubernetes.io/control-plane:NoSchedule
+```
+
+The most operationally important built-in taints are `node.kubernetes.io/not-ready` and `node.kubernetes.io/unreachable` (both `NoExecute`, applied by the node controller the moment a Node's `Ready` condition goes false or the node controller loses contact with it) and `node.kubernetes.io/unschedulable` (`NoSchedule`, mirrors `kubectl cordon`). Every Pod tolerates `not-ready`/`unreachable` for `300s` by default (via a default `tolerationSeconds` the API server adds automatically) — which is exactly the mechanism behind "a Pod survives a brief node blip but is evicted if the Node stays down."
+
+<Mermaid title="A taint repels an ordinary Pod while a Pod with a matching toleration is allowed through, subject to tolerationSeconds" code={taintRepelDiagram} />
 
 export const taintRepelDiagram = `flowchart LR
   node["Node: gpu-node-1\\n(tainted hardware=gpu:NoSchedule)"]
   podA["Pod A: no toleration"] -- blocked --> node
-  podB["Pod B: tolerates hardware=gpu"] -- scheduled --> node`;
+  podB["Pod B: tolerates hardware=gpu"] -- scheduled --> node
+  node2["Node: tainted NoExecute + tolerationSeconds: 10"] --> podC["Pod C: tolerates for 10s, then evicted"]`;
+
+## Mental Model
+
+There are really only two directions in this lesson, and everything is one or the other. **Pulling**: `nodeSelector`, node affinity, pod affinity, and the preferred half of `topologySpreadConstraints` all describe what a Pod *wants* — a Node with a label, proximity to other Pods, an even spread — and a Pod that cannot get what it wants either stays `Pending` (`required`) or settles for second-best (`preferred`). **Pushing**: taints describe what a *Node* refuses, independent of any Pod's wishes, and only a matching toleration cancels that push — it never becomes a pull. `topologySpreadConstraints` sits in between: it counts Pods across a topology and its own `nodeTaintsPolicy` decides whether a taint (a push) also removes a Node from being counted as a spread target at all — proven above, getting that one field wrong silently changes "spread evenly" into "wedge forever."
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| `podAntiAffinity` `requiredDuringScheduling` | Absolute guarantee: never two matching Pods on one domain (proven above) | All-or-nothing — the (N+1)th replica stays Pending with no partial credit, proven above |
+| `topologySpreadConstraints` with `maxSkew` | Tunable "spread evenly, allow up to N difference" instead of all-or-nothing | Needs `nodeTaintsPolicy: Honor` on any cluster with tainted/not-yet-Ready Nodes, or it can silently wedge (proven above) |
+| `matchLabelKeys: [pod-template-hash]` on a spread constraint | Each rollout generation gets spread independently, not blocked or skewed by the outgoing generation (proven above) | Still a beta field (checked live: 1.37, enabled by default) — not yet a documented-stable guarantee |
+| `preferredDuringScheduling` (node or pod affinity) | Never blocks scheduling; the Pod always lands somewhere | No guarantee at all under contention — proven above, a soft preference can be silently skipped |
+| `tolerationSeconds` on a `NoExecute` toleration | Rides out a brief Node problem instead of an immediate evict | If set too long, a genuinely bad Node keeps the Pod past when it should have moved (proven above with a real timed eviction) |
+
+## Common Misconceptions
+
+- **"`topologySpreadConstraints` and `podAntiAffinity` are two syntaxes for the same guarantee."** Proven above: anti-affinity's `requiredDuringScheduling` is strictly one-per-domain (all-or-nothing), while spread's `maxSkew` allows a tunable difference and degrades gracefully with `ScheduleAnyway`.
+- **"A tainted or not-yet-Ready control-plane Node just gets ignored by scheduling features automatically."** Proven above: without `nodeTaintsPolicy: Honor`, a tainted Node still counts as a topology domain with 0 Pods, which can make `maxSkew` impossible to satisfy anywhere, cluster-wide.
+- **"`preferredDuringSchedulingIgnoredDuringExecution` will still evict a Pod if the preference stops being true later."** Both `required` and `preferred` end in `IgnoredDuringExecution` — proven in the API docs and by the fact that neither affinity type ever triggers an eviction on its own once a Pod is running.
+- **"A toleration attracts a Pod to the tainted Node, the same way affinity does."** Proven above: a toleration only cancels a taint's *repulsion* — the Pod still needs a `nodeSelector` or affinity rule to actually be drawn there.
+- **"`tolerationSeconds` is advisory, like a soft preference."** Proven above with real timestamps: the Pod is evicted right on schedule once the window elapses, not "eventually" or "if convenient."
+
+## Reading AI-generated code
+
+When reviewing a generated affinity, spread, or toleration block, check for:
+
+- `topologySpreadConstraints` with no `nodeTaintsPolicy` set, on any cluster that has a control-plane or cordoned Node — proven above, this can silently wedge scheduling past the first N Pods (N = number of untainted Nodes) with no obvious error pointing at the real cause.
+- `podAntiAffinity` `requiredDuringScheduling` used where the intent was really "spread evenly, but don't block on it" — proven above, `required` anti-affinity is all-or-nothing; `topologySpreadConstraints` with `whenUnsatisfiable: ScheduleAnyway` is the softer tool for that intent.
+- A rolling-update Deployment with `topologySpreadConstraints` but no `matchLabelKeys: [pod-template-hash]` — proven above, without it the spread constraint mixes generations together during a rollout, which is rarely the intent.
+- A `nodeSelector` or `tolerations` entry that references a label/taint key which no Node in the cluster actually has — this is a silent no-op: the toleration matches nothing, and the Pod schedules (or fails to) exactly as if it were absent, which is easy to mistake for "this is protecting against a taint" when it protects against nothing.
+- `tolerationSeconds` set on a taint the Pod was never actually meant to ride out (e.g. copied from an unrelated example) — proven above, it is a real enforced timer, so a wrong value either evicts too eagerly or leaves a Pod on a bad Node far longer than intended.
+- A GPU/dedicated-node toleration with no matching `nodeSelector`/affinity — the Pod merely stops being repelled, it is not drawn to the tainted Nodes, so it can land anywhere else in the cluster just as easily.
+
+<SpotTheBug code={`# k8s/node-affinity-taints-and-tolerations/web-spread.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: web
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10`}>
+This looks correct — a standard `maxSkew: 1` spread across hostnames — but it omits `nodeTaintsPolicy: Honor`. Proven above on a real 4-node cluster (1 control-plane + 3 workers): `kubectl explain` confirms the default is equivalent to `Ignore`, so the tainted, unschedulable control-plane Node is still counted as a valid topology domain sitting at 0 matching Pods. Once each of the 3 workers has 1 Pod, any further Pod would make the skew `2 - 0 = 2` against that phantom 4th domain — over `maxSkew: 1` — so exactly half the replicas (3 of 6) get stuck permanently `Pending` with `didn't match pod topology spread constraints`, cluster-wide, with no quota or resource shortage anywhere. The fix is one line: `nodeTaintsPolicy: Honor`, which excludes Nodes this Pod cannot tolerate from the domain count, restoring the intended 2-2-2 spread.
+</SpotTheBug>
 
 <Callout title="The one-line takeaway">
-**Node affinity** pulls a Pod toward Nodes, hard with **`requiredDuringSchedulingIgnoredDuringExecution`** or soft with **`preferredDuringSchedulingIgnoredDuringExecution`**; **pod affinity/anti-affinity** does the same relative to other Pods, commonly to spread replicas apart. A **taint** on a Node works the opposite direction — it **repels** Pods unless they carry a matching **toleration**, with effects **`NoSchedule`**, **`PreferNoSchedule`**, and **`NoExecute`** (which also evicts Pods already running there). Dedicated node pools usually combine both: a taint keeps ordinary Pods off, and affinity plus a toleration pulls the right Pods on.
+**Node affinity** pulls a Pod toward Nodes, hard with **`requiredDuringSchedulingIgnoredDuringExecution`** or soft with **`preferredDuringSchedulingIgnoredDuringExecution`** (proven above, a soft preference reliably steers placement without blocking); **pod affinity/anti-affinity** does the same relative to other Pods, but `required` anti-affinity is strictly all-or-nothing (proven above, replica 4 of 4 stuck Pending on 3 Nodes). **`topologySpreadConstraints`** is the tunable alternative — `maxSkew`/`topologyKey`/`whenUnsatisfiable` — but its still-beta **`matchLabelKeys`** matters during rollouts (proven above, it keeps each generation's spread independent) and its **`nodeTaintsPolicy`** defaults to counting tainted Nodes as empty domains, which can silently wedge scheduling cluster-wide (proven above) unless set to **`Honor`**. A **taint** on a Node works the opposite direction — it **repels** Pods unless they carry a matching **toleration**, with effects **`NoSchedule`**, **`PreferNoSchedule`**, and **`NoExecute`** (which evicts running Pods on a real, enforced **`tolerationSeconds`** clock, proven above) — plus built-in `node.kubernetes.io/*` taints the cluster applies automatically.
 </Callout>
 
 export const quizAffinity = [
@@ -160,6 +387,7 @@ export const quizAffinity = [
       'Preferred is stricter than required',
     ],
     answer: 1,
+    explain: 'Proven above: a Pod with only a preferred rule landed on the preferred Node every time out of three candidates, but a required rule with no match anywhere leaves the Pod Pending.',
   },
   {
     q: 'A Node has a taint with effect NoExecute. What happens to a Pod already running on that Node without a matching toleration?',
@@ -170,6 +398,7 @@ export const quizAffinity = [
       'The taint is ignored for already-running Pods permanently',
     ],
     answer: 1,
+    explain: 'NoExecute evicts already-running Pods that lack a matching toleration, unlike NoSchedule which only blocks new ones.',
   },
   {
     q: 'What is the key directional difference between affinity and taint/toleration?',
@@ -180,16 +409,51 @@ export const quizAffinity = [
       'Taints pull Pods in, affinity repels them',
     ],
     answer: 1,
+    explain: 'Affinity is the Pod expressing a preference toward something; a taint is the Node repelling everything except an explicit toleration -- a toleration cancels the repulsion, it does not create a pull.',
   },
   {
-    q: 'What does podAntiAffinity with topologyKey: kubernetes.io/hostname typically achieve for a Deployment?',
+    q: '```text\n$ kubectl describe pod web-anti-6476995565-glvpv\nWarning  FailedScheduling  0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 node(s) didn\'t match pod anti-affinity rules.\n```\nThis is the 4th replica of a Deployment using podAntiAffinity requiredDuringScheduling on a 3-worker cluster. Why is it stuck Pending, and what would fix it?',
     options: [
-      'It forces all replicas onto a single Node',
-      'It spreads replicas across different Nodes so one Node failure does not take down more than one replica',
-      'It deletes duplicate Pods automatically',
-      'It disables scheduling for the Deployment entirely',
+      'It is a transient error that will resolve on retry',
+      'requiredDuringScheduling anti-affinity is all-or-nothing (one per Node); topologySpreadConstraints with maxSkew would allow more than one per Node instead',
+      'The image failed to pull',
+      'The Deployment selector is misconfigured',
     ],
     answer: 1,
+    explain: 'Proven above: with only 3 Nodes and a hard one-per-hostname anti-affinity rule, a 4th replica has nowhere left to go -- topologySpreadConstraints expresses a tunable skew instead of this strict ceiling.',
+  },
+  {
+    q: '```yaml\ntopologySpreadConstraints:\n  - maxSkew: 1\n    topologyKey: kubernetes.io/hostname\n    whenUnsatisfiable: DoNotSchedule\n    labelSelector:\n      matchLabels: { app: web }\n```\nOn a cluster with a tainted control-plane Node, this spreads 6 replicas across 3 workers -- but half get stuck Pending. What is missing?',
+    options: [
+      'maxSkew should be set to 3',
+      'nodeTaintsPolicy: Honor -- without it, the tainted Node still counts as an empty topology domain, making the skew impossible to satisfy past the first 3 Pods',
+      'The labelSelector is wrong',
+      'whenUnsatisfiable should be ScheduleAnyway',
+    ],
+    answer: 1,
+    explain: 'Proven above with kubectl explain: nodeTaintsPolicy defaults to behaving like Ignore, so a tainted Node the Pod cannot tolerate still counts as a 0-Pod domain, making any further placement violate maxSkew: 1.',
+  },
+  {
+    q: 'Why does adding matchLabelKeys: [pod-template-hash] to a topologySpreadConstraints matter during a rolling update?',
+    options: [
+      'It has no effect during rollouts',
+      'It scopes the skew calculation to Pods of the same ReplicaSet generation, so a new rollout\'s spread is not blocked or skewed by where the outgoing generation\'s Pods happen to sit',
+      'It disables topology spread entirely during rollouts',
+      'It forces all generations onto the same Node',
+    ],
+    answer: 1,
+    explain: 'Proven above: without it, a surge Pod during a rollout can land on a Node that already has old-generation Pods, counted together; with it, each generation is spread independently from a fresh count of 0.',
+  },
+  {
+    q: 'A Pod has tolerationSeconds: 10 on a NoExecute toleration, and the matching taint is applied to its Node. What actually happens?',
+    options: [
+      'The Pod tolerates the taint forever once applied',
+      'The Pod is evicted almost immediately, tolerationSeconds is ignored for NoExecute',
+      'The Pod keeps running for approximately 10 seconds after the taint is observed, then is evicted -- a real, enforced timer',
+      'The taint is removed automatically after 10 seconds',
+    ],
+    answer: 2,
+    explain: 'Proven above with real timestamps: the Pod ran for roughly the configured window, then transitioned to Succeeded/deleted right on schedule.',
   },
 ];
 

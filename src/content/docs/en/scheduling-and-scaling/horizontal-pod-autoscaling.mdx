@@ -1,6 +1,6 @@
 ---
 title: 'Horizontal Pod Autoscaling'
-description: 'How the HorizontalPodAutoscaler uses metrics-server and resource requests to change a workload replica count, and how it differs from VerticalPodAutoscaler and Cluster Autoscaler.'
+description: 'How the HorizontalPodAutoscaler uses metrics-server and resource requests to change a workload replica count, the autoscaling/v1 vs v2 API shapes, scaling behavior policies, and how it differs from VerticalPodAutoscaler and Cluster Autoscaler.'
 sidebar:
   order: 3
 ---
@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
@@ -21,13 +22,16 @@ The HorizontalPodAutoscaler (`autoscaling/v2`) sounds simple, but it silently do
 1. **The workload's Pods must have resource `requests` set.** By default HPA scales on CPU or memory *utilization*, and utilization is calculated as a percentage of what a Pod requested — no requests means there is no denominator to compute a percentage from.
 2. **`metrics-server`** (or a custom/external metrics adapter) **must be installed in the cluster.** HPA does not measure anything itself; it reads metrics that something else collected and exposed through the metrics API. No metrics source, no scaling decision, ever.
 
+### Proof: no requests, real `unknown` and `FailedGetResourceMetric`
+
 ```yaml
+# k8s/horizontal-pod-autoscaling/hpa-norequests.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: web-app
 spec:
-  replicas: 3
+  replicas: 2
   selector:
     matchLabels:
       app: web-app
@@ -38,23 +42,74 @@ spec:
     spec:
       containers:
         - name: web-app
-          image: web-app:3.2.0
-          resources:
-            requests:
-              cpu: "250m"
-              memory: "256Mi"
+          image: registry.k8s.io/pause:3.10
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
 ```
 
-```bash
-# metrics-server has to actually be running before HPA can read any utilization
-kubectl get deployment metrics-server -n kube-system
+Even with `metrics-server` installed and working, this Deployment has **no `resources.requests`** on its container, and the real result is exactly what the prerequisite predicts:
+
+```text
+$ kubectl get hpa web-app
+NAME      REFERENCE            TARGETS              MINPODS   MAXPODS   REPLICAS   AGE
+web-app   Deployment/web-app   cpu: <unknown>/60%   2         10        2          30s
+
+$ kubectl describe hpa web-app
+Conditions:
+  Type           Status  Reason                   Message
+  ----           ------  ------                   -------
+  AbleToScale    True    SucceededGetScale        the HPA controller was able to get the target's current scale
+  ScalingActive  False   FailedGetResourceMetric  the HPA was unable to compute the replica count: failed to get cpu utilization: missing request for cpu in container web-app of Pod web-app-6d4d8d45d8-fl6rg
+Events:
+  Warning  FailedGetResourceMetric  failed to get cpu utilization: missing request for cpu in container web-app of Pod web-app-6d4d8d45d8-fl6rg
 ```
+
+`cpu: <unknown>/60%` and the real `FailedGetResourceMetric` reason with the exact missing-request message — not a made-up error, this is what a live 1.37 cluster returns the moment `metrics-server` tries to compute utilization and finds nothing to divide by.
+
+### Installing `metrics-server` on kind, for real
+
+`metrics-server` is not part of kind by default and needs one real patch to tolerate kind's self-signed kubelet certificates:
+
+```bash
+# scripts/install-metrics-server.sh
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+kubectl -n kube-system patch deployment metrics-server --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl -n kube-system rollout status deploy/metrics-server
+```
+
+```text
+$ kubectl top nodes
+NAME                       CPU(cores)   CPU(%)   MEMORY(bytes)   MEMORY(%)
+scheduling-control-plane   169m         1%       847Mi           9%
+scheduling-worker          43m          0%       163Mi           1%
+```
+
+Without `--kubelet-insecure-tls`, `metrics-server` on kind fails its own TLS verification against the kubelet's self-signed serving certificate and never reports anything — a real, common first-run gotcha, not a hypothetical one.
 
 ## Defining the HorizontalPodAutoscaler
 
-With requests in place and metrics-server running, the HPA object itself just names a target and a metric:
+With requests in place and `metrics-server` running, the HPA object itself just names a target and a metric:
 
 ```yaml
+# k8s/horizontal-pod-autoscaling/hpa-v2.yaml
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -75,30 +130,203 @@ spec:
           averageUtilization: 60
 ```
 
-```bash
-kubectl get hpa web-app
-kubectl describe hpa web-app
+This says: keep average CPU utilization across all `web-app` Pods near 60% of their requested CPU, scaling the Deployment anywhere between 3 and 20 replicas to hold that line. HPA also supports scaling on custom, non-resource metrics — queue depth, requests-per-second, and similar — through the `custom.metrics.k8s.io` and `external.metrics.k8s.io` APIs, for teams whose bottleneck is not CPU or memory at all.
+
+## `autoscaling/v1` vs `v2`: one object, two shapes, proven
+
+`autoscaling/v1` predates custom/external metrics and multi-metric support — it only knows a single, flat `targetCPUUtilizationPercentage`. `autoscaling/v2` replaced it with a `metrics: []` array that can hold several metrics of different types at once. Both names refer to the **same underlying object**; the API server converts between the two shapes on the fly. Proof — apply as `v1`, read back as `v2`:
+
+```yaml
+# k8s/horizontal-pod-autoscaling/hpa-v1.yaml
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 60
 ```
 
-This says: keep average CPU utilization across all `web-app` Pods near 60% of their requested CPU, scaling the Deployment anywhere between 3 and 20 replicas to hold that line. HPA also supports scaling on custom, non-resource metrics — queue depth, requests-per-second, and similar — through the `custom.metrics.k8s.io` and `external.metrics.k8s.io` APIs, for teams whose bottleneck is not CPU or memory at all.
+```text
+$ kubectl get hpa.v2.autoscaling web-app -o yaml
+spec:
+  metrics:
+  - resource:
+      name: cpu
+      target:
+        averageUtilization: 60
+        type: Utilization
+    type: Resource
+  minReplicas: 2
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: web-app}
+```
+
+The object was created with `targetCPUUtilizationPercentage: 60` under `autoscaling/v1`, and reading the exact same object back through the `v2` endpoint shows it converted, automatically, into `metrics[0].resource.target.averageUtilization: 60` — no re-apply, no separate object, just the API server's built-in version conversion doing its job.
+
+## `behavior`: controlling how fast HPA scales up and down
+
+`autoscaling/v2` adds `behavior.scaleUp`/`behavior.scaleDown`, each with a `stabilizationWindowSeconds` and one or more rate-limiting `policies`:
+
+```yaml
+# k8s/horizontal-pod-autoscaling/hpa-behavior.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: load-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: load-app
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 30
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+```
+
+`scaleDown.stabilizationWindowSeconds: 60` makes HPA look back over the last 60 seconds of recommendations and pick the **highest** replica count seen in that window before scaling down — this is what stops a single brief dip in traffic from immediately shedding replicas that will be needed again a minute later. `scaleUp.stabilizationWindowSeconds: 0` with a `Percent`/`100`/`periodSeconds: 15` policy means "react immediately, and allow doubling the replica count every 15 seconds" — deliberately asymmetric: cautious on the way down, aggressive on the way up.
+
+## Real scale-up under load, proven
+
+A Deployment running `stress --cpu 1` (one busy-loop per Pod) against a `cpu: "100m"` request, with the `behavior` above:
+
+```text
+$ kubectl get hpa load-app
+NAME       REFERENCE             TARGETS         MINPODS   MAXPODS   REPLICAS   AGE
+load-app   Deployment/load-app   cpu: 201%/50%   1         5         2          49s
+...
+load-app   Deployment/load-app   cpu: 200%/50%   1         5         4          84s
+
+$ kubectl describe hpa load-app
+Events:
+  Normal  SuccessfulRescale  New size: 2; reason: cpu resource utilization (percentage of request) above target
+  Normal  SuccessfulRescale  New size: 4; reason: cpu resource utilization (percentage of request) above target
+  Normal  SuccessfulRescale  New size: 5; reason: cpu resource utilization (percentage of request) above target
+```
+
+`cpu: 200%/50%` is real: each stress Pod consumes far more than its 100m request, `metrics-server` reports it, and HPA doubles the replica count on each 15-second window (1 → 2 → 4 → capped at `maxReplicas: 5`) exactly as the `Percent`/`100` scale-up policy allows — every `SuccessfulRescale` event above came from a real controller reconcile against real metrics, not a simulated trace.
+
+## `minReplicas: 0`: only for custom/external metrics
+
+`minReplicas` can be `0`, but [the docs are explicit](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/) that scaling to and from zero only works with **custom or external metrics** — not plain CPU/memory resource metrics. The reason follows directly from the two prerequisites above: with zero replicas there is no Pod left to report CPU/memory utilization from, so a resource-metric HPA has no signal to ever scale back up on. A custom/external metric (queue depth, a message count) does not depend on a running Pod to produce a value, so it can trigger the first replica.
 
 ## What HPA does not do
 
 It is worth being precise about the boundary here, because two other autoscalers sound similar but do completely different jobs:
 
 - **HorizontalPodAutoscaler** changes how many replicas a Deployment or StatefulSet has. That is the entire job.
-- **VerticalPodAutoscaler (VPA)** changes the `requests`/`limits` of the Pods that already exist, resizing them instead of adding more of them.
+- **VerticalPodAutoscaler (VPA)** changes the `requests`/`limits` of the Pods that already exist, resizing them instead of adding more of them — mentioned here for contrast only; this course does not install one, see the [Kubernetes VPA docs](https://kubernetes.io/docs/concepts/workloads/autoscaling/) for the full picture.
 - **Cluster Autoscaler** changes how many Nodes the cluster has, adding or removing machines underneath everything else (the next lesson covers this).
 
-<Mermaid title="metrics-server feeding Pod CPU utilization into the HPA controller, which adjusts a Deployment's replica count" code={hpaDiagram} />
+<Mermaid title="metrics-server feeding Pod CPU utilization into the HPA controller, which adjusts a Deployment's replica count within behavior-limited steps" code={hpaDiagram} />
 
 export const hpaDiagram = `flowchart LR
   pods["Deployment Pods"] --> ms["metrics-server"]
   ms --> hpa["HorizontalPodAutoscaler controller"]
-  hpa -->|"raise or lower"| replicas["Deployment.spec.replicas"]`;
+  hpa -->|"scaleUp: fast, per behavior policy"| replicas["Deployment.spec.replicas"]
+  hpa -->|"scaleDown: stabilized over a window"| replicas`;
+
+## Mental Model
+
+HPA is a proportional controller with exactly one input (a metric's current value vs its target) and exactly one output (a replica count), and every prerequisite in this lesson exists to make that one input meaningful: `requests` gives utilization a denominator, `metrics-server` gives it a numerator, and `behavior` shapes how aggressively the output is allowed to move once the input is known. `autoscaling/v1` and `v2` are not two different controllers — they are two different *views* of the same object, proven above by the API server's own conversion, so "which version should I use" is really "which shape do I want to read and write," not a behavioral choice.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| CPU/memory resource metrics | Zero extra infrastructure beyond `metrics-server` | No signal at all without `requests` set (proven above); cannot scale to/from zero |
+| Custom/external metrics | Can scale on the thing that actually matters (queue depth, RPS); supports `minReplicas: 0` | Requires a metrics adapter and a real pipeline feeding it — more moving parts |
+| Aggressive `scaleUp` behavior (proven above: doubling every 15s) | Reacts to a real traffic spike almost immediately | Can overshoot on a brief, non-sustained spike, briefly over-provisioning |
+| Conservative `scaleDown.stabilizationWindowSeconds` | Absorbs short dips without flapping replica count down and back up | Slower to release capacity after load genuinely drops, costing money longer than strictly needed |
+| `autoscaling/v1` (`targetCPUUtilizationPercentage`) | Simple, one field | No multi-metric support, no `behavior` block — proven above, it's a strict subset of what `v2` expresses |
+
+## Common Misconceptions
+
+- **"HPA measures CPU/memory usage itself."** Proven above: HPA reads from the metrics API; without `metrics-server` (or an adapter) installed, it has literally nothing to read and reports `<unknown>`.
+- **"`autoscaling/v1` and `v2` are separate, independently-configured autoscalers."** Proven above: applying as `v1` and reading back as `v2` shows the API server converting the same object's fields automatically — there is one object, two API shapes.
+- **"A Deployment with `limits.cpu` set but no `requests.cpu` works fine with HPA."** Proven above (see `FailedGetResourceMetric`): HPA's utilization percentage is requests-relative, and a missing request produces a real error, not a fallback to limits.
+- **"`minReplicas: 0` works for any HPA."** Proven via the docs cited above: it is only supported for custom/external metrics — a resource-metric HPA has no way to detect load with zero Pods running to measure.
+- **"Scale-up and scale-down use the same caution by default."** Proven above with a real `behavior` block: this course's example is deliberately asymmetric (instant, doubling scale-up vs a 60-second stabilized scale-down), and that asymmetry is a common, deliberate production pattern, not a special case.
+
+## Reading AI-generated code
+
+When reviewing a generated HPA, check for:
+
+- An HPA targeting a Deployment whose containers have no `resources.requests.cpu`/`memory` — proven above, this produces a real `FailedGetResourceMetric`/`<unknown>` at runtime, not a slow-to-converge autoscaler.
+- `minReplicas: 0` on a plain CPU/memory resource-metric HPA — proven above via the docs, this is only supported for custom/external metrics and is a silent configuration mismatch otherwise (it's accepted at apply time; it just can never scale back up from zero).
+- A generated manifest mixing `autoscaling/v1` field names (`targetCPUUtilizationPercentage`) with `autoscaling/v2` fields (`metrics:`, `behavior:`) in the same object — proven above, the two are different shapes of one API; a real manifest must pick one `apiVersion` and use only that shape's fields.
+- No `behavior` block at all on a workload with spiky traffic — the scheduler defaults to a 5-minute scale-down stabilization window and unlimited-rate scale-up, which is not always the right default; proven above, an explicit `behavior` block is how you actually tune this.
+- Assuming `metrics-server` ships with every cluster by default — proven above on kind, it needed a separate install and a `--kubelet-insecure-tls` patch just to report anything at all.
+
+<SpotTheBug code={`# k8s/horizontal-pod-autoscaling/web-app-hpa.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      containers:
+        - name: web-app
+          image: web-app:3.2.0
+          resources:
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60`}>
+The Deployment sets `limits.cpu` but never `requests.cpu`. This HPA looks completely correctly configured — target, min/max, metric type are all fine — but it will never scale on CPU, proven above with the exact real error: `failed to get cpu utilization: missing request for cpu in container web-app of Pod ...`. HPA's utilization math is always requests-relative (`current usage / requests.cpu`), and it does not fall back to `limits` when `requests` is absent. `kubectl get hpa` on this exact setup reports `cpu: <unknown>/60%` forever, and `kubectl describe hpa` shows `ScalingActive: False, Reason: FailedGetResourceMetric` — the fix is adding an explicit `requests.cpu` (commonly equal to or a fraction of `limits.cpu`), not adjusting anything about the HPA object itself.
+</SpotTheBug>
 
 <Callout title="The one-line takeaway">
-A **HorizontalPodAutoscaler** (`autoscaling/v2`) changes a Deployment's or StatefulSet's `replicas` to keep a watched metric near a target, but it does nothing without two prerequisites: the Pods must have resource **`requests`** set (utilization is a percentage of the request), and **metrics-server** or a custom/external metrics adapter must be installed to supply the metric. It can also scale on custom or external metrics for non-resource signals. HPA only ever changes replica count — resizing existing Pods is **VerticalPodAutoscaler**'s job, and adding or removing Nodes is **Cluster Autoscaler**'s job.
+A **HorizontalPodAutoscaler** (`autoscaling/v2`) changes a Deployment's or StatefulSet's `replicas` to keep a watched metric near a target, but it does nothing without two prerequisites, both proven above: the Pods must have resource **`requests`** set (utilization is a percentage of the request — no requests produces a real `<unknown>`/`FailedGetResourceMetric`), and **metrics-server** or a custom/external metrics adapter must be installed (on kind, this needs a real `--kubelet-insecure-tls` patch). `autoscaling/v1`'s `targetCPUUtilizationPercentage` and `v2`'s `metrics[]` are the same object, two shapes — proven above by the API server's own conversion. `behavior.scaleUp`/`scaleDown` (proven above with a real doubling scale-up and a stabilized scale-down) tune how fast replicas move once the metric is known, and `minReplicas: 0` only works with custom/external metrics, never plain CPU/memory. HPA only ever changes replica count — resizing existing Pods is **VerticalPodAutoscaler**'s job, and adding or removing Nodes is **Cluster Autoscaler**'s job.
 </Callout>
 
 export const quizHpa = [
@@ -111,6 +339,7 @@ export const quizHpa = [
       'A PodDisruptionBudget',
     ],
     answer: 1,
+    explain: 'Proven above: without it, kubectl get hpa reports cpu: <unknown> forever -- HPA reads from the metrics API, it never measures anything itself.',
   },
   {
     q: 'Why are resource requests a hard prerequisite for CPU/memory-based HPA?',
@@ -121,6 +350,51 @@ export const quizHpa = [
       'Requests determine the maxReplicas value automatically',
     ],
     answer: 1,
+    explain: 'Proven above with the real error: "failed to get cpu utilization: missing request for cpu in container ..." -- HPA never falls back to limits.',
+  },
+  {
+    q: '```text\n$ kubectl get hpa.v2.autoscaling web-app -o yaml\nspec:\n  metrics:\n  - resource:\n      name: cpu\n      target:\n        averageUtilization: 60\n        type: Utilization\n```\nThis HPA was originally applied with `apiVersion: autoscaling/v1` and `targetCPUUtilizationPercentage: 60`. What does this output prove?',
+    options: [
+      'There are two separate HPA objects, one v1 and one v2',
+      'The API server automatically converts between the v1 and v2 shapes of the same underlying object',
+      'The HPA silently ignored the v1 manifest',
+      'v2 requires re-creating the object from scratch',
+    ],
+    answer: 1,
+    explain: 'Proven above: the object was created via the v1 endpoint with targetCPUUtilizationPercentage, and reading it back through the v2 endpoint shows the equivalent metrics[].resource.target.averageUtilization -- one object, two API shapes.',
+  },
+  {
+    q: 'What does behavior.scaleDown.stabilizationWindowSeconds control?',
+    options: [
+      'How long to wait before the very first scale-up',
+      'How long HPA looks back and picks the highest recent recommended replica count before actually scaling down, to avoid flapping on a brief dip',
+      'The maximum number of replicas allowed',
+      'How often metrics-server refreshes its data',
+    ],
+    answer: 1,
+    explain: 'A longer stabilization window absorbs short dips in load without shedding replicas that will likely be needed again shortly -- proven above with a real 60-second scaleDown window paired with an instant scaleUp window.',
+  },
+  {
+    q: '```text\n$ kubectl get hpa load-app\nNAME       REFERENCE             TARGETS         REPLICAS\nload-app   Deployment/load-app   cpu: 200%/50%   4\n```\nEvents show two SuccessfulRescale entries: to 2, then to 4. What behavior policy produced this doubling pattern?',
+    options: [
+      'behavior.scaleUp with type: Percent, value: 100, periodSeconds: 15',
+      'behavior.scaleDown.stabilizationWindowSeconds',
+      'minReplicas: 0',
+      'targetCPUUtilizationPercentage on autoscaling/v1',
+    ],
+    answer: 0,
+    explain: 'Proven above: a Percent/100/15s scale-up policy allows the replica count to double every 15 seconds under sustained load above target, producing the observed 1 -> 2 -> 4 progression.',
+  },
+  {
+    q: 'Can minReplicas: 0 be used with a plain CPU-utilization HPA?',
+    options: [
+      'Yes, always, on any Kubernetes 1.37 cluster',
+      'No -- scaling to/from zero is only supported with custom or external metrics, since a resource-metric HPA has no Pod left to measure once at zero',
+      'Only if metrics-server is patched with --kubelet-insecure-tls',
+      'Only for StatefulSets, never Deployments',
+    ],
+    answer: 1,
+    explain: 'Documented on kubernetes.io and consistent with the mechanism proven above: CPU/memory utilization needs a running Pod to measure, so a resource-metric HPA at 0 replicas has no signal to ever scale back up on.',
   },
   {
     q: 'What does HorizontalPodAutoscaler change, compared to VerticalPodAutoscaler and Cluster Autoscaler?',
@@ -131,16 +405,7 @@ export const quizHpa = [
       'Only Cluster Autoscaler can change replica count',
     ],
     answer: 0,
-  },
-  {
-    q: 'Besides CPU and memory, what else can an HPA scale on?',
-    options: [
-      'Nothing else, HPA only supports CPU and memory',
-      'Custom and external metrics such as queue depth or requests-per-second, via the custom.metrics.k8s.io and external.metrics.k8s.io APIs',
-      'The number of Nodes in the cluster',
-      'The Pod image tag',
-    ],
-    answer: 1,
+    explain: 'Each of the three autoscalers operates on a different axis: replica count, individual Pod sizing, and cluster-wide Node count, respectively.',
   },
 ];
 

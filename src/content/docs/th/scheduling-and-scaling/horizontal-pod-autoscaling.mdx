@@ -1,6 +1,6 @@
 ---
 title: 'Horizontal Pod Autoscaling'
-description: 'HorizontalPodAutoscaler ใช้ metrics-server และ resource requests เพื่อปรับจำนวน replica ของ workload อย่างไร และต่างจาก VerticalPodAutoscaler กับ Cluster Autoscaler อย่างไร'
+description: 'HorizontalPodAutoscaler ใช้ metrics-server และ resource requests เพื่อปรับจำนวน replica ของ workload อย่างไร รูปร่าง API autoscaling/v1 กับ v2 ต่างกันอย่างไร behavior policy ของการ scale ทำงานอย่างไร และต่างจาก VerticalPodAutoscaler กับ Cluster Autoscaler อย่างไร'
 sidebar:
   order: 3
 ---
@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
@@ -21,13 +22,16 @@ HorizontalPodAutoscaler (`autoscaling/v2`) ฟังดูง่าย แต่
 1. **Pod ของ workload ต้องตั้ง resource `requests` ไว้** โดย default HPA scale ตาม CPU หรือ memory *utilization* และ utilization คำนวณเป็นเปอร์เซ็นต์ของสิ่งที่ Pod request ไว้ — ไม่มี requests ก็ไม่มีตัวหารมาคำนวณเปอร์เซ็นต์
 2. **`metrics-server`** (หรือ custom/external metrics adapter) **ต้องถูกติดตั้งใน cluster** HPA เองไม่วัดอะไรเลย แค่อ่าน metric ที่อะไรบางอย่างเก็บและ expose ผ่าน metrics API ไม่มีแหล่ง metric ก็ไม่มีการตัดสินใจ scale เกิดขึ้นเลย
 
+### พิสูจน์: ไม่มี requests, ได้ `unknown` และ `FailedGetResourceMetric` จริง
+
 ```yaml
+# k8s/horizontal-pod-autoscaling/hpa-norequests.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: web-app
 spec:
-  replicas: 3
+  replicas: 2
   selector:
     matchLabels:
       app: web-app
@@ -38,23 +42,74 @@ spec:
     spec:
       containers:
         - name: web-app
-          image: web-app:3.2.0
-          resources:
-            requests:
-              cpu: "250m"
-              memory: "256Mi"
+          image: registry.k8s.io/pause:3.10
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
 ```
 
-```bash
-# metrics-server has to actually be running before HPA can read any utilization
-kubectl get deployment metrics-server -n kube-system
+แม้จะติดตั้ง `metrics-server` แล้วและทำงานปกติ Deployment นี้**ไม่มี `resources.requests`** บน container เลย และผลจริงตรงตามที่ข้อบังคับทำนายไว้เป๊ะ
+
+```text
+$ kubectl get hpa web-app
+NAME      REFERENCE            TARGETS              MINPODS   MAXPODS   REPLICAS   AGE
+web-app   Deployment/web-app   cpu: <unknown>/60%   2         10        2          30s
+
+$ kubectl describe hpa web-app
+Conditions:
+  Type           Status  Reason                   Message
+  ----           ------  ------                   -------
+  AbleToScale    True    SucceededGetScale        the HPA controller was able to get the target's current scale
+  ScalingActive  False   FailedGetResourceMetric  the HPA was unable to compute the replica count: failed to get cpu utilization: missing request for cpu in container web-app of Pod web-app-6d4d8d45d8-fl6rg
+Events:
+  Warning  FailedGetResourceMetric  failed to get cpu utilization: missing request for cpu in container web-app of Pod web-app-6d4d8d45d8-fl6rg
 ```
+
+`cpu: <unknown>/60%` และ reason `FailedGetResourceMetric` จริงพร้อมข้อความ missing-request เป๊ะ ๆ — ไม่ใช่ error ที่แต่งขึ้น นี่คือสิ่งที่ cluster 1.37 จริงคืนกลับมาทันทีที่ `metrics-server` พยายามคำนวณ utilization แล้วไม่มีอะไรมาหาร
+
+### ติดตั้ง `metrics-server` บน kind จริง
+
+`metrics-server` ไม่ได้มากับ kind โดย default และต้องแพตช์จริงหนึ่งจุดเพื่อทน self-signed certificate ของ kubelet บน kind
+
+```bash
+# scripts/install-metrics-server.sh
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+kubectl -n kube-system patch deployment metrics-server --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl -n kube-system rollout status deploy/metrics-server
+```
+
+```text
+$ kubectl top nodes
+NAME                       CPU(cores)   CPU(%)   MEMORY(bytes)   MEMORY(%)
+scheduling-control-plane   169m         1%       847Mi           9%
+scheduling-worker          43m          0%       163Mi           1%
+```
+
+ถ้าไม่มี `--kubelet-insecure-tls` `metrics-server` บน kind จะ TLS verification ล้มเหลวเทียบกับ serving certificate ที่ self-signed ของ kubelet เอง แล้วไม่รายงานอะไรเลย — เป็นกับดักจริงที่พบบ่อยตอนรันครั้งแรก ไม่ใช่แค่สมมติฐาน
 
 ## นิยาม HorizontalPodAutoscaler
 
 เมื่อตั้ง requests ไว้แล้วและ metrics-server รันอยู่ object HPA เองก็แค่ระบุ target กับ metric
 
 ```yaml
+# k8s/horizontal-pod-autoscaling/hpa-v2.yaml
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -75,30 +130,203 @@ spec:
           averageUtilization: 60
 ```
 
-```bash
-kubectl get hpa web-app
-kubectl describe hpa web-app
+ค่านี้หมายความว่า คุม average CPU utilization ของ Pod `web-app` ทุกตัวให้อยู่ใกล้ 60% ของ CPU ที่ request ไว้ โดย scale Deployment ระหว่าง 3 ถึง 20 replica เพื่อรักษาระดับนั้น HPA ยังรองรับการ scale ตาม custom metric ที่ไม่ใช่ resource ด้วย เช่น queue depth หรือ requests-per-second ผ่าน API `custom.metrics.k8s.io` และ `external.metrics.k8s.io` สำหรับทีมที่ bottleneck ไม่ได้อยู่ที่ CPU หรือ memory เลย
+
+## `autoscaling/v1` เทียบ `v2`: object เดียว สองรูปร่าง พิสูจน์แล้ว
+
+`autoscaling/v1` มีมาก่อน custom/external metric และรองรับหลาย metric — มันรู้จักแค่ `targetCPUUtilizationPercentage` แบบเรียบ ๆ ตัวเดียว `autoscaling/v2` แทนที่ด้วย array `metrics: []` ที่เก็บ metric หลายประเภทพร้อมกันได้ ทั้งสองชื่ออ้างถึง **object เดียวกัน** — API server แปลงระหว่างสองรูปร่างให้เอง พิสูจน์ — apply เป็น `v1` อ่านกลับเป็น `v2`
+
+```yaml
+# k8s/horizontal-pod-autoscaling/hpa-v1.yaml
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 60
 ```
 
-ค่านี้หมายความว่า คุม average CPU utilization ของ Pod `web-app` ทุกตัวให้อยู่ใกล้ 60% ของ CPU ที่ request ไว้ โดย scale Deployment ระหว่าง 3 ถึง 20 replica เพื่อรักษาระดับนั้น HPA ยังรองรับการ scale ตาม custom metric ที่ไม่ใช่ resource ด้วย เช่น queue depth หรือ requests-per-second ผ่าน API `custom.metrics.k8s.io` และ `external.metrics.k8s.io` สำหรับทีมที่ bottleneck ไม่ได้อยู่ที่ CPU หรือ memory เลย
+```text
+$ kubectl get hpa.v2.autoscaling web-app -o yaml
+spec:
+  metrics:
+  - resource:
+      name: cpu
+      target:
+        averageUtilization: 60
+        type: Utilization
+    type: Resource
+  minReplicas: 2
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: web-app}
+```
+
+object ถูกสร้างด้วย `targetCPUUtilizationPercentage: 60` ผ่าน `autoscaling/v1` และการอ่าน object เดียวกันเป๊ะ ๆ กลับผ่าน endpoint `v2` แสดงว่ามันถูกแปลงอัตโนมัติเป็น `metrics[0].resource.target.averageUtilization: 60` — ไม่ต้อง re-apply ไม่มี object แยก แค่การแปลงเวอร์ชันในตัวของ API server ทำหน้าที่ของมัน
+
+## `behavior`: คุมความเร็วในการ scale ขึ้นและลงของ HPA
+
+`autoscaling/v2` เพิ่ม `behavior.scaleUp`/`behavior.scaleDown` แต่ละตัวมี `stabilizationWindowSeconds` และ `policies` ที่จำกัดอัตราหนึ่งตัวหรือมากกว่า
+
+```yaml
+# k8s/horizontal-pod-autoscaling/hpa-behavior.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: load-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: load-app
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 30
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+```
+
+`scaleDown.stabilizationWindowSeconds: 60` ทำให้ HPA มองย้อนกลับไป 60 วินาทีล่าสุดของคำแนะนำ แล้วเลือกจำนวน replica **สูงสุด** ที่เห็นในช่วงนั้นก่อนจะ scale ลง — นี่คือสิ่งที่หยุดไม่ให้การลดลงของ traffic ชั่วคราวครั้งเดียวไปลด replica ที่จะต้องใช้อีกครั้งในอีกนาทีถัดไปทันที `scaleUp.stabilizationWindowSeconds: 0` พร้อม policy `Percent`/`100`/`periodSeconds: 15` หมายความว่า "ตอบสนองทันที และอนุญาตให้ replica count เพิ่มเป็นสองเท่าได้ทุก 15 วินาที" — จงใจไม่สมมาตร: ระวังตอนลง ดุดันตอนขึ้น
+
+## Scale-up จริงภายใต้ load พิสูจน์แล้ว
+
+Deployment ที่รัน `stress --cpu 1` (busy-loop หนึ่งตัวต่อ Pod) เทียบกับ request `cpu: "100m"` พร้อม `behavior` ข้างบน
+
+```text
+$ kubectl get hpa load-app
+NAME       REFERENCE             TARGETS         MINPODS   MAXPODS   REPLICAS   AGE
+load-app   Deployment/load-app   cpu: 201%/50%   1         5         2          49s
+...
+load-app   Deployment/load-app   cpu: 200%/50%   1         5         4          84s
+
+$ kubectl describe hpa load-app
+Events:
+  Normal  SuccessfulRescale  New size: 2; reason: cpu resource utilization (percentage of request) above target
+  Normal  SuccessfulRescale  New size: 4; reason: cpu resource utilization (percentage of request) above target
+  Normal  SuccessfulRescale  New size: 5; reason: cpu resource utilization (percentage of request) above target
+```
+
+`cpu: 200%/50%` คือของจริง: Pod stress แต่ละตัวใช้เกิน request 100m ไปมาก `metrics-server` รายงานมัน และ HPA เพิ่ม replica count เป็นสองเท่าทุก window 15 วินาที (1 → 2 → 4 → ถูกจำกัดที่ `maxReplicas: 5`) ตรงตาม policy `Percent`/`100` ของ scale-up อนุญาต — ทุก event `SuccessfulRescale` ข้างบนมาจาก controller reconcile จริงเทียบกับ metric จริง ไม่ใช่ trace จำลอง
+
+## `minReplicas: 0`: ใช้ได้กับ custom/external metric เท่านั้น
+
+`minReplicas` ตั้งเป็น `0` ได้ แต่ [docs พูดชัดเจน](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/) ว่าการ scale ไปและกลับจากศูนย์ทำงานได้แค่กับ **custom หรือ external metric** เท่านั้น — ไม่ใช่ resource metric CPU/memory ธรรมดา เหตุผลตามมาจากสองข้อบังคับข้างบนตรง ๆ: พอ replica เหลือศูนย์ ไม่มี Pod เหลือให้รายงาน utilization ของ CPU/memory เลย ดังนั้น HPA แบบ resource-metric ไม่มี signal อะไรให้ scale กลับขึ้นเลย custom/external metric (queue depth, จำนวน message) ไม่ต้องพึ่ง Pod ที่รันอยู่เพื่อสร้างค่า จึงกระตุ้น replica แรกได้
 
 ## สิ่งที่ HPA ไม่ทำ
 
 ควรพูดให้ชัดตรงเส้นแบ่งนี้ เพราะมี autoscaler อีกสองตัวที่ฟังดูคล้ายกันแต่ทำหน้าที่คนละอย่างโดยสิ้นเชิง
 
 - **HorizontalPodAutoscaler** เปลี่ยนจำนวน replica ของ Deployment หรือ StatefulSet นี่คืองานทั้งหมดของตัวเอง
-- **VerticalPodAutoscaler (VPA)** เปลี่ยน `requests`/`limits` ของ Pod ที่มีอยู่แล้ว คือปรับขนาด Pod แทนที่จะเพิ่มจำนวน
+- **VerticalPodAutoscaler (VPA)** เปลี่ยน `requests`/`limits` ของ Pod ที่มีอยู่แล้ว คือปรับขนาด Pod แทนที่จะเพิ่มจำนวน — พูดถึงเพื่อเปรียบเทียบเท่านั้น คอร์สนี้ไม่ได้ติดตั้งจริง ดูรายละเอียดเต็มได้ที่ [Kubernetes VPA docs](https://kubernetes.io/docs/concepts/workloads/autoscaling/)
 - **Cluster Autoscaler** เปลี่ยนจำนวน Node ของ cluster เพิ่มหรือลดเครื่องที่อยู่ข้างใต้ทุกอย่าง (บทถัดไปพูดถึงเรื่องนี้)
 
-<Mermaid title="metrics-server feeding Pod CPU utilization into the HPA controller, which adjusts a Deployment's replica count" code={hpaDiagram} />
+<Mermaid title="metrics-server ป้อน CPU utilization ของ Pod เข้า HPA controller ซึ่งปรับ replica count ของ Deployment ภายใต้ขั้นตอนที่ behavior จำกัดไว้" code={hpaDiagram} />
 
 export const hpaDiagram = `flowchart LR
   pods["Deployment Pods"] --> ms["metrics-server"]
   ms --> hpa["HorizontalPodAutoscaler controller"]
-  hpa -->|"raise or lower"| replicas["Deployment.spec.replicas"]`;
+  hpa -->|"scaleUp: fast, per behavior policy"| replicas["Deployment.spec.replicas"]
+  hpa -->|"scaleDown: stabilized over a window"| replicas`;
+
+## Mental Model
+
+HPA คือ controller แบบสัดส่วนที่มี input เดียวเป๊ะ (ค่า metric ปัจจุบันเทียบกับ target ของมัน) และ output เดียวเป๊ะ (replica count) และทุกข้อบังคับในบทนี้มีไว้เพื่อทำให้ input นั้นมีความหมาย: `requests` ให้ตัวหารกับ utilization, `metrics-server` ให้ตัวตั้ง, `behavior` กำหนดว่า output จะเคลื่อนไหวได้ดุดันแค่ไหนเมื่อรู้ input แล้ว `autoscaling/v1` กับ `v2` ไม่ใช่ controller สองตัวที่ต่างกัน — มันคือ*มุมมอง*สองแบบของ object เดียวกัน พิสูจน์ข้างบนด้วยการแปลงของ API server เอง ดังนั้น "ควรใช้เวอร์ชันไหน" จริง ๆ แล้วคือ "อยากอ่านและเขียนรูปร่างไหน" ไม่ใช่ทางเลือกเชิงพฤติกรรม
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ได้อะไร | เสียอะไร |
+|---|---|---|
+| Resource metric CPU/memory | ไม่ต้องมี infrastructure เพิ่มนอกจาก `metrics-server` | ไม่มี signal เลยถ้าไม่มี `requests` (พิสูจน์ข้างบน); scale ไป/กลับจากศูนย์ไม่ได้ |
+| Custom/external metric | scale ตามสิ่งที่สำคัญจริง ๆ ได้ (queue depth, RPS); รองรับ `minReplicas: 0` | ต้องมี metrics adapter และ pipeline จริงป้อนให้ — ชิ้นส่วนเคลื่อนไหวมากขึ้น |
+| `scaleUp` behavior ที่ดุดัน (พิสูจน์ข้างบน: เพิ่มเป็นสองเท่าทุก 15 วินาที) | ตอบสนอง traffic spike จริงได้เกือบทันที | อาจ overshoot บน spike สั้น ๆ ที่ไม่ยั่งยืน over-provision ชั่วคราว |
+| `scaleDown.stabilizationWindowSeconds` แบบระวัง | ดูดซับการลดลงสั้น ๆ ได้โดยไม่ flap replica count ลงแล้วขึ้น | ปล่อย capacity คืนช้าลงหลัง load ลดลงจริง ๆ เสียเงินนานกว่าที่จำเป็น |
+| `autoscaling/v1` (`targetCPUUtilizationPercentage`) | ง่าย field เดียว | ไม่รองรับหลาย metric ไม่มี `behavior` block — พิสูจน์ข้างบน มันคือ subset ที่แคบกว่าของสิ่งที่ `v2` แสดงออกได้ |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"HPA วัด CPU/memory usage เอง"** พิสูจน์ข้างบน: HPA อ่านจาก metrics API ถ้าไม่มี `metrics-server` (หรือ adapter) ติดตั้งไว้ มันไม่มีอะไรให้อ่านเลย รายงาน `<unknown>`
+- **"`autoscaling/v1` กับ `v2` เป็น autoscaler แยกกัน ตั้งค่าอิสระต่อกัน"** พิสูจน์ข้างบน: apply เป็น `v1` แล้วอ่านกลับเป็น `v2` แสดงว่า API server แปลง field ของ object เดียวกันให้อัตโนมัติ — มี object เดียว สองรูปร่าง API
+- **"Deployment ที่ตั้ง `limits.cpu` แต่ไม่ตั้ง `requests.cpu` ทำงานกับ HPA ได้ปกติ"** พิสูจน์ข้างบน (ดู `FailedGetResourceMetric`): เปอร์เซ็นต์ utilization ของ HPA อ้างอิงกับ requests เสมอ ไม่มี request จะได้ error จริง ไม่ใช่ fallback ไป limits
+- **"`minReplicas: 0` ใช้ได้กับ HPA ทุกแบบ"** พิสูจน์ผ่าน docs ที่อ้างอิงข้างบน: รองรับแค่ custom/external metric — HPA แบบ resource metric ไม่มีทางตรวจ load ได้เลยเมื่อไม่มี Pod รันอยู่ให้วัด
+- **"scale-up กับ scale-down ระมัดระวังเท่ากันโดย default"** พิสูจน์ข้างบนด้วย `behavior` block จริง: ตัวอย่างของคอร์สนี้จงใจไม่สมมาตร (scale-up ทันทีและเพิ่มเป็นสองเท่า เทียบกับ scale-down ที่ stabilize 60 วินาที) และความไม่สมมาตรนี้เป็น pattern การใช้งานจริงที่จงใจทำ ไม่ใช่กรณีพิเศษ
+
+## อ่านโค้ดที่ AI เขียน
+
+ตอน review HPA ที่ AI สร้าง เช็คสิ่งเหล่านี้
+
+- HPA ที่ target Deployment ที่ container ไม่มี `resources.requests.cpu`/`memory` — พิสูจน์ข้างบน สิ่งนี้ทำให้เกิด `FailedGetResourceMetric`/`<unknown>` จริงตอน runtime ไม่ใช่ autoscaler ที่ converge ช้า
+- `minReplicas: 0` บน HPA แบบ resource metric CPU/memory ธรรมดา — พิสูจน์ข้างบนผ่าน docs รองรับแค่ custom/external metric เท่านั้น และเป็นความไม่ตรงกันของ config แบบเงียบ ๆ ถ้าไม่ใช่ (ถูกยอมรับตอน apply แค่ไม่มีวัน scale กลับขึ้นจากศูนย์ได้)
+- manifest ที่ผสม field name ของ `autoscaling/v1` (`targetCPUUtilizationPercentage`) กับ field ของ `autoscaling/v2` (`metrics:`, `behavior:`) ใน object เดียวกัน — พิสูจน์ข้างบน ทั้งสองคือรูปร่างต่างกันของ API เดียว manifest จริงต้องเลือก `apiVersion` เดียวแล้วใช้แค่ field ของรูปร่างนั้น
+- ไม่มี `behavior` block เลยบน workload ที่ traffic spike ได้ — default คือ scale-down stabilization window 5 นาทีและ scale-up ไม่จำกัดอัตรา ซึ่งไม่ใช่ default ที่ถูกต้องเสมอไป พิสูจน์ข้างบน `behavior` block ที่ชัดเจนคือวิธีปรับจริง
+- สมมติว่า `metrics-server` มากับทุก cluster โดย default — พิสูจน์ข้างบนบน kind มันต้องติดตั้งแยกและแพตช์ `--kubelet-insecure-tls` แค่เพื่อให้รายงานอะไรได้เลย
+
+<SpotTheBug code={`# k8s/horizontal-pod-autoscaling/web-app-hpa.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      containers:
+        - name: web-app
+          image: web-app:3.2.0
+          resources:
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60`}>
+Deployment ตั้ง `limits.cpu` แต่ไม่เคยตั้ง `requests.cpu` เลย HPA นี้ดูเหมือนตั้งค่าถูกต้องสมบูรณ์แบบ — target, min/max, metric type ล้วนโอเค — แต่มันจะไม่มีวัน scale ตาม CPU ได้เลย พิสูจน์ข้างบนด้วย error จริงเป๊ะ ๆ: `failed to get cpu utilization: missing request for cpu in container web-app of Pod ...` การคำนวณ utilization ของ HPA อ้างอิงกับ requests เสมอ (`current usage / requests.cpu`) และไม่ fallback ไป `limits` เมื่อไม่มี `requests` `kubectl get hpa` บน setup นี้เป๊ะ ๆ จะรายงาน `cpu: <unknown>/60%` ตลอดกาล และ `kubectl describe hpa` แสดง `ScalingActive: False, Reason: FailedGetResourceMetric` — ทางแก้คือเพิ่ม `requests.cpu` ที่ชัดเจน (มักเท่ากับหรือเป็นสัดส่วนของ `limits.cpu`) ไม่ใช่ปรับอะไรใน object HPA เอง
+</SpotTheBug>
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**HorizontalPodAutoscaler** (`autoscaling/v2`) เปลี่ยน `replicas` ของ Deployment หรือ StatefulSet เพื่อดึง metric ที่จับตาอยู่ให้ใกล้ target แต่จะไม่ทำอะไรเลยถ้าไม่มีสองข้อบังคับ: Pod ต้องตั้ง **`requests`** ไว้ (utilization คือเปอร์เซ็นต์ของ request) และต้องมี **metrics-server** หรือ custom/external metrics adapter ติดตั้งไว้เพื่อป้อน metric นอกจากนี้ HPA ยัง scale ตาม custom หรือ external metric สำหรับ signal ที่ไม่ใช่ resource ได้ด้วย HPA เปลี่ยนแค่จำนวน replica เท่านั้น — การปรับขนาด Pod ที่มีอยู่แล้วเป็นงานของ **VerticalPodAutoscaler** ส่วนการเพิ่มหรือลด Node เป็นงานของ **Cluster Autoscaler**
+**HorizontalPodAutoscaler** (`autoscaling/v2`) เปลี่ยน `replicas` ของ Deployment หรือ StatefulSet เพื่อดึง metric ที่จับตาอยู่ให้ใกล้ target แต่จะไม่ทำอะไรเลยถ้าไม่มีสองข้อบังคับ ทั้งคู่พิสูจน์ข้างบนแล้ว: Pod ต้องตั้ง **`requests`** ไว้ (utilization คือเปอร์เซ็นต์ของ request — ไม่มี requests ได้ `<unknown>`/`FailedGetResourceMetric` จริง) และต้องมี **metrics-server** หรือ custom/external metrics adapter ติดตั้งไว้ (บน kind ต้องแพตช์ `--kubelet-insecure-tls` จริง) `targetCPUUtilizationPercentage` ของ `autoscaling/v1` กับ `metrics[]` ของ `v2` คือ object เดียวกัน สองรูปร่าง — พิสูจน์ข้างบนด้วยการแปลงของ API server เอง `behavior.scaleUp`/`scaleDown` (พิสูจน์ข้างบนด้วย scale-up ที่เพิ่มเป็นสองเท่าจริงและ scale-down ที่ stabilize) ปรับความเร็วของ replica เมื่อรู้ metric แล้ว และ `minReplicas: 0` ใช้ได้แค่กับ custom/external metric ไม่ใช่ CPU/memory ธรรมดา HPA เปลี่ยนแค่จำนวน replica เท่านั้น — การปรับขนาด Pod ที่มีอยู่แล้วเป็นงานของ **VerticalPodAutoscaler** ส่วนการเพิ่มหรือลด Node เป็นงานของ **Cluster Autoscaler**
 </Callout>
 
 export const quizHpa = [
@@ -111,6 +339,7 @@ export const quizHpa = [
       'PodDisruptionBudget',
     ],
     answer: 1,
+    explain: 'พิสูจน์ข้างบน: ถ้าไม่มี metrics-server, kubectl get hpa จะรายงาน cpu: <unknown> ตลอดกาล — HPA อ่านจาก metrics API ไม่เคยวัดอะไรเอง',
   },
   {
     q: 'ทำไม resource requests ถึงเป็นข้อบังคับสำหรับ HPA ที่ scale ตาม CPU/memory',
@@ -121,6 +350,51 @@ export const quizHpa = [
       'requests กำหนดค่า maxReplicas ให้อัตโนมัติ',
     ],
     answer: 1,
+    explain: 'พิสูจน์ข้างบนด้วย error จริง: "failed to get cpu utilization: missing request for cpu in container ..." — HPA ไม่เคย fallback ไป limits',
+  },
+  {
+    q: '```text\n$ kubectl get hpa.v2.autoscaling web-app -o yaml\nspec:\n  metrics:\n  - resource:\n      name: cpu\n      target:\n        averageUtilization: 60\n        type: Utilization\n```\nHPA นี้ถูก apply ด้วย `apiVersion: autoscaling/v1` และ `targetCPUUtilizationPercentage: 60` ตอนแรก output นี้พิสูจน์อะไร',
+    options: [
+      'มี HPA object แยกกันสองตัว ตัวหนึ่ง v1 ตัวหนึ่ง v2',
+      'API server แปลงระหว่างรูปร่าง v1 กับ v2 ของ object เดียวกันให้อัตโนมัติ',
+      'HPA เพิกเฉยต่อ manifest v1 แบบเงียบ ๆ',
+      'v2 ต้องสร้าง object ใหม่ตั้งแต่ต้น',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบน: object ถูกสร้างผ่าน endpoint v1 ด้วย targetCPUUtilizationPercentage และการอ่านกลับผ่าน endpoint v2 แสดง metrics[].resource.target.averageUtilization ที่เทียบเท่ากัน — object เดียว สองรูปร่าง API',
+  },
+  {
+    q: 'behavior.scaleDown.stabilizationWindowSeconds คุมอะไร',
+    options: [
+      'ระยะเวลารอก่อน scale-up ครั้งแรก',
+      'ระยะเวลาที่ HPA มองย้อนกลับไปและเลือกจำนวน replica ที่แนะนำสูงสุดล่าสุดก่อนจะ scale ลงจริง เพื่อเลี่ยงการ flap จากการลดลงสั้น ๆ',
+      'จำนวน replica สูงสุดที่อนุญาต',
+      'metrics-server refresh ข้อมูลบ่อยแค่ไหน',
+    ],
+    answer: 1,
+    explain: 'stabilization window ที่ยาวขึ้นดูดซับการลดลงสั้น ๆ ของ load โดยไม่ลด replica ที่น่าจะต้องใช้อีกในไม่ช้า — พิสูจน์ข้างบนด้วย scaleDown window 60 วินาทีจริงคู่กับ scaleUp window ที่ทันที',
+  },
+  {
+    q: '```text\n$ kubectl get hpa load-app\nNAME       REFERENCE             TARGETS         REPLICAS\nload-app   Deployment/load-app   cpu: 200%/50%   4\n```\nEvents แสดง SuccessfulRescale สองครั้ง: ไปที่ 2 แล้วไปที่ 4 behavior policy ไหนทำให้เกิด pattern เพิ่มเป็นสองเท่านี้',
+    options: [
+      'behavior.scaleUp พร้อม type: Percent, value: 100, periodSeconds: 15',
+      'behavior.scaleDown.stabilizationWindowSeconds',
+      'minReplicas: 0',
+      'targetCPUUtilizationPercentage บน autoscaling/v1',
+    ],
+    answer: 0,
+    explain: 'พิสูจน์ข้างบน: policy scale-up แบบ Percent/100/15 วินาที อนุญาตให้ replica count เพิ่มเป็นสองเท่าได้ทุก 15 วินาทีภายใต้ load ที่เกิน target ต่อเนื่อง ทำให้เกิด progression 1 -> 2 -> 4 ที่สังเกตได้',
+  },
+  {
+    q: 'ใช้ minReplicas: 0 กับ HPA แบบ CPU utilization ธรรมดาได้ไหม',
+    options: [
+      'ได้ เสมอ บน cluster Kubernetes 1.37 ใด ๆ',
+      'ไม่ได้ — การ scale ไป/กลับจากศูนย์รองรับแค่ custom หรือ external metric เพราะ HPA แบบ resource metric ไม่มี Pod เหลือให้วัดเมื่ออยู่ที่ศูนย์',
+      'ได้แค่ถ้า metrics-server ถูกแพตช์ด้วย --kubelet-insecure-tls',
+      'ได้แค่กับ StatefulSet ไม่ใช่ Deployment',
+    ],
+    answer: 1,
+    explain: 'บันทึกไว้บน kubernetes.io และสอดคล้องกับกลไกที่พิสูจน์ข้างบน: CPU/memory utilization ต้องมี Pod รันอยู่ให้วัด ดังนั้น HPA แบบ resource metric ที่ 0 replica ไม่มี signal ให้ scale กลับขึ้นเลย',
   },
   {
     q: 'HorizontalPodAutoscaler เปลี่ยนอะไร เทียบกับ VerticalPodAutoscaler และ Cluster Autoscaler',
@@ -131,16 +405,7 @@ export const quizHpa = [
       'มีแค่ Cluster Autoscaler เท่านั้นที่เปลี่ยนจำนวน replica ได้',
     ],
     answer: 0,
-  },
-  {
-    q: 'นอกจาก CPU กับ memory แล้ว HPA ยัง scale ตามอะไรได้อีก',
-    options: [
-      'ไม่มีอย่างอื่นแล้ว HPA รองรับแค่ CPU กับ memory',
-      'custom และ external metric เช่น queue depth หรือ requests-per-second ผ่าน API custom.metrics.k8s.io และ external.metrics.k8s.io',
-      'จำนวน Node ใน cluster',
-      'image tag ของ Pod',
-    ],
-    answer: 1,
+    explain: 'autoscaler ทั้งสามตัวทำงานบนแกนที่ต่างกัน: จำนวน replica, ขนาด Pod แต่ละตัว และจำนวน Node ทั้ง cluster ตามลำดับ',
   },
 ];
 

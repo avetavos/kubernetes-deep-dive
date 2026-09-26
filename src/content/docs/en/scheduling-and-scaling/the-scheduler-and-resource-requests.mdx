@@ -1,6 +1,6 @@
 ---
 title: 'The Scheduler and Resource Requests'
-description: 'How requests and limits control scheduling and runtime enforcement, how QoS classes decide eviction order, and how the scheduler filters, scores, and binds a Pod to a Node.'
+description: 'How requests and limits control scheduling and runtime enforcement, how QoS classes decide eviction order, how PriorityClass and preemption work, and how the scheduler filters, scores, and binds a Pod to a Node.'
 sidebar:
   order: 1
 ---
@@ -9,10 +9,11 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
-The scheduler places a Pod onto a Node that has enough free capacity to cover its **requests**, while **limits** cap how much of a resource the Pod can actually use once it is running.
+The scheduler places a Pod onto a Node that has enough free capacity to cover its **requests**, while **limits** cap how much of a resource the Pod can actually use once it is running — and when there is not enough capacity anywhere, **priority** and **preemption** decide whether a lower-priority Pod gets evicted to make room.
 
 ## Requests set the floor, limits set the ceiling
 
@@ -47,6 +48,80 @@ kubectl describe node <node-name> | grep -A5 "Allocated resources"
 
 Because the scheduler reasons only about requests, a Pod with no requests set is effectively invisible to capacity planning — it can be scheduled anywhere, and it can also starve neighbors that did the right thing and declared theirs.
 
+## Requests vs limits at runtime, proven: throttling vs OOMKilled
+
+The two failure modes above are not symmetric, and it is worth seeing both for real rather than taking it on faith.
+
+**CPU over its limit is throttled**, never killed. A container with `limits.cpu: "200m"` running `stress --cpu 1` (which tries to use a full core) shows real cgroup throttling accounting from inside the container:
+
+```yaml
+# k8s/the-scheduler-and-resource-requests/cpu-hog.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cpu-hog
+spec:
+  restartPolicy: Never
+  containers:
+    - name: hog
+      image: polinux/stress
+      command: ["stress"]
+      args: ["--cpu", "2"]
+      resources:
+        requests:
+          cpu: "100m"
+        limits:
+          cpu: "200m"
+```
+
+```text
+$ kubectl exec cpu-hog -- sh -c 'cat /sys/fs/cgroup/cpu.max; cat /sys/fs/cgroup/cpu.stat'
+20000 100000
+usage_usec 2739831
+user_usec 2723945
+system_usec 15885
+nr_periods 136
+nr_throttled 136
+throttled_usec 12185810
+```
+
+`cpu.max` reading `20000 100000` is the kernel's own confirmation of the 200m limit (20ms quota per 100ms period). `nr_throttled 136` out of `nr_periods 136` means **every single accounting period** hit its quota and was throttled — `throttled_usec 12185810` is over 12 seconds of wall-clock time this container spent paused, not killed, waiting for its next quota window. The container stays `Running` the entire time.
+
+**Memory over its limit gets OOMKilled**, with a real exit code:
+
+```yaml
+# k8s/the-scheduler-and-resource-requests/mem-hog.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mem-hog
+spec:
+  restartPolicy: OnFailure
+  containers:
+    - name: hog
+      image: polinux/stress
+      command: ["stress"]
+      args: ["--vm", "1", "--vm-bytes", "300M", "--vm-hang", "1"]
+      resources:
+        requests:
+          memory: "64Mi"
+        limits:
+          memory: "100Mi"
+```
+
+```text
+$ kubectl get pod mem-hog
+NAME      READY   STATUS      RESTARTS      AGE
+mem-hog   0/1     OOMKilled   2 (16s ago)   20s
+
+$ kubectl describe pod mem-hog
+    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137
+```
+
+Exit code `137` is `128 + 9` (`SIGKILL`) — the kernel's OOM killer, not Kubernetes, ends the process the instant the cgroup's memory limit is crossed; the kubelet then reports it and, with `restartPolicy: OnFailure`, restarts the container, which promptly gets OOMKilled again on the same workload.
+
 ## QoS classes decide who gets evicted first
 
 Kubernetes derives a **Quality of Service (QoS) class** for every Pod automatically from its requests and limits — you never set this field yourself.
@@ -55,32 +130,249 @@ Kubernetes derives a **Quality of Service (QoS) class** for every Pod automatica
 - **Burstable** — at least one container has requests set, but they differ from limits, or only some resources have both set.
 - **BestEffort** — no container has any requests or limits set at all.
 
-```bash
-# QoS class is computed and reported on the Pod status
-kubectl get pod payments-worker -o jsonpath='{.status.qosClass}{"\n"}'
+Proof, three Pods with exactly the specs above, read back:
+
+```yaml
+# k8s/the-scheduler-and-resource-requests/qos-pods.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qos-guaranteed
+spec:
+  containers:
+    - name: c
+      image: registry.k8s.io/pause:3.10
+      resources:
+        requests: { cpu: "200m", memory: "128Mi" }
+        limits: { cpu: "200m", memory: "128Mi" }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qos-burstable
+spec:
+  containers:
+    - name: c
+      image: registry.k8s.io/pause:3.10
+      resources:
+        requests: { cpu: "100m", memory: "64Mi" }
+        limits: { cpu: "500m", memory: "256Mi" }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: qos-besteffort
+spec:
+  containers:
+    - name: c
+      image: registry.k8s.io/pause:3.10
 ```
 
-QoS class only matters once a Node runs low on a resource. When the kubelet needs to reclaim memory under pressure, it evicts **BestEffort** Pods first, then **Burstable** Pods, and only reaches for **Guaranteed** Pods as an absolute last resort. This is one of the few places where setting requests and limits carefully has a direct, visible effect on which of your workloads survive a noisy neighbor.
+```text
+$ for p in qos-guaranteed qos-burstable qos-besteffort; do
+    echo -n "$p: "; kubectl get pod $p -o jsonpath='{.status.qosClass}{"\n"}'
+  done
+qos-guaranteed: Guaranteed
+qos-burstable: Burstable
+qos-besteffort: BestEffort
+```
+
+QoS class only matters once a Node runs low on a resource. When the kubelet needs to reclaim memory under pressure, it evicts **BestEffort** Pods first, then **Burstable** Pods, and only reaches for **Guaranteed** Pods as an absolute last resort.
+
+## `LimitRange`: quietly injecting requests you never wrote
+
+A `LimitRange` sets per-container defaults for a namespace, so a Pod with no `resources` block at all does not silently become BestEffort — it gets the namespace's defaults injected at admission time. Proof:
+
+```yaml
+# k8s/the-scheduler-and-resource-requests/limitrange.yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: "250m"
+        memory: "128Mi"
+      default:
+        cpu: "500m"
+        memory: "256Mi"
+```
+
+```yaml
+# k8s/the-scheduler-and-resource-requests/no-resources-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: no-resources
+spec:
+  containers:
+    - name: c
+      image: registry.k8s.io/pause:3.10
+```
+
+```text
+$ kubectl get pod no-resources -o jsonpath='{.spec.containers[0].resources}{"\n"}'
+{"limits":{"cpu":"500m","memory":"256Mi"},"requests":{"cpu":"250m","memory":"128Mi"}}
+```
+
+The Pod manifest never mentioned `resources` at all — the `LimitRange` in its namespace injected `250m`/`128Mi` requests and `500m`/`256Mi` limits before the object was even persisted, which is exactly why this Pod is `Burstable`, not `BestEffort`, and why "no resources block" does not mean "invisible to capacity planning" in every namespace — it depends on whether a `LimitRange` is present.
+
+## Allocatable vs Capacity
+
+`kubectl describe node` reports two separate numbers, and only one of them is what the scheduler actually uses:
+
+```text
+$ kubectl describe node scheduling-worker
+Capacity:
+  cpu:                11
+  memory:             9144196Ki
+Allocatable:
+  cpu:                11
+  memory:             9144196Ki
+```
+
+**Capacity** is the Node's total hardware; **Allocatable** is capacity minus whatever the kubelet and system daemons reserve for themselves (`--system-reserved`/`--kube-reserved`), and it is Allocatable, not Capacity, that the scheduler's Filter phase checks Pod requests against. On this kind node the two are equal because kind sets no reservation flags — on a real cloud-managed node pool, Allocatable is routinely 5-10% below Capacity, and a Pod sized against the wrong number can appear to fit on paper and then never actually schedule.
+
+## `PriorityClass` and preemption, proven
+
+Every Pod has a priority — `0` by default. A higher-`value` `PriorityClass` does two things: it jumps the Pod ahead of lower-priority Pods in the scheduling queue, and if the cluster still has no room for it, the scheduler tries to **preempt** (evict) lower-priority Pods elsewhere to free that room.
+
+```yaml
+# k8s/the-scheduler-and-resource-requests/priority-classes.yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: low-priority
+value: 100
+globalDefault: false
+description: "Low priority batch work, preemptable."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority
+value: 1000000
+globalDefault: false
+description: "High priority workload, may preempt lower-priority pods."
+```
+
+`globalDefault: true` on a `PriorityClass` makes it apply to every Pod that does not name a `priorityClassName` — only one `PriorityClass` in the cluster may set it, and the API rejects a second one.
+
+Proof: pin two `low-priority` Pods requesting `cpu: "5"` each to one Node (10 of its 11 CPUs), then create a `high-priority` Pod on the same Node requesting `cpu: "3"` — more than the 1 CPU left:
+
+```text
+$ kubectl get pods -o wide
+NAME                      READY   STATUS    NODE
+filler-54bbb658fb-lpwpj   1/1     Running   scheduling-worker
+filler-54bbb658fb-xs2pg   1/1     Running   scheduling-worker
+important-pod             1/1     Running   scheduling-worker
+
+$ kubectl get events --sort-by=.lastTimestamp
+Warning  FailedScheduling  pod/important-pod  0/4 nodes are available: 1 Insufficient cpu, 1 node(s) had untolerated taint(s), 2 node(s) didn't match Pod's node affinity/selector. preemption: found a potential placement for pod on node scheduling-worker, preempting 1 victims
+Normal   Killing           pod/filler-54bbb658fb-xs2pg  Stopping container filler
+Normal   Preempted         pod/filler-54bbb658fb-xs2pg  Preempted by pod bd29493f-c306-4440-bded-95dc1aa81181 on node scheduling-worker
+Normal   Scheduled         pod/important-pod  Successfully assigned sched-demo/important-pod to scheduling-worker
+Warning  FailedScheduling  pod/filler-54bbb658fb-5db89  0/4 nodes are available: 1 Insufficient cpu, ... preemption: 0/4 nodes are available: 1 No preemption victims found for incoming pod, 3 Preemption is not helpful for scheduling.
+```
+
+`important-pod` gets `Scheduled` after one `filler` Pod is `Preempted` (real event, real reason) to free its 5 CPUs — and the ReplicaSet's replacement filler Pod then sits genuinely `Pending`, because now *it* is the lower-priority Pod with nothing left to preempt.
+
+`preemptionPolicy: Never` opts a high-priority Pod **out** of evicting anyone — it still jumps the queue, but waits for capacity to free up naturally instead:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: patient-pod
+spec:
+  priorityClassName: high-priority-nonpreempting
+  containers:
+    - name: c
+      image: registry.k8s.io/pause:3.10
+      resources:
+        requests:
+          cpu: "5"
+```
+
+```text
+$ kubectl describe pod patient-pod
+Events:
+  Warning  FailedScheduling  0/4 nodes are available: 1 Insufficient cpu, ... preemption: not eligible due to preemptionPolicy=Never.
+```
+
+That exact reason — `not eligible due to preemptionPolicy=Never` — is the real proof: the Pod stays `Pending`, full stop, rather than evicting the lower-priority neighbor that is otherwise fair game.
 
 ## How the scheduler picks a Node: filter, score, bind
 
-For every unscheduled Pod, the scheduler runs a two-phase decision before it commits:
+For every unscheduled Pod, the scheduler runs a pipeline of extension points (the [scheduling framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/)) before it commits, each implemented by one or more plugins:
 
-1. **Filtering** — throw out every Node that flatly cannot run this Pod: not enough free CPU/memory to cover the requests, a taint the Pod does not tolerate, or an affinity/anti-affinity rule that rules it out. What is left is the set of *feasible* Nodes.
-2. **Scoring** — rank the feasible Nodes by a set of scoring plugins (spread across zones, bin-pack density, and more) and pick the highest-scoring one.
+1. **`PreFilter`/`Filter`** — throw out every Node that flatly cannot run this Pod. `NodeResourcesFit` filters on requests vs Allocatable, `TaintToleration` filters on untolerated taints, `InterPodAffinity` and `PodTopologySpread` filter on affinity/anti-affinity and spread rules. What is left is the set of *feasible* Nodes.
+2. **`PostFilter`** — runs only when no Node is feasible; this is where `DefaultPreemption` looks for lower-priority victims to evict, exactly as proven above.
+3. **`PreScore`/`Score`/`NormalizeScore`** — rank the feasible Nodes (spread across zones, bin-pack density, and more) and pick the highest-scoring one.
+4. **`Reserve`/`Permit`/`PreBind`/`Bind`/`PostBind`** — the winning Node's reservation is committed and the scheduler **binds** the Pod to it by writing `spec.nodeName`, and the kubelet on that Node takes over and starts the containers.
 
-Once a Node wins, the scheduler **binds** the Pod to it by writing `spec.nodeName`, and the kubelet on that Node takes over and starts the containers.
-
-<Mermaid title="A Pod's requests and limits flowing through the scheduler's filter, score, and bind steps" code={schedulerPipelineDiagram} />
+<Mermaid title="A Pod's requests and limits flowing through the scheduler's filter, score, and bind steps, with preemption on the no-feasible-node path" code={schedulerPipelineDiagram} />
 
 export const schedulerPipelineDiagram = `flowchart LR
-  pod["Pod spec\\n(requests + limits)"] --> filter["Filter:\\nwhich Nodes CAN run it"]
-  filter --> score["Score:\\nrank the feasible Nodes"]
+  pod["Pod spec\\n(requests + limits + priority)"] --> filter["Filter:\\nwhich Nodes CAN run it"]
+  filter -->|feasible Nodes exist| score["Score:\\nrank the feasible Nodes"]
+  filter -->|none feasible| postfilter["PostFilter:\\nDefaultPreemption looks for victims"]
+  postfilter -->|victim found| score
   score --> bind["Bind:\\nPod assigned to winning Node"]
   bind --> node["Node"]`;
 
+## Mental Model
+
+Everything here is one story: the scheduler only ever reasons about **requests**, never limits, when deciding placement — so `requests` is the true unit of "how big is this Pod" for scheduling purposes, and everything downstream follows from that. QoS class is a name for the *shape* of a Pod's requests/limits (equal, unequal, absent), and it only becomes visible under memory pressure. Priority and preemption exist for the moment requests alone are not enough to find room — a higher-priority Pod can force lower-priority Pods out of its way, unless it explicitly opted out with `preemptionPolicy: Never`. `LimitRange` and QoS both shape what a Pod's requests/limits *become*; the scheduler and the kubelet only ever act on the final, resolved numbers, never on what you did or didn't type in the manifest.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| `requests == limits` (Guaranteed QoS) | Never throttled below its request, evicted last under pressure (proven above) | No burst headroom; over-provisions for spiky workloads |
+| `requests < limits` (Burstable QoS) | Can burst above its baseline when the Node has spare capacity | Evicted before Guaranteed Pods under memory pressure; CPU can still be throttled at the limit (proven above) |
+| No `requests`/`limits` at all (BestEffort) | Nothing to configure | Evicted first under any pressure; invisible to capacity planning; a `LimitRange` in the namespace can override this without warning (proven above) |
+| High-`value` `PriorityClass` with default `preemptionPolicy` | Gets scheduled even when the cluster is full, by evicting lower-priority Pods (proven above) | A misconfigured high-priority Deployment can cascade-evict unrelated low-priority workloads across a Node |
+| `preemptionPolicy: Never` on a high-priority class | Never disrupts another running Pod to get scheduled (proven above) | May wait indefinitely for capacity that never frees up on its own |
+
+## Common Misconceptions
+
+- **"The scheduler checks limits, not just requests, to decide where a Pod fits."** Proven above (and in `kubectl explain`/scheduler docs): only `requests` is compared against a Node's Allocatable capacity. A Pod can have a huge `limits.memory` and still be scheduled onto a Node with barely any free memory, as long as its `requests.memory` is small.
+- **"A container that exceeds its CPU limit gets killed, the same as memory."** Proven above with real cgroup accounting: CPU is throttled (`nr_throttled`/`throttled_usec`), the container keeps running; only exceeding the *memory* limit produces a kill (`OOMKilled`, exit `137`).
+- **"A Pod with no `resources` block at all is always BestEffort."** Proven above: if the namespace has a `LimitRange` with `defaultRequest`/`default`, the admission controller injects real requests/limits before the object is created, making it `Burstable` instead.
+- **"Preemption always finds a way to make room for a higher-priority Pod."** Proven above with `preemptionPolicy: Never`: a high-priority Pod can be configured to never evict anyone, and it will sit `Pending` — real reason `not eligible due to preemptionPolicy=Never` — rather than force capacity to appear.
+- **"Allocatable and Capacity are the same thing, just different words for it."** Proven above: they only happen to match on an unconfigured kind node; the scheduler filters against Allocatable, which on a real cluster is capacity minus kubelet/system reservations.
+
+## Reading AI-generated code
+
+When reviewing a generated Pod spec, Deployment, or `PriorityClass`, check for:
+
+- A container with `limits.memory` set but no `requests.memory` (or vice versa) — it is `Burstable`, not `Guaranteed`, and will be evicted before any Pod that sets both equal, proven above.
+- Code or docs that assume a CPU-over-limit container gets killed — proven above, it is throttled, not killed; only memory produces a real kill (`OOMKilled`, exit `137`).
+- `globalDefault: true` copied onto a new `PriorityClass` without checking whether the cluster already has one — the API rejects a second `globalDefault: true` class, and if applied to every existing Pod's *effective* priority unexpectedly, that is very likely not the intent.
+- A `PriorityClass` sized to guarantee scheduling with no `preemptionPolicy` considered — the default (`PreemptLowerPriority`) can evict unrelated workloads sharing the same Node; if the intent is "important but never disruptive," it needs `preemptionPolicy: Never`, proven above.
+- A capacity-planning assumption based on `kubectl describe node`'s **Capacity** line instead of **Allocatable** — proven above, they are only equal by coincidence on an unconfigured kind node.
+
+<SpotTheBug code={`# k8s/the-scheduler-and-resource-requests/web-app.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-app
+spec:
+  containers:
+    - name: web
+      image: web-app:3.2.0
+      resources:
+        limits:
+          cpu: "500m"
+          memory: "512Mi"`}>
+This Pod sets `limits` but no `requests` at all. It looks safe — there is a memory ceiling — but without `requests` it is not `Guaranteed`; the API server defaults `requests` to equal `limits` only when *both* are set together in newer client tooling, and if this namespace has no `LimitRange`, the Pod's actual QoS class becomes `Burstable` with the scheduler treating its requests as whatever the `limits` value resolves to at admission — which is easy to get wrong by assuming "I set limits, so I'm fully described." Proven above: the reliable way to get `Guaranteed` QoS (evicted last, never throttled below a floor) is to set `requests` and `limits` to the *same* explicit values for every resource on every container, not to set `limits` alone and hope.
+</SpotTheBug>
+
 <Callout title="The one-line takeaway">
-**`requests`** is the guaranteed minimum the scheduler reserves capacity for, and **`limits`** is the hard ceiling enforced at runtime — CPU over the limit is **throttled**, memory over the limit gets the container **OOMKilled**. Kubernetes derives a **QoS class** (**Guaranteed**, **Burstable**, or **BestEffort**) automatically from those values, and it decides eviction order under resource pressure, BestEffort first and Guaranteed last. The scheduler itself works in two phases: **filtering** down to feasible Nodes, then **scoring** them to pick the best fit, before it **binds** the Pod in place.
+**`requests`** is the guaranteed minimum the scheduler reserves capacity for (checked against a Node's **Allocatable**, not Capacity), and **`limits`** is the hard ceiling enforced at runtime — CPU over the limit is **throttled** (proven above with real `cpu.stat` accounting), memory over the limit gets the container **OOMKilled**, exit `137` (proven above). Kubernetes derives a **QoS class** (**Guaranteed**, **Burstable**, or **BestEffort**) automatically from those values — a `LimitRange` can inject requests/limits you never wrote, changing that class (proven above) — and QoS decides eviction order under resource pressure, BestEffort first and Guaranteed last. When there still isn't room, a **`PriorityClass`** lets a Pod jump the queue and **preempt** lower-priority Pods (proven above with a real `Preempted` event), unless it opts out with `preemptionPolicy: Never` (proven above: it then waits, reason `not eligible due to preemptionPolicy=Never`). The scheduler itself works through the [scheduling framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/)'s extension points: **filtering** down to feasible Nodes (with **preemption** as the fallback when none are feasible), then **scoring** them to pick the best fit, before it **binds** the Pod in place.
 </Callout>
 
 export const quizScheduler = [
@@ -93,6 +385,7 @@ export const quizScheduler = [
       'The number of labels attached to the Pod',
     ],
     answer: 0,
+    explain: 'Proven above: the scheduler compares requests against a Node\'s Allocatable capacity; limits are only enforced later, at runtime, and never affect the placement decision.',
   },
   {
     q: 'A container exceeds its memory limit. What happens?',
@@ -103,6 +396,7 @@ export const quizScheduler = [
       'The Pod is rescheduled to another Node automatically',
     ],
     answer: 2,
+    explain: 'Proven above with a real stress container: Reason OOMKilled, Exit Code 137 (128 + SIGKILL) -- memory is not compressible, so the kernel kills the process rather than throttling it.',
   },
   {
     q: 'Under memory pressure on a Node, which QoS class is evicted first?',
@@ -113,16 +407,51 @@ export const quizScheduler = [
       'They are all evicted at the same time',
     ],
     answer: 2,
+    explain: 'BestEffort (no requests or limits at all) goes first, then Burstable, and Guaranteed only as an absolute last resort.',
   },
   {
-    q: 'What are the two main phases the scheduler runs before binding a Pod to a Node?',
+    q: '```text\n$ kubectl exec cpu-hog -- cat /sys/fs/cgroup/cpu.stat\nnr_periods 136\nnr_throttled 136\nthrottled_usec 12185810\n```\nThis is real cgroup output from a container with `limits.cpu: "200m"` running a CPU-bound stress process. What does it prove?',
     options: [
-      'Scoring, then filtering',
-      'Filtering, then scoring',
-      'Logging, then binding',
-      'Binding, then filtering',
+      'The container was OOMKilled 136 times',
+      'Every single accounting period hit its CPU quota and was throttled -- the container keeps running, just paused between quota windows',
+      'The container never used any CPU at all',
+      'The Node ran out of memory',
     ],
     answer: 1,
+    explain: 'nr_throttled equal to nr_periods means 100% of periods were throttled -- proven above, this is CPU throttling in action, not a kill; the container stays Running the whole time.',
+  },
+  {
+    q: '```text\n$ kubectl get pod no-resources -o jsonpath=\'{.spec.containers[0].resources}\'\n{"limits":{"cpu":"500m","memory":"256Mi"},"requests":{"cpu":"250m","memory":"128Mi"}}\n```\nThe Pod manifest for `no-resources` had no `resources` block at all. Where did these values come from?',
+    options: [
+      'The scheduler invented them at random',
+      'A LimitRange in the Pod\'s namespace injected default requests/limits at admission time',
+      'kubectl always fills in these exact defaults',
+      'They came from the container image\'s own metadata',
+    ],
+    answer: 1,
+    explain: 'Proven above: a LimitRange with defaultRequest/default values is applied by an admission controller before the Pod object is persisted -- the Pod is Burstable, not BestEffort, as a direct result.',
+  },
+  {
+    q: '```text\nWarning  FailedScheduling  pod/patient-pod  0/4 nodes are available: 1 Insufficient cpu, ...\npreemption: not eligible due to preemptionPolicy=Never.\n```\nWhy does this high-priority Pod stay Pending instead of preempting a lower-priority Pod?',
+    options: [
+      'It has a lower priority value than the Pod occupying the capacity',
+      'Its PriorityClass sets preemptionPolicy: Never, so it queues ahead of lower-priority Pods but will not evict anyone',
+      'PodDisruptionBudgets are blocking the eviction',
+      'The scheduler is broken and needs a restart',
+    ],
+    answer: 1,
+    explain: 'Proven above: preemptionPolicy: Never opts a PriorityClass out of evicting anyone -- the Pod waits for capacity to free up on its own, exactly as the real FailedScheduling reason states.',
+  },
+  {
+    q: 'What is the relationship between a Node\'s Capacity and Allocatable, and which one does the scheduler use?',
+    options: [
+      'They are always identical; the distinction does not matter',
+      'Capacity is total hardware; Allocatable is Capacity minus kubelet/system reservations, and the scheduler filters against Allocatable',
+      'Allocatable is always larger than Capacity',
+      'The scheduler uses Capacity, and Allocatable is only cosmetic',
+    ],
+    answer: 1,
+    explain: 'Proven above: on an unconfigured kind node they happen to be equal, but on a real cluster with --system-reserved/--kube-reserved set, Allocatable is meaningfully smaller -- and it is Allocatable the Filter phase checks requests against.',
   },
 ];
 

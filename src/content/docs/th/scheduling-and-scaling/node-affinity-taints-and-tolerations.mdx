@@ -1,6 +1,6 @@
 ---
 title: 'Node Affinity, Taint และ Toleration'
-description: 'ความต่างระหว่าง nodeSelector node affinity และ pod affinity/anti-affinity และวิธีที่ taint กับ toleration ผลัก Pod ออกจาก Node เว้นแต่จะอนุญาตชัดเจน'
+description: 'ความต่างระหว่าง nodeSelector, node affinity, pod affinity/anti-affinity และ topologySpreadConstraints และวิธีที่ taint กับ toleration ผลัก Pod ออกจาก Node เว้นแต่จะอนุญาตชัดเจน'
 sidebar:
   order: 2
 ---
@@ -9,10 +9,11 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
-**Affinity** ดึง Pod เข้าหา Node (หรือ Pod อื่น) บางตัว ส่วน **taint** ผลัก Pod ออกจาก Node เว้นแต่ Pod จะมี **toleration** ที่ match — สองกลไกที่ทำงานคนละทิศทาง และมักถูกใช้ร่วมกัน
+**Affinity** ดึง Pod เข้าหา Node (หรือ Pod อื่น) บางตัว **`topologySpreadConstraints`** กระจาย Pod กลุ่มหนึ่งให้เท่ากันข้าม topology ส่วน **taint** ผลัก Pod ออกจาก Node เว้นแต่ Pod จะมี **toleration** ที่ match — กลไกที่มักถูกใช้ร่วมกัน
 
 ## nodeSelector กับ node affinity: match บน label ของ Node
 
@@ -55,35 +56,42 @@ spec:
         - weight: 80
           preference:
             matchExpressions:
-              - key: topology.kubernetes.io/zone
+              - key: zone
                 operator: In
                 values:
-                  - us-central1-a
+                  - preferred
   containers:
     - name: inference
       image: inference-server:2.1.0
 ```
 
-ทั้งสอง suffix ลงท้ายด้วย `IgnoredDuringExecution` หมายความว่าเมื่อ Pod รันอยู่แล้ว การเปลี่ยน label ของ Node ภายหลังจะไม่ทำให้ Pod ถูก evict — กฎพวกนี้มีผลแค่ตอนตัดสินใจ schedule ครั้งแรกเท่านั้น
+ทั้งสอง suffix ลงท้ายด้วย `IgnoredDuringExecution` หมายความว่าเมื่อ Pod รันอยู่แล้ว การเปลี่ยน label ของ Node ภายหลังจะไม่ทำให้ Pod ถูก evict — กฎพวกนี้มีผลแค่ตอนตัดสินใจ schedule ครั้งแรกเท่านั้น พิสูจน์ว่า `preferred` steers การวาง Pod จริงโดยไม่บังคับ: label worker ตัวเดียวเป็น `zone=preferred` แล้วสร้าง Pod ที่มีแค่ soft preference นั้น (ไม่มี `nodeSelector` ไม่มีข้อบังคับแบบแข็ง) มันลงที่ worker ตัวนั้นทุกครั้ง จากตัวเลือกที่เหมือนกันสามตัว
 
-## Pod affinity กับ anti-affinity: schedule โดยอ้างอิง Pod อื่น
+```text
+$ kubectl label node scheduling-worker2 zone=preferred
+$ kubectl get pod prefers-zone -o wide
+NAME           READY   STATUS    NODE
+prefers-zone   1/1     Running   scheduling-worker2
+```
 
-Node affinity มองที่ label ของ Node ส่วน **pod affinity** และ **pod anti-affinity** มองที่ label ของ *Pod อื่นที่รันอยู่แล้ว* แทน โดยใช้ `topologyKey` เพื่อนิยามว่า "ใกล้กัน" หมายถึงอะไร (hostname, zone และอื่น ๆ) การใช้ที่พบบ่อยที่สุดคือกระจาย replica ของ app เดียวกันออกจากกันเพื่อความทนทาน
+## Pod affinity กับ anti-affinity: schedule โดยอ้างอิง Pod อื่น พิสูจน์แบบ all-or-nothing
+
+Node affinity มองที่ label ของ Node ส่วน **pod affinity** และ **pod anti-affinity** มองที่ label ของ *Pod อื่นที่รันอยู่แล้ว* แทน โดยใช้ `topologyKey` เพื่อนิยามว่า "ใกล้กัน" หมายถึงอะไร (hostname, zone และอื่น ๆ)
 
 ```yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: web-app
+  name: web-anti
 spec:
-  replicas: 3
+  replicas: 4
   selector:
     matchLabels:
-      app: web-app
+      app: web-anti
   template:
     metadata:
       labels:
-        app: web-app
+        app: web-anti
     spec:
       affinity:
         podAntiAffinity:
@@ -92,15 +100,127 @@ spec:
                 matchExpressions:
                   - key: app
                     operator: In
-                    values:
-                      - web-app
+                    values: ["web-anti"]
               topologyKey: kubernetes.io/hostname
       containers:
-        - name: web-app
-          image: web-app:3.2.0
+        - name: web
+          image: registry.k8s.io/pause:3.10
 ```
 
-กฎ anti-affinity นี้บอก scheduler ว่า "ห้ามวาง Pod ของ `web-app` สองตัวบน host เดียวกัน" — เสีย Node ไปหนึ่งตัวจะไม่มีทางกระทบเกินหนึ่ง replica กรณีตรงข้ามคือ **pod affinity** ซึ่งเอา Pod มาอยู่ใกล้กันแทน เช่น ปัก cache sidecar ไว้บน Node เดียวกับ service ที่อ่าน cache นั้น เพื่อตัด traffic นั้นออกจาก network ไปเลย
+กฎนี้บอกว่า "ห้ามวาง Pod `web-anti` สองตัวบน host เดียวกัน" บน cluster ที่มี 3 worker replica 3 ตัวลงได้พอดี — ตัวละ Node — แต่ตัวที่ 4 ไม่เหลือที่ให้ไปแล้ว และ `requiredDuringScheduling` คือ all-or-nothing: มันค้างอยู่ที่ `Pending` จริง ๆ ไม่ใช่ "กระจายได้บ้าง"
+
+```text
+$ kubectl get pods -l app=web-anti -o wide
+NAME                        READY   STATUS    NODE
+web-anti-6476995565-5dwmp   1/1     Running   scheduling-worker
+web-anti-6476995565-glvpv   0/1     Pending   <none>
+web-anti-6476995565-l9tvf   1/1     Running   scheduling-worker2
+web-anti-6476995565-rhltf   1/1     Running   scheduling-worker3
+
+$ kubectl describe pod web-anti-6476995565-glvpv
+Events:
+  Warning  FailedScheduling  0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 node(s) didn't match pod anti-affinity rules. preemption: 0/4 nodes are available: 1 Preemption is not helpful for scheduling, 3 No preemption victims found for incoming pod.
+```
+
+เทียบกับ `topologySpreadConstraints` ข้างล่างที่พูดว่า "กระจายให้เท่ากัน อนุญาตได้ถึง N ตัวต่อ Node" แทน เพดาน one-per-Node แบบเข้มงวดของ anti-affinity
+
+## `topologySpreadConstraints`: กระจายเท่ากันด้วย skew ที่ปรับได้
+
+`topologySpreadConstraints` (`kubectl explain pod.spec.topologySpreadConstraints` บน cluster 1.37 จริง) กระจาย Pod กลุ่มหนึ่งข้าม topology domain ให้อยู่ในค่า tolerance หนึ่งคือ `maxSkew` แทนที่จะเป็นกฎ all-or-nothing ของ anti-affinity
+
+```yaml
+# k8s/node-affinity-taints-and-tolerations/topology-spread-deploy.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          nodeTaintsPolicy: Honor
+          matchLabelKeys:
+            - pod-template-hash
+          labelSelector:
+            matchLabels:
+              app: web
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10
+```
+
+- **`maxSkew`** — ความต่างสูงสุดที่ยอมได้ระหว่าง domain ที่มี Pod match มากสุดกับน้อยสุด `1` ที่นี่หมายความว่าไม่มี Node ไหนมี Pod match มากกว่า Node อื่น 2 ตัวขึ้นไป
+- **`topologyKey: kubernetes.io/hostname`** — กระจายต่อ Node ใช้ `topology.kubernetes.io/zone` เพื่อกระจายต่อ zone แทน
+- **`whenUnsatisfiable`** — `DoNotSchedule` (แข็ง เหมือน `required` affinity) หรือ `ScheduleAnyway` (อ่อน best-effort)
+- **`matchLabelKeys: [pod-template-hash]`** — เช็คแล้วจริง: `kubectl explain pod.spec.topologySpreadConstraints.matchLabelKeys` บน API server 1.37 จริงรายงาน **"This is a beta field ... requires the `MatchLabelKeysInPodTopologySpread` feature gate (enabled by default)"** — มัน*ยังไม่ GA* ยังเป็น beta ตั้งแต่ 1.27 ซึ่งต่างจากสมมติฐานว่ามันน่าจะ GA แล้วตอน 1.37 ในทางปฏิบัติมัน enable by default อยู่แล้ว จึงทำงานเหมือนมีอยู่เสมอ มันจำกัดขอบเขตการนับ skew ให้อยู่แค่ Pod ของ ReplicaSet generation *เดียวกัน* (ดูส่วน rollout ข้างล่าง)
+
+พิสูจน์ การกระจาย 2-2-2 สะอาด ๆ ข้าม 3 worker ด้วย 6 replica
+
+```text
+$ kubectl apply -f topology-spread-deploy.yaml
+$ kubectl get pods -o wide
+NAME                  READY   STATUS    NODE
+web-b8b7dc6c7-4dpx9   1/1     Running   scheduling-worker
+web-b8b7dc6c7-llb6c    1/1     Running   scheduling-worker
+web-b8b7dc6c7-csj9b   1/1     Running   scheduling-worker2
+web-b8b7dc6c7-l9qrl   1/1     Running   scheduling-worker2
+web-b8b7dc6c7-hf4pl   1/1     Running   scheduling-worker3
+web-b8b7dc6c7-nqxj9   1/1     Running   scheduling-worker3
+```
+
+### กับดักของ `nodeTaintsPolicy` พิสูจน์แล้ว
+
+manifest เดียวกัน**โดยไม่มี** `nodeTaintsPolicy: Honor` ทำให้ 3 จาก 6 Pod ค้างที่ `Pending` ถาวรบน cluster ตัวนี้เป๊ะ ๆ
+
+```text
+$ kubectl get pods -o wide
+NAME                   READY   STATUS    NODE
+web-57c75d6bbb-7m652   0/1     Pending   <none>
+web-57c75d6bbb-gn7s7   0/1     Pending   <none>
+web-57c75d6bbb-k67n4   1/1     Running   scheduling-worker3
+web-57c75d6bbb-nwc64   1/1     Running   scheduling-worker
+web-57c75d6bbb-xjl2m   0/1     Pending   <none>
+web-57c75d6bbb-xz9lt   1/1     Running   scheduling-worker2
+
+$ kubectl describe pod web-57c75d6bbb-7m652
+Events:
+  Warning  FailedScheduling  0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 node(s) didn't match pod topology spread constraints.
+```
+
+`kubectl explain pod.spec.topologySpreadConstraints.nodeTaintsPolicy` บอกเหตุผลชัด ๆ: **"If this value is nil, the behavior is equivalent to the `Ignore` policy"** — หมายความว่า Node control-plane ที่มี taint และ schedule ไม่ได้ยังถูกนับเป็น topology domain ที่ถูกต้องด้วย Pod match **0** ตัว โดย default พอมี Pod หนึ่งตัวอยู่แล้วบนแต่ละ worker ทั้ง 3 ตัว (1-1-1) และ control-plane ถูกนับเป็น domain ที่ 4 อยู่ที่ 0 การวาง Pod ตัวที่ 4 ที่ไหนก็ตามจะทำให้ skew เป็น `2 - 0 = 2` เกิน limit `maxSkew: 1` — ดังนั้นไม่มีอะไรหลังจาก 3 Pod แรก schedule ได้เลย ทั่วทั้ง cluster ตลอดกาล การตั้ง `nodeTaintsPolicy: Honor` ตัด Node ที่ Pod ที่เข้ามาไม่ tolerate ออกจากการนับ domain ซึ่งเป็นสิ่งที่แก้ปัญหาข้างบนได้
+
+### `matchLabelKeys` ระหว่าง rolling update พิสูจน์แล้ว
+
+trigger rolling update (`maxUnavailable: 0, maxSurge: 1`) บน Deployment ที่ spread **โดยไม่มี** `matchLabelKeys` แล้วดู surge Pod ลงบน Node ที่มี Pod ของ generation *ก่อนหน้า* อยู่แล้ว 2 ตัว เพราะ constraint นับทุก generation รวมกัน
+
+```text
+$ kubectl set image deploy/rollout-demo web=nginx:1.27.2-alpine
+t+8s: rollout-demo-579bddcff9-2cpvt  Running  scheduling-worker  (old gen 579bddcff9)
+t+8s: rollout-demo-579bddcff9-hmj2l  Running  scheduling-worker  (old gen 579bddcff9)
+t+8s: rollout-demo-676f6cdd75-2bdwb  Running  scheduling-worker  (NEW gen 676f6cdd75)
+```
+
+`scheduling-worker` ตอนนี้มี 3 Pod จริง ๆ (old 2 + new 1) อยู่ครู่หนึ่ง — ยังอยู่ใน `maxSkew: 1` โดยรวม (3 เทียบ 2 เทียบ 2) แต่การกระจายของ generation *ใหม่*เองไม่สม่ำเสมอเพียงเพราะบังเอิญว่า Pod เก่าอยู่ตรงไหน เพิ่ม `matchLabelKeys: [pod-template-hash]` แล้วทำ rollout เดิมซ้ำ: ตอนนี้ constraint นับแต่ละ generation แยกกัน ดังนั้น surge Pod ตัวแรกของ generation ใหม่เอี่ยมจะเริ่มนับ domain ของ*ตัวเอง*ที่ 0 ทุกที่เสมอ — ไม่ว่า Pod ของ generation ที่กำลังจะออกจะอยู่ตรงไหนก็ตาม
+
+```text
+$ kubectl patch deploy rollout-demo --type=json -p='[{"op":"add","path":"/spec/template/spec/topologySpreadConstraints/0/matchLabelKeys","value":["pod-template-hash"]}]'
+$ kubectl set image deploy/rollout-demo web=nginx:1.27.3-alpine
+t+1s: rollout-demo-548b8ff4cb-djfk9  ContainerCreating  scheduling-worker   (NEW gen 548b8ff4cb, 1st of its generation)
+t+1s: rollout-demo-676f6cdd75-2bdwb  Running            scheduling-worker   (old gen 676f6cdd75)
+t+1s: rollout-demo-7b5cbfbdb7-bdd57  Running            scheduling-worker   (old gen 7b5cbfbdb7)
+```
+
+`matchLabelKeys` merge `pod-template-hash: 548b8ff4cb` เข้ากับ `labelSelector` ที่มีผลจริงสำหรับ admission ของ surge Pod ตัวนั้น ดังนั้นการคำนวณ skew ของมันจะเห็นแค่ Pod ของ hash *เดียวกัน* — ไม่มีวันถูกกันหรือถูกกระจุกตัวโดยไม่ตั้งใจจาก Node ที่ generation เก่าบังเอิญอยู่
 
 ## Taint กับ toleration: Node ที่ผลัก Pod ออก
 
@@ -139,15 +259,122 @@ spec:
 
 toleration แค่หักล้าง taint เท่านั้น ไม่ได้ดึง Pod ไปที่นั่น นี่คือเหตุผลที่ node pool เฉพาะสำหรับ GPU มักสร้างจากสองกลไกพร้อมกัน: Node ถูก taint ไว้ให้ Pod ทั่วไปอยู่ห่าง ๆ ส่วน Pod ของ GPU workload ทั้ง tolerate taint นั้นและใช้ `nodeSelector` (หรือ node affinity) เพื่อขอ schedule ไปที่นั่น พร้อมกับ request GPU resource ด้วย
 
-<Mermaid title="A taint repels an ordinary Pod while a Pod with a matching toleration is allowed through" code={taintRepelDiagram} />
+### `NoExecute` พร้อม `tolerationSeconds` จับเวลาจริง
+
+`tolerationSeconds` ให้ Pod tolerate taint `NoExecute` ได้ แต่แค่ในช่วงเวลาผ่อนผันที่จำกัดก่อนจะถูก evict อยู่ดี — มีประโยชน์สำหรับ "ทนปัญหา Node สั้น ๆ ได้ แต่ถ้ายืดเยื้อก็ออก"
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tolerates-briefly
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: scheduling-worker3
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: batch
+      effect: NoExecute
+      tolerationSeconds: 10
+  containers:
+    - name: c
+      image: registry.k8s.io/pause:3.10
+```
+
+```text
+$ kubectl taint nodes scheduling-worker3 dedicated=batch:NoExecute
+$ kubectl apply -f toleration-seconds-pod.yaml   # created 16:43:07, taint already present
+16:43:07  Running
+16:43:16  Running
+16:43:18  Succeeded   (deletionTimestamp set)
+16:43:19  Error from server (NotFound): pods "tolerates-briefly" not found
+```
+
+Pod รันอยู่ประมาณ 10 วินาทีหลัง taint ถูกใส่ แล้วก็ถูก evict ตรงตามกำหนด — `tolerationSeconds` คือนาฬิกาจริงที่บังคับใช้จริง ไม่ใช่แค่คำแนะนำ
+
+### Taint `node.kubernetes.io/*` ที่ built-in
+
+Kubernetes ใส่ taint บางตัวให้อัตโนมัติ โดยไม่ต้อง operator ทำอะไรเลย — Node control-plane ของ kind มีตัวหนึ่งติดมาตั้งแต่สร้าง
+
+```text
+$ kubectl describe node scheduling-control-plane | grep Taints
+Taints:             node-role.kubernetes.io/control-plane:NoSchedule
+```
+
+taint built-in ที่สำคัญด้าน operation ที่สุดคือ `node.kubernetes.io/not-ready` กับ `node.kubernetes.io/unreachable` (ทั้งคู่ `NoExecute` ถูกใส่โดย node controller ทันทีที่ condition `Ready` ของ Node เป็น false หรือ node controller ขาดการติดต่อกับมัน) และ `node.kubernetes.io/unschedulable` (`NoSchedule` สะท้อน `kubectl cordon`) ทุก Pod tolerate `not-ready`/`unreachable` เป็นเวลา `300s` โดย default (ผ่าน `tolerationSeconds` default ที่ API server ใส่ให้อัตโนมัติ) — นี่คือกลไกเบื้องหลังพอดีของ "Pod รอดจาก node ที่สะดุดสั้น ๆ แต่ถูก evict ถ้า Node ล่มค้างไว้"
+
+<Mermaid title="Taint ผลัก Pod ธรรมดาออก ในขณะที่ Pod ที่มี toleration ตรงกันผ่านเข้าไปได้ ภายใต้เงื่อนไข tolerationSeconds" code={taintRepelDiagram} />
 
 export const taintRepelDiagram = `flowchart LR
   node["Node: gpu-node-1\\n(tainted hardware=gpu:NoSchedule)"]
   podA["Pod A: no toleration"] -- blocked --> node
-  podB["Pod B: tolerates hardware=gpu"] -- scheduled --> node`;
+  podB["Pod B: tolerates hardware=gpu"] -- scheduled --> node
+  node2["Node: tainted NoExecute + tolerationSeconds: 10"] --> podC["Pod C: tolerates for 10s, then evicted"]`;
+
+## Mental Model
+
+จริง ๆ แล้วมีแค่สองทิศทางในบทนี้ และทุกอย่างเป็นหนึ่งในสองแบบ **ดึง**: `nodeSelector`, node affinity, pod affinity และครึ่ง preferred ของ `topologySpreadConstraints` ล้วนอธิบายสิ่งที่ Pod *ต้องการ* — Node ที่มี label, ความใกล้กับ Pod อื่น, การกระจายที่เท่ากัน — และ Pod ที่ไม่ได้สิ่งที่ต้องการก็จะค้างที่ `Pending` (`required`) หรือยอมรับตัวเลือกรองลงมา (`preferred`) **ผลัก**: taint อธิบายสิ่งที่ *Node* ปฏิเสธ ไม่ขึ้นกับความต้องการของ Pod เลย และมีแค่ toleration ที่ match เท่านั้นที่หักล้างการผลักนั้นได้ — มันไม่เคยกลายเป็นการดึง `topologySpreadConstraints` อยู่ตรงกลาง: มันนับ Pod ข้าม topology และ `nodeTaintsPolicy` ของมันเองตัดสินว่า taint (การผลัก) จะทำให้ Node หลุดออกจากการถูกนับเป็นเป้าหมายการกระจายด้วยหรือเปล่า — พิสูจน์ข้างบน การตั้งค่า field นี้ผิดทำให้ "กระจายเท่ากัน" กลายเป็น "ค้างตลอดกาล" แบบเงียบ ๆ
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ได้อะไร | เสียอะไร |
+|---|---|---|
+| `podAntiAffinity` `requiredDuringScheduling` | รับประกันแน่นอน: ไม่มีทาง Pod match สองตัวอยู่ domain เดียวกัน (พิสูจน์ข้างบน) | all-or-nothing — replica ตัวที่ N+1 ค้างที่ Pending ไม่มีคะแนนบางส่วน พิสูจน์ข้างบน |
+| `topologySpreadConstraints` พร้อม `maxSkew` | ปรับได้: "กระจายเท่ากัน อนุญาตความต่างได้ถึง N" แทน all-or-nothing | ต้องมี `nodeTaintsPolicy: Honor` บน cluster ที่มี Node ถูก taint/ยังไม่ Ready ไม่งั้นค้างเงียบ ๆ ได้ (พิสูจน์ข้างบน) |
+| `matchLabelKeys: [pod-template-hash]` บน spread constraint | แต่ละ generation ของ rollout ถูกกระจายแยกกัน ไม่ถูกกันหรือ skew โดย generation ที่กำลังออก (พิสูจน์ข้างบน) | ยังเป็น beta field อยู่ (เช็คแล้ว: 1.37, enabled by default) ยังไม่ใช่การรับประกันแบบ stable ที่บันทึกไว้ |
+| `preferredDuringScheduling` (node หรือ pod affinity) | ไม่มีวันบล็อกการ schedule Pod ลงที่ไหนสักที่เสมอ | ไม่มีการรับประกันเลยเมื่อมีการแย่งชิง — พิสูจน์ข้างบน soft preference ถูกข้ามได้แบบเงียบ ๆ |
+| `tolerationSeconds` บน toleration ของ `NoExecute` | ทนปัญหา Node สั้น ๆ ได้แทนที่จะ evict ทันที | ถ้าตั้งนานเกินไป Node ที่แย่จริง ๆ จะเก็บ Pod ไว้เกินเวลาที่ควรย้าย (พิสูจน์ข้างบนด้วย eviction ที่จับเวลาจริง) |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"`topologySpreadConstraints` กับ `podAntiAffinity` คือ syntax สองแบบของการรับประกันเดียวกัน"** พิสูจน์ข้างบน: `requiredDuringScheduling` ของ anti-affinity คือหนึ่งต่อ domain เข้มงวด (all-or-nothing) ส่วน `maxSkew` ของ spread อนุญาตความต่างที่ปรับได้และลดระดับได้อย่างนุ่มนวลด้วย `ScheduleAnyway`
+- **"Node control-plane ที่ถูก taint หรือยังไม่ Ready จะถูกละเว้นโดย scheduling feature อัตโนมัติ"** พิสูจน์ข้างบน: ถ้าไม่มี `nodeTaintsPolicy: Honor` Node ที่ถูก taint ยังถูกนับเป็น topology domain ที่มี 0 Pod ซึ่งอาจทำให้ `maxSkew` เป็นไปไม่ได้ที่จะพอใจที่ไหนเลย ทั่วทั้ง cluster
+- **"`preferredDuringSchedulingIgnoredDuringExecution` จะ evict Pod ถ้า preference ไม่จริงอีกต่อไปในภายหลัง"** ทั้ง `required` และ `preferred` ลงท้ายด้วย `IgnoredDuringExecution` — พิสูจน์ใน API docs และจากข้อเท็จจริงว่า affinity ทั้งสองแบบไม่เคย trigger การ evict เองเลยเมื่อ Pod รันอยู่แล้ว
+- **"toleration ดึง Pod เข้าหา Node ที่ถูก taint เหมือนที่ affinity ทำ"** พิสูจน์ข้างบน: toleration แค่หักล้าง*การผลัก*ของ taint เท่านั้น — Pod ยังต้องมี `nodeSelector` หรือกฎ affinity เพื่อถูกดึงไปที่นั่นจริง ๆ
+- **"`tolerationSeconds` เป็นแค่คำแนะนำ เหมือน soft preference"** พิสูจน์ข้างบนด้วย timestamp จริง: Pod ถูก evict ตรงตามกำหนดทันทีที่ window หมด ไม่ใช่ "สักวัน" หรือ "ถ้าสะดวก"
+
+## อ่านโค้ดที่ AI เขียน
+
+ตอน review affinity, spread หรือ toleration block ที่ AI สร้าง เช็คสิ่งเหล่านี้
+
+- `topologySpreadConstraints` ที่ไม่ได้ตั้ง `nodeTaintsPolicy` เลย บน cluster ที่มี Node control-plane หรือ Node ที่ cordon ไว้ — พิสูจน์ข้างบน อาจทำให้ scheduling ค้างเงียบ ๆ หลังจาก N Pod แรก (N = จำนวน Node ที่ไม่ถูก taint) โดยไม่มี error ที่ชี้ไปที่สาเหตุจริงเลย
+- `podAntiAffinity` `requiredDuringScheduling` ที่ใช้ทั้งที่เจตนาจริงคือ "กระจายเท่ากัน แต่อย่าบล็อกเพราะมัน" — พิสูจน์ข้างบน `required` anti-affinity คือ all-or-nothing `topologySpreadConstraints` พร้อม `whenUnsatisfiable: ScheduleAnyway` คือเครื่องมือที่อ่อนกว่าสำหรับเจตนานั้น
+- Deployment ที่ทำ rolling update พร้อม `topologySpreadConstraints` แต่ไม่มี `matchLabelKeys: [pod-template-hash]` — พิสูจน์ข้างบน ถ้าไม่มีมัน spread constraint จะผสม generation เข้าด้วยกันระหว่าง rollout ซึ่งไม่ใช่เจตนาส่วนใหญ่
+- `nodeSelector` หรือ `tolerations` ที่อ้างถึง label/taint key ที่ไม่มี Node ไหนใน cluster มีจริง — นี่คือ no-op แบบเงียบ ๆ: toleration ไม่ match อะไรเลย และ Pod ก็ schedule ได้ (หรือไม่ได้) เหมือนไม่มีมันอยู่เลย ซึ่งเข้าใจผิดได้ง่ายว่า "มันกำลังป้องกัน taint นี้อยู่" ทั้งที่มันไม่ได้ป้องกันอะไรเลย
+- `tolerationSeconds` ที่ตั้งบน taint ที่ Pod ไม่ได้เจตนาจะทนจริง ๆ (เช่น copy มาจากตัวอย่างที่ไม่เกี่ยวข้อง) — พิสูจน์ข้างบน มันคือ timer จริงที่บังคับใช้ ค่าที่ผิดจะทำให้ evict เร็วเกินไปหรือปล่อยให้ Pod อยู่บน Node ที่แย่นานเกินตั้งใจ
+- toleration ของ Node เฉพาะทาง GPU/dedicated ที่ไม่มี `nodeSelector`/affinity คู่กัน — Pod แค่หยุดถูกผลักออก มันไม่ได้ถูกดึงไปที่ Node ที่ถูก taint จึงลงที่ไหนใน cluster ก็ได้พอ ๆ กัน
+
+<SpotTheBug code={`# k8s/node-affinity-taints-and-tolerations/web-spread.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: web
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10`}>
+ดูเหมือนถูกต้อง — spread `maxSkew: 1` มาตรฐานข้าม hostname — แต่มันขาด `nodeTaintsPolicy: Honor` พิสูจน์ข้างบนบน cluster 4 Node จริง (1 control-plane + 3 worker): `kubectl explain` ยืนยันว่า default เทียบเท่ากับ `Ignore` ดังนั้น Node control-plane ที่ถูก taint และ schedule ไม่ได้ยังถูกนับเป็น topology domain ที่ถูกต้องอยู่ที่ 0 Pod match พอแต่ละ worker ทั้ง 3 ตัวมี 1 Pod แล้ว Pod เพิ่มเติมใด ๆ จะทำให้ skew เป็น `2 - 0 = 2` เกิน `maxSkew: 1` — replica ครึ่งหนึ่งพอดี (3 จาก 6) เลยค้างที่ `Pending` ถาวรด้วย `didn't match pod topology spread constraints` ทั่วทั้ง cluster โดยไม่มีปัญหา quota หรือ resource ขาดแคลนที่ไหนเลย ทางแก้คือเพิ่มบรรทัดเดียว: `nodeTaintsPolicy: Honor` ซึ่งตัด Node ที่ Pod นี้ tolerate ไม่ได้ออกจากการนับ domain คืนการกระจาย 2-2-2 ที่ตั้งใจไว้กลับมา
+</SpotTheBug>
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**Node affinity** ดึง Pod เข้าหา Node แบบแข็งด้วย **`requiredDuringSchedulingIgnoredDuringExecution`** หรือแบบอ่อนด้วย **`preferredDuringSchedulingIgnoredDuringExecution`** ส่วน **pod affinity/anti-affinity** ทำแบบเดียวกันแต่อ้างอิง Pod อื่น มักใช้กระจาย replica ออกจากกัน **taint** บน Node ทำงานตรงข้าม — คือ **ผลัก** Pod ออกเว้นแต่จะมี **toleration** ที่ match ด้วย effect **`NoSchedule`**, **`PreferNoSchedule`** และ **`NoExecute`** (ซึ่ง evict Pod ที่รันอยู่แล้วด้วย) node pool เฉพาะทางมักรวมทั้งสองอย่างเข้าด้วยกัน: taint กัน Pod ทั่วไปออก ส่วน affinity บวก toleration ดึง Pod ที่ถูกต้องเข้ามา
+**Node affinity** ดึง Pod เข้าหา Node แบบแข็งด้วย **`requiredDuringSchedulingIgnoredDuringExecution`** หรือแบบอ่อนด้วย **`preferredDuringSchedulingIgnoredDuringExecution`** (พิสูจน์ข้างบน soft preference steers การวางได้จริงโดยไม่บล็อก) **pod affinity/anti-affinity** ทำแบบเดียวกันแต่อ้างอิง Pod อื่น แต่ `required` anti-affinity คือ all-or-nothing เข้มงวด (พิสูจน์ข้างบน replica ตัวที่ 4 จาก 4 ค้าง Pending บน 3 Node) **`topologySpreadConstraints`** คือทางเลือกที่ปรับได้ — `maxSkew`/`topologyKey`/`whenUnsatisfiable` — แต่ **`matchLabelKeys`** ที่ยังเป็น beta มีผลตอน rollout (พิสูจน์ข้างบน มันทำให้การกระจายของแต่ละ generation แยกจากกัน) และ **`nodeTaintsPolicy`** ของมัน default เป็นการนับ Node ที่ถูก taint เป็น domain ว่างเปล่า ซึ่งอาจทำให้ scheduling ค้างเงียบ ๆ ทั่วทั้ง cluster (พิสูจน์ข้างบน) เว้นแต่จะตั้งเป็น **`Honor`** **taint** บน Node ทำงานตรงข้าม — คือ **ผลัก** Pod ออกเว้นแต่จะมี **toleration** ที่ match ด้วย effect **`NoSchedule`**, **`PreferNoSchedule`** และ **`NoExecute`** (ซึ่ง evict Pod ที่รันอยู่แล้วด้วยนาฬิกา **`tolerationSeconds`** จริงที่บังคับใช้จริง พิสูจน์ข้างบน) บวก taint `node.kubernetes.io/*` ที่ cluster ใส่ให้อัตโนมัติ
 </Callout>
 
 export const quizAffinity = [
@@ -160,6 +387,7 @@ export const quizAffinity = [
       'preferred เข้มงวดกว่า required',
     ],
     answer: 1,
+    explain: 'พิสูจน์ข้างบน: Pod ที่มีแค่กฎ preferred ลงที่ Node ที่ preferred ทุกครั้งจากตัวเลือกสามตัว แต่กฎ required ที่ไม่มีที่ไหน match เลยจะทำให้ Pod ค้าง Pending',
   },
   {
     q: 'Node มี taint effect เป็น NoExecute จะเกิดอะไรกับ Pod ที่รันอยู่บน Node นั้นแล้วโดยไม่มี toleration ที่ match',
@@ -170,6 +398,7 @@ export const quizAffinity = [
       'taint จะถูกมองข้ามสำหรับ Pod ที่รันอยู่แล้วตลอดไป',
     ],
     answer: 1,
+    explain: 'NoExecute evict Pod ที่รันอยู่แล้วที่ไม่มี toleration match ต่างจาก NoSchedule ที่กันแค่ Pod ใหม่',
   },
   {
     q: 'ความต่างด้านทิศทางหลักระหว่าง affinity กับ taint/toleration คืออะไร',
@@ -180,16 +409,51 @@ export const quizAffinity = [
       'taint ดึง Pod เข้ามา affinity ผลักออก',
     ],
     answer: 1,
+    explain: 'affinity คือ Pod แสดงความต้องการต่อบางสิ่ง ส่วน taint คือ Node ผลักทุกอย่างออกยกเว้น toleration ที่ชัดเจน — toleration หักล้างการผลัก ไม่ได้สร้างการดึง',
   },
   {
-    q: 'podAntiAffinity ที่ใช้ topologyKey: kubernetes.io/hostname ทำอะไรให้ Deployment โดยทั่วไป',
+    q: '```text\n$ kubectl describe pod web-anti-6476995565-glvpv\nWarning  FailedScheduling  0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 node(s) didn\'t match pod anti-affinity rules.\n```\nนี่คือ replica ตัวที่ 4 ของ Deployment ที่ใช้ podAntiAffinity requiredDuringScheduling บน cluster 3-worker ทำไมมันถึงค้างที่ Pending และอะไรจะแก้ได้',
     options: [
-      'บังคับให้ replica ทั้งหมดไปอยู่ Node เดียว',
-      'กระจาย replica ไปยัง Node ต่างกัน ทำให้ Node เสียหนึ่งตัวไม่กระทบเกินหนึ่ง replica',
-      'ลบ Pod ที่ซ้ำกันอัตโนมัติ',
-      'ปิดการ schedule ของ Deployment ทั้งหมด',
+      'เป็น error ชั่วคราวที่จะหายเองถ้า retry',
+      'requiredDuringScheduling anti-affinity คือ all-or-nothing (หนึ่งต่อ Node); topologySpreadConstraints พร้อม maxSkew จะอนุญาตมากกว่าหนึ่งต่อ Node แทน',
+      'image pull ล้มเหลว',
+      'selector ของ Deployment ตั้งผิด',
     ],
     answer: 1,
+    explain: 'พิสูจน์ข้างบน: มีแค่ 3 Node และกฎ anti-affinity แบบแข็งหนึ่งต่อ hostname replica ตัวที่ 4 ไม่เหลือที่ให้ไปแล้ว — topologySpreadConstraints แสดง skew ที่ปรับได้แทนเพดานเข้มงวดนี้',
+  },
+  {
+    q: '```yaml\ntopologySpreadConstraints:\n  - maxSkew: 1\n    topologyKey: kubernetes.io/hostname\n    whenUnsatisfiable: DoNotSchedule\n    labelSelector:\n      matchLabels: { app: web }\n```\nบน cluster ที่มี Node control-plane ถูก taint นี่กระจาย 6 replica ข้าม 3 worker แต่ครึ่งหนึ่งค้างที่ Pending ขาดอะไรไป',
+    options: [
+      'maxSkew ควรตั้งเป็น 3',
+      'nodeTaintsPolicy: Honor — ถ้าไม่มี Node ที่ถูก taint ยังถูกนับเป็น topology domain ว่างเปล่า ทำให้ skew เป็นไปไม่ได้ที่จะพอใจหลังจาก 3 Pod แรก',
+      'labelSelector ตั้งผิด',
+      'whenUnsatisfiable ควรเป็น ScheduleAnyway',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบนด้วย kubectl explain: nodeTaintsPolicy default เทียบเท่า Ignore ดังนั้น Node ที่ถูก taint ที่ Pod นี้ tolerate ไม่ได้ยังถูกนับเป็น domain ที่มี 0 Pod ทำให้การวางเพิ่มเติมใด ๆ ละเมิด maxSkew: 1',
+  },
+  {
+    q: 'ทำไมการเพิ่ม matchLabelKeys: [pod-template-hash] ให้ topologySpreadConstraints ถึงสำคัญระหว่าง rolling update',
+    options: [
+      'ไม่มีผลระหว่าง rollout เลย',
+      'มันจำกัดขอบเขตการคำนวณ skew ให้อยู่แค่ Pod ของ ReplicaSet generation เดียวกัน ทำให้การกระจายของ rollout ใหม่ไม่ถูกกันหรือ skew โดยตำแหน่งของ generation ที่กำลังออก',
+      'มันปิด topology spread ทั้งหมดระหว่าง rollout',
+      'มันบังคับให้ทุก generation ไปอยู่ Node เดียวกัน',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบน: ถ้าไม่มีมัน surge Pod ระหว่าง rollout อาจลงบน Node ที่มี Pod generation เก่าอยู่แล้ว นับรวมกัน; มีมันแล้วแต่ละ generation กระจายแยกกันจากการนับ 0 ใหม่เสมอ',
+  },
+  {
+    q: 'Pod มี tolerationSeconds: 10 บน toleration ของ NoExecute และ taint ที่ match ถูกใส่บน Node ของมัน จะเกิดอะไรขึ้นจริง',
+    options: [
+      'Pod tolerate taint ตลอดไปเมื่อถูกใส่แล้ว',
+      'Pod ถูก evict เกือบทันที tolerationSeconds ถูกมองข้ามสำหรับ NoExecute',
+      'Pod ยังรันต่อประมาณ 10 วินาทีหลัง taint ถูกสังเกตเห็น แล้วถูก evict — นาฬิกาจริงที่บังคับใช้',
+      'taint ถูกลบอัตโนมัติหลัง 10 วินาที',
+    ],
+    answer: 2,
+    explain: 'พิสูจน์ข้างบนด้วย timestamp จริง: Pod รันอยู่ประมาณ window ที่ตั้งไว้ แล้วเปลี่ยนเป็น Succeeded/ถูกลบตรงตามกำหนด',
   },
 ];
 
