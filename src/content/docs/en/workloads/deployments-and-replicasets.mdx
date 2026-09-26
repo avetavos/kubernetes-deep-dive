@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
@@ -99,11 +100,165 @@ spec:
 
 `Recreate` causes a brief outage, so it is reserved for cases where the old and new versions genuinely cannot run side by side — for example, an application that cannot tolerate two schema versions hitting the same database at once.
 
+## `maxUnavailable: 0` and `maxSurge: 0` together: a real API-server rejection
+
+The two knobs are not independent — together they must leave the rollout *some* way to make progress. Setting both to `0` means "never let a Pod be unavailable, and never create an extra one either," which is not a strategy, it is a rollout that can never move a single replica from old to new. The API server rejects it outright, not at runtime — at `apply` time:
+
+```yaml
+# k8s/deployments-and-replicasets/deployment-zero-zero.yaml — @expect-error maxUnavailable: 0 is invalid when maxSurge is also 0
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 0
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10
+```
+
+```text
+$ kubectl apply --dry-run=server -f deployment-zero-zero.yaml
+The Deployment "web" is invalid: spec.strategy.rollingUpdate.maxUnavailable: Invalid value: 0: may not be 0 when `maxSurge` is 0
+```
+
+That is the exact, real validation error text from a live 1.37 API server — this is caught before anything is created, not discovered as a stuck rollout later.
+
+## `minReadySeconds`: available is not the same as ready
+
+A Pod reaching `Ready` does not immediately count as *available* to the rollout — `minReadySeconds` is the extra time a Pod must stay continuously `Ready` before the Deployment controller considers it available and lets the rollout proceed to the next Pod. With `minReadySeconds: 5` on a Deployment whose Pods become `Ready` almost instantly, a real rollout genuinely pauses on this exact message multiple times before completing:
+
+```yaml
+# k8s/deployments-and-replicasets/deployment-minreadyseconds.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  minReadySeconds: 5
+  progressDeadlineSeconds: 30
+  selector:
+    matchLabels:
+      app: web
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10
+```
+
+```text
+$ kubectl apply -f deployment-with-minreadyseconds.yaml && kubectl rollout status deployment/web
+Waiting for deployment "web" rollout to finish: 0 of 3 updated replicas are available...
+Waiting for deployment "web" rollout to finish: 0 of 3 updated replicas are available...
+Waiting for deployment "web" rollout to finish: 0 of 3 updated replicas are available...
+deployment "web" successfully rolled out
+```
+
+Three consecutive "0 of 3 ... available" lines for Pods that were already `Ready` within a second is `minReadySeconds` doing its job — the Deployment is deliberately holding each new Pod at "Ready but not yet available" for those extra 5 seconds before trusting it, which is exactly the guard you want against a Pod that passes its readiness probe immediately but isn't actually warmed up.
+
+## `progressDeadlineSeconds` and `ProgressDeadlineExceeded`
+
+`progressDeadlineSeconds` bounds how long the Deployment controller will wait for a rollout to make *any* forward progress before giving up and marking it stalled — this is what catches a rollout to a broken image that will never pass its readiness probe, instead of leaving it "in progress" forever. Proof: a Deployment with `progressDeadlineSeconds: 15` and a readiness probe that always fails:
+
+```yaml
+# k8s/deployments-and-replicasets/deployment-progress-deadline.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-baddeploy
+spec:
+  replicas: 2
+  progressDeadlineSeconds: 15
+  selector:
+    matchLabels:
+      app: web-baddeploy
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: web-baddeploy
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10
+          readinessProbe:
+            exec:
+              command: ['false']
+            periodSeconds: 2
+            failureThreshold: 1
+```
+
+```text
+$ kubectl rollout status deployment/web-baddeploy --timeout=5s
+error: deployment "web-baddeploy" exceeded its progress deadline
+```
+
+```text
+$ kubectl get deployment web-baddeploy -o jsonpath='{range .status.conditions[*]}{.type}{"="}{.status}{" reason="}{.reason}{" msg="}{.message}{"\n"}{end}'
+Available=False reason=MinimumReplicasUnavailable msg=Deployment does not have minimum availability.
+Progressing=False reason=ProgressDeadlineExceeded msg=ReplicaSet "web-baddeploy-56d9694579" has timed out progressing.
+```
+
+`Progressing=False` with `reason: ProgressDeadlineExceeded` is the real, queryable signal — an alert or a CI gate should watch this condition, not just "is the Deployment done yet," since a stuck rollout otherwise sits silently `Progressing=True` forever with no readiness ever coming.
+
+## `selector` is immutable
+
+A Deployment's `spec.selector` is set once and can never change afterward — not even to add a label — because changing it would silently orphan every existing Pod/ReplicaSet the old selector matched. Proof, changing an existing Deployment's selector from `{app: web}` to `{app: web, tier: frontend}`:
+
+```text
+$ kubectl apply -f deployment-selector-changed.yaml
+The Deployment "web" is invalid: spec.selector: Invalid value: {"matchLabels":{"app":"web","tier":"frontend"}}: field is immutable
+```
+
+If you genuinely need a different selector, the only real path is deleting and recreating the Deployment (with `--cascade=orphan` if you want the existing Pods to survive it, then adopting them under the new selector) — there is no in-place migration.
+
+## `pod-template-hash`: how the ownership chain actually works
+
+Every Pod a Deployment's ReplicaSet creates gets an extra label, `pod-template-hash`, computed from (and unique to) that ReplicaSet's Pod template — it is how a Deployment tells "old ReplicaSet's Pods" apart from "new ReplicaSet's Pods" without any other bookkeeping:
+
+```text
+$ kubectl get pods -l app=web --show-labels
+NAME                   READY   STATUS    RESTARTS   AGE   LABELS
+web-795568db48-6c6tv   1/1     Running   0          5s    app=web,pod-template-hash=795568db48
+web-795568db48-j4fh2   1/1     Running   0          5s    app=web,pod-template-hash=795568db48
+web-795568db48-wll9g   1/1     Running   0          5s    app=web,pod-template-hash=795568db48
+```
+
+The ReplicaSet itself is named `<deployment>-<pod-template-hash>` (`web-795568db48` above) — the same hash is both the ReplicaSet's name suffix and every one of its Pods' `pod-template-hash` label, which is also what a Service selector matching only `app: web` (not the hash) keeps routing to correctly across a rollout: it never needs to know which ReplicaSet is "current."
+
 ## Operating a rollout
 
 ```bash
 # Trigger a rollout by changing the Pod template (e.g. a new image), then watch it
 kubectl set image deployment/web web=myregistry/web:1.2.0
+kubectl annotate deployment/web kubernetes.io/change-cause="bump to 1.2.0" --overwrite
 kubectl rollout status deployment/web
 
 # See every revision this Deployment has kept
@@ -116,8 +271,105 @@ kubectl rollout undo deployment/web
 kubectl scale deployment/web --replicas=5
 ```
 
+Real output from that sequence, on a Deployment created with `kubernetes.io/change-cause: "initial rollout: web:1.0.0"`, then updated to `pause:3.9` with a new change-cause, then rolled back:
+
+```text
+$ kubectl rollout history deployment/web
+deployment.apps/web
+REVISION  CHANGE-CAUSE
+1         initial rollout: web:1.0.0
+2         bump pause 3.9 -> testing rollback
+
+$ kubectl rollout history deployment/web --revision=2
+deployment.apps/web with revision #2
+Pod Template:
+  Labels:	app=web
+	pod-template-hash=587c49f48d
+  Annotations:	kubernetes.io/change-cause: bump pause 3.9 -> testing rollback
+  Containers:
+   web:
+    Image:	registry.k8s.io/pause:3.9
+...
+
+$ kubectl rollout undo deployment/web
+Warning: resource deployments/web was previously managed with 'kubectl apply'. Rolling back will not update the kubectl.kubernetes.io/last-applied-configuration annotation, which may cause unexpected behavior on future 'kubectl apply' operations. Consider using 'kubectl apply' with your previous configuration file instead.
+deployment.apps/web rolled back
+
+$ kubectl rollout history deployment/web
+deployment.apps/web
+REVISION  CHANGE-CAUSE
+2         bump pause 3.9 -> testing rollback
+3         initial rollout: web:1.0.0
+```
+
+Two things worth noticing in real output: `kubectl rollout history` only shows a `CHANGE-CAUSE` when the Deployment carries the `kubernetes.io/change-cause` annotation (there's no `--record` flag in kubectl 1.36 — it was removed; annotate explicitly instead) — and `rollout undo` doesn't erase revision 1, it makes rolling back **itself** a new revision (3), copying revision 1's template forward, and the real CLI warns you that `apply`-managed Deployments can drift their `last-applied-configuration` annotation after an `undo`.
+
+## Reading AI-generated code
+
+When reviewing a generated Deployment, check for:
+
+- `maxUnavailable: 0` paired with `maxSurge: 0` — proven above, this is a real, immediate API-server rejection, not a valid "extra safe" rollout setting.
+- A `selector` that was changed on an *existing* Deployment (rather than set once at creation) — proven above, `spec.selector` is immutable and the apply will fail with `field is immutable`; the generated fix should create a new Deployment, not attempt an in-place selector edit.
+- No `progressDeadlineSeconds` (or the 600s default left as-is) on a Deployment fronted by an SLA/alert — without it, a rollout to a broken image sits `Progressing=True` forever with no automatic `ProgressDeadlineExceeded` signal to page on, proven above.
+- A rollout change with no `kubernetes.io/change-cause` annotation — `kubectl rollout history` then shows a revision with a blank `CHANGE-CAUSE`, making `rollout undo` a guess instead of an informed choice.
+- `minReadySeconds` assumed to mean "how long to wait before starting the next Pod" when it actually means "how long a Pod must stay Ready before counting as available at all" — the distinction matters for reading `kubectl rollout status` output, proven above with the repeated "0 of N replicas are available" lines.
+
+<SpotTheBug code={`# k8s/deployments-and-replicasets/web-fast-rollback.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: web
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 0
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: myregistry/web:2.0.0`}>
+This is trying to express "zero-downtime, no extra capacity used" but it describes a rollout that can never move: with `maxUnavailable: 0`, no existing Pod may go down before its replacement is ready; with `maxSurge: 0`, no replacement Pod may even be created above the desired count. There is no way left to create a new Pod or free room for one. This is not a slow rollout, it's a *rejected* one — proven above on a real 1.37 API server:
+
+```text
+The Deployment "web" is invalid: spec.strategy.rollingUpdate.maxUnavailable: Invalid value: 0: may not be 0 when `maxSurge` is 0
+```
+
+The fix is to pick one knob to be the "room to move": `maxSurge: 1` (create one extra Pod at a time, true zero-downtime) or `maxUnavailable: 1` (accept one Pod briefly missing at a time, no extra capacity used) — never both `0`.
+</SpotTheBug>
+
+## Mental Model
+
+A Deployment is not "the thing that runs your Pods" — it is a **generator of ReplicaSets**, one per distinct Pod template it has ever been given, and the rollout is entirely a story about shifting the replica count between exactly two of them (old, new) under the constraints of `maxUnavailable`/`maxSurge`. Every other feature here is either a constraint on that shift (`minReadySeconds` slows how fast a new Pod counts, `progressDeadlineSeconds` bounds how long the shift may stall) or a fact about its bookkeeping (`selector` is the immutable question "which Pods are mine," `pod-template-hash` is the immutable answer "which generation is this Pod from," change-cause annotations are the human-readable trail through `rollout history`).
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| `maxSurge: 1, maxUnavailable: 0` | True zero-downtime — capacity never drops | Briefly uses more resources than the steady-state replica count |
+| `maxUnavailable: 1, maxSurge: 0` | Never exceeds the steady-state resource footprint | Capacity briefly drops by one replica during rollout |
+| `maxUnavailable: 0, maxSurge: 0` | — none, proven above this is a real, immediate rejection | Cannot be applied at all |
+| `minReadySeconds > 0` | Catches a Pod that passes readiness immediately but isn't actually warmed up (proven above) | Slows every rollout by that many seconds per batch, always, whether or not it was needed |
+| `progressDeadlineSeconds` (explicit, not the 600s default) | A stuck rollout surfaces `ProgressDeadlineExceeded` fast enough to page on (proven above) | Too low a value can flag a rollout that was just legitimately slow (large images, cold caches) as failed |
+| `kubernetes.io/change-cause` annotation | `rollout history`/`rollout undo` become informed, auditable operations (proven above) | One more thing to remember to set on every change; nothing enforces it |
+
+## Common Misconceptions
+
+- **"Setting both maxUnavailable and maxSurge to 0 is the safest possible rollout."** Proven above: it is not applied at all, the API server rejects it with a real validation error.
+- **"minReadySeconds delays when the rollout starts."** Proven above: it delays when an already-Ready Pod counts as *available*, which is what gates the rollout's next step — the Pod is genuinely serving traffic during that window, it just isn't trusted as a rollout-progress signal yet.
+- **"A Deployment's selector can be edited like any other field, as long as the new selector still matches the same Pods."** Proven above: `spec.selector` is immutable at the API level regardless of whether the new value would match the same or different Pods.
+- **"kubectl rollout undo re-applies revision 1's manifest and there's nothing left to undo further back."** Proven above: undo creates a brand-new revision (3) with revision 1's template — the history keeps growing, it isn't a stack that empties.
+
 <Callout title="The one-line takeaway">
-A **ReplicaSet** keeps a fixed count of Pods matching a selector running; a **Deployment** manages ReplicaSets for you, following the chain **Deployment → ReplicaSet → Pod**, and adds declarative rolling updates (tuned with `maxUnavailable`/`maxSurge`, or the downtime-accepting `Recreate` strategy) plus a revision history you can inspect with `kubectl rollout history` and undo with `kubectl rollout undo`.
+A **ReplicaSet** keeps a fixed count of Pods matching a selector running; a **Deployment** manages ReplicaSets for you, following the chain **Deployment → ReplicaSet → Pod** (each generation tagged with its own immutable **`pod-template-hash`**), and adds declarative rolling updates tuned with `maxUnavailable`/`maxSurge` — both `0` together is a real, proven API-server rejection, not an extra-safe setting — plus `minReadySeconds` (Ready ≠ available, proven above) and `progressDeadlineSeconds` (a stalled rollout surfaces as `Progressing=False, reason=ProgressDeadlineExceeded`, proven above). `spec.selector` is immutable once set. Inspect history with `kubectl rollout history` (populated by the `kubernetes.io/change-cause` annotation, not a `--record` flag) and undo with `kubectl rollout undo`, which adds a **new** revision rather than erasing anything.
 </Callout>
 
 export const quizDeployments = [
@@ -130,6 +382,7 @@ export const quizDeployments = [
       'ReplicaSets manage Deployments, not the other way around',
     ],
     answer: 1,
+    explain: 'You edit the Deployment (image, replicas, strategy); it creates a new ReplicaSet for a changed Pod template and shifts replicas from the old one to the new one for you.',
   },
   {
     q: 'During a RollingUpdate, what do maxUnavailable and maxSurge each control?',
@@ -140,6 +393,7 @@ export const quizDeployments = [
       'maxSurge deletes old Pods immediately regardless of readiness',
     ],
     answer: 0,
+    explain: 'maxUnavailable bounds how far below the desired replica count the rollout may drop; maxSurge bounds how far above it may temporarily go while creating replacements.',
   },
   {
     q: 'How do you roll back a Deployment to its previous working revision?',
@@ -150,6 +404,7 @@ export const quizDeployments = [
       'Edit the ReplicaSet selector',
     ],
     answer: 1,
+    explain: 'kubectl rollout undo rolls the Deployment back to the previous revision (or a specific one with --to-revision) -- proven above, this adds a new revision rather than deleting history.',
   },
   {
     q: 'Why would you choose the Recreate strategy instead of RollingUpdate?',
@@ -160,6 +415,29 @@ export const quizDeployments = [
       'It is required for every Deployment by default',
     ],
     answer: 1,
+    explain: 'Recreate terminates every old Pod before creating any new one, causing a brief outage -- worth it only when the two versions genuinely cannot coexist (e.g. an incompatible schema change).',
+  },
+  {
+    q: '```yaml\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxUnavailable: 0\n      maxSurge: 0\n```\nWhat happens when this is applied to a real 1.37 cluster?',
+    options: [
+      'It rolls out slowly but successfully, one Pod at a time',
+      'The API server rejects it immediately with a validation error -- these two fields cannot both be 0',
+      'It silently falls back to maxSurge: 1',
+      'It is accepted, but the rollout hangs forever with no error',
+    ],
+    answer: 1,
+    explain: 'Proven above with the real, exact error: "spec.strategy.rollingUpdate.maxUnavailable: Invalid value: 0: may not be 0 when `maxSurge` is 0" -- rejected at apply time, not discovered later as a stuck rollout.',
+  },
+  {
+    q: '```text\nThe Deployment "web" is invalid: spec.selector: Invalid value: {"matchLabels":{"app":"web","tier":"frontend"}}: field is immutable\n```\nWhat real change to an existing Deployment produced this exact error?',
+    options: [
+      'Changing the container image',
+      'Changing spec.selector.matchLabels on an existing Deployment',
+      'Scaling replicas from 3 to 5',
+      'Adding a new environment variable',
+    ],
+    answer: 1,
+    explain: 'Proven above: spec.selector is set once at creation and can never be changed afterward, even to add a label -- the only path is deleting and recreating the Deployment.',
   },
 ];
 

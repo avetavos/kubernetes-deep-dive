@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
@@ -64,7 +65,7 @@ spec:
 
 `wait-for-db` จะบล็อกไม่ให้ Pod เริ่มทำงานจนกว่าจะเชื่อมต่อ database ได้ แล้ว exit สำเร็จ จากนั้น `initContainers` ตัวที่เหลือและ `containers` หลักถึงจะเริ่มตามลำดับ สังเกตว่า `log-shipper` ก็อยู่ใต้ `initContainers` เหมือนกัน ไม่ได้อยู่ใน `containers` แต่มันตั้ง `restartPolicy: Always` ให้ตัวเอง แค่ field เดียวนี้แหละที่ทำให้มันกลายเป็น **native sidecar** แทนที่จะเป็น init container ธรรมดา kubelet จะ start มัน (แล้ว restart ให้ถ้า exit) ก่อน `app` จะเริ่ม และตอน Pod กำลังจะ terminate ก็จะสั่งหยุด `app` ก่อนแล้วค่อยหยุด sidecar ตัวนี้ทีหลัง log shipper เลย stream log บรรทัดสุดท้าย ๆ ได้ครบโดยไม่ถูกฆ่าทิ้งก่อนเวลา ฟีเจอร์นี้เป็น **stable/GA ตั้งแต่ Kubernetes v1.33** (เริ่มมีตั้งแต่ v1.28) ก่อนหน้านี้วิธีเดียวที่จะรัน sidecar คือใส่เป็น container ธรรมดาใน `containers` ซึ่งไม่มี guarantee เรื่องลำดับ start/stop เทียบกับ container หลักเลย `app` กับ `log-shipper` แชร์ network namespace และ volume `logs` ของ Pod ร่วมกัน ซึ่งเป็นวิธีที่ `log-shipper` อ่านไฟล์ที่ `app` เขียนได้
 
-<Mermaid title="One Pod: an init container runs first, then the main container and a sidecar share one network namespace" code={podsDiagram} />
+<Mermaid title="Pod เดียว: init container รันก่อน แล้ว main container กับ sidecar แชร์ network namespace เดียวกัน" code={podsDiagram} />
 
 export const podsDiagram = `flowchart TB
   subgraph pod["Pod app-with-sidecar (one IP, one network namespace)"]
@@ -86,12 +87,190 @@ kubectl get pod app-with-sidecar --watch
 kubectl describe pod app-with-sidecar
 ```
 
+## Pod termination lifecycle: SIGTERM, grace period และ preStop
+
+`kubectl delete pod` ไม่ได้ไปฆ่า container ของ Pod ตรง ๆ มันตั้ง `metadata.deletionTimestamp` แล้วสองอย่างนี้เริ่มทำงาน **พร้อมกัน**
+
+1. endpoint controller เริ่มเอา Pod ออกจาก `Endpoints`/`EndpointSlice` ของทุก Service ที่ Pod นี้เป็น backend อยู่
+2. kubelet รัน `preStop` hook ของ container (ถ้ามี) แล้วส่ง **SIGTERM** ไปที่ PID 1 ของแต่ละ container แล้วรอ ถ้า container ยังไม่ exit จนกว่างบประมาณ `terminationGracePeriodSeconds` ทั้งหมด (ซึ่งเวลาที่ `preStop` hook รันก็นับรวมอยู่ในนั้นด้วย) หมด kubelet จะส่ง **SIGKILL**
+
+```text
+$ kubectl explain pod.spec.terminationGracePeriodSeconds
+KIND:       Pod
+VERSION:    v1
+
+FIELD: terminationGracePeriodSeconds <integer>
+
+DESCRIPTION:
+    Optional duration in seconds the pod needs to terminate gracefully. May be
+    decreased in delete request. Value must be non-negative integer. The value
+    zero indicates stop immediately via the kill signal (no opportunity to shut
+    down). If this value is nil, the default grace period will be used instead.
+    The grace period is the duration in seconds after the processes running in
+    the pod are sent a termination signal and the time when the processes are
+    forcibly halted with a kill signal. Set this value longer than the expected
+    cleanup time for your process. Defaults to 30 seconds.
+```
+
+<Mermaid title="Pod termination: การเอาออกจาก endpoint และ preStop แข่งกันแบบขนาน, SIGTERM จะยิงก็ต่อเมื่อ preStop return แล้วเท่านั้น" code={terminationDiagram} />
+
+export const terminationDiagram = `sequenceDiagram
+  participant K as kubectl delete
+  participant EP as Endpoint controller
+  participant Kubelet
+  participant C as Container "main"
+  K->>Kubelet: pod.deletionTimestamp set
+  par endpoint removal
+    EP->>EP: remove Pod from EndpointSlice
+  and preStop hook
+    Kubelet->>C: run preStop hook
+  end
+  Kubelet->>C: SIGTERM (sent only after preStop returns)
+  Note over C: remaining grace = terminationGracePeriodSeconds minus preStop's own duration
+  Kubelet->>C: SIGKILL (if still running once remaining grace runs out)`;
+
+### พิสูจน์: การแข่งกันระหว่างการเอาออกจาก endpoint กับ preStop ด้วย timestamp จริง
+
+`Pod` (`terminationGracePeriodSeconds: 15`) ที่ trap `SIGTERM` แล้วพอรับ signal ก็ sleep 15 วินาทีก่อน exit ส่วน `preStop` hook ของมัน sleep 5 วินาที มันอยู่หลัง `ClusterIP` Service ตัวหนึ่ง พอ delete Pod นี้พร้อมกับ poll `EndpointSlice` ที่อยู่ข้างหลังทุก 300ms และ stream log ที่มี timestamp ของ container เอง จะได้ timeline จริงแบบนี้ (log ของ container เป็น UTC ส่วน endpoint poll เป็นเวลา local UTC+7 ดูแค่ผลต่างของเวลาก็พอ):
+
+```text
+# container log (kubectl logs -f term-demo --timestamps)
+2026-09-26T07:50:24.632391178Z main started
+2026-09-26T07:50:32.496035750Z preStop start
+2026-09-26T07:50:37.500057586Z preStop end
+2026-09-26T07:50:37.649504711Z SIGTERM received, sleeping 15s before exit
+# (never logged: "main exiting now" -- SIGKILL cut it off, see below)
+```
+
+```text
+# endpoint poll (kubectl get endpointslice -l kubernetes.io/service-name=term-demo, every 300ms)
+14:50:31.946884000 ready=true  addrs=[10.244.2.2]
+14:50:32.428941000 DELETE ISSUED
+14:50:32.424496000 ready=true  addrs=[10.244.2.2]   # still true -- preStop hasn't even started yet
+14:50:32.902948000 ready=false addrs=[10.244.2.2]   # <-- endpoint marked not-ready ~0.47s after delete
+...(unchanged ready=false for the next ~15s)...
+14:50:47.575059000 ready=false addrs=[]             # <-- endpoint entry fully removed
+14:50:47.925334000 DELETE RETURNED
+```
+
+```text
+# kubectl get events --field-selector involvedObject.name=term-demo
+LAST SEEN   REASON    MESSAGE
+0s          Killing   Stopping container main
+```
+
+อ่าน log สองอันคู่กัน: entry ของ `Endpoints`/`EndpointSlice` กลายเป็น not-ready **ภายในครึ่งวินาทีหลัง `kubectl delete`** ก่อนที่ `preStop` hook 5 วินาทีจะเสร็จด้วยซ้ำ (`07:50:37.500`) ยิ่งไม่ต้องพูดถึงก่อนที่ `SIGTERM` จะถูกส่ง (`07:50:37.649`) นี่แหละคือการแข่งที่ spec เตือนไว้ **การเอา readiness ออกไม่ได้เรียงมาหลัง preStop มันเกิดพร้อม ๆ กันเลย** client ที่ยังส่ง traffic ตาม endpoint list ที่ cache ไว้ (client-side load balancer, proxy ใน cluster ที่ยังไม่รู้ว่ามีการอัปเดต) ยังยิงมาที่ Pod ได้ตลอดช่วง `preStop` เลย นั่นแหละคือปัญหาที่ `preStop: sleep N` มีไว้แก้ มันซื้อเวลาที่การอัปเดต Service/kube-proxy/Ingress dataplane จริง ๆ ต้องใช้เพื่อ propagate ให้ครบก่อนที่ container จะหยุดรับ connection ใหม่จริง ๆ **ไม่ใช่** การการันตีว่าจะไม่มี traffic เข้ามาระหว่างนั้น
+
+ภาพรวมทั้งหมด: `preStop` รันไป 5 วินาที `SIGTERM` มาถึงตอน `07:50:37.649` แล้ว trap handler ของ container ก็ขอเวลาอีก 15 วินาทีเพื่อ exit อย่างสวยงาม แต่ Pod หายไปเกลี้ยงตอน `14:50:47.925` แค่ **~15.1 วินาทีหลัง delete ถูกยิงออกไป** ไม่ใช่ ~20 วินาทีที่ container ขอ (5 วินาที preStop + 15 วินาที graceful exit) บรรทัด `"main exiting now"` **ไม่เคยปรากฏใน log เลย** มันถูก `SIGKILL` กลางคัน นี่คือ `terminationGracePeriodSeconds: 15` ทำงานตามที่มันบอกไว้เป๊ะ ๆ งบประมาณถูกใช้ตั้งแต่วินาทีที่ `kubectl delete` ถูกยิง `preStop` 5 วินาทีของมันเองก็มาจากงบ 15 วินาทีนี้เหมือนกัน เหลือแค่ ~10 วินาทีหลัง `SIGTERM` ให้ container exit จริง ๆ
+
+### `terminationGracePeriodSeconds: 0` อันตราย
+
+การตั้งเป็น `0` ไม่ได้ทำให้ container shutdown เร็วแบบสวยงาม มันข้าม sequence ข้างบนเกือบทั้งหมด Pod เดิม `terminationGracePeriodSeconds: 0`:
+
+```text
+$ kubectl apply --dry-run=server -f term-demo-zero.yaml
+pod/term-demo-zero created (server dry run)     # the API server accepts it -- no validation rejects grace period 0
+```
+
+```text
+# container log
+2026-09-26T07:51:15.005753381Z main started
+2026-09-26T07:51:16.088548048Z preStop ran       # preStop *started* and logged its first line...
+# ...and nothing else. No "SIGTERM received" line was ever logged.
+```
+
+```text
+$ time kubectl delete pod term-demo-zero
+pod "term-demo-zero" deleted
+# real  0m0.055s
+```
+
+```text
+# kubectl get events --field-selector involvedObject.name=term-demo-zero
+LAST SEEN   REASON              MESSAGE
+3s          Killing             Stopping container main
+0s          FailedPreStopHook   PreStopHook failed
+```
+
+delete call return กลับมาใน **55 มิลลิวินาที** `preStop` hook ถูก start ขึ้นมา log บรรทัดแรกของมันได้ แล้วก็ถูกฆ่ากลางคันก่อนที่ `sleep 5` ของมันเองจะจบ event จริงของ kubelet คือ `FailedPreStopHook: PreStopHook failed` trap handler `SIGTERM` ของ container เองไม่เคยถูกรันเลย เพราะไม่มีเวลา grace เหลือให้ deliver แล้วรอเลย kubelet เลยไป `SIGKILL` ตรง ๆ `terminationGracePeriodSeconds: 0` เหมาะกับ Pod ที่คุณมั่นใจว่าไม่มี state และไม่ต้องการ cleanup อะไรเลย (debug/test workload บางแบบ) มันไม่ใช่วิธีแก้ที่ถูกสำหรับ "rollout/delete ของฉันช้าไป" เพราะมันทิ้งทั้ง in-flight request draining, log flushing และ endpoint-removal grace window ที่พูดถึงข้างบนไปด้วย
+
+### native sidecar หยุดทีหลังสุด พิสูจน์แล้ว
+
+ต่อยอดจากตัวอย่าง `wait-for-db` / `log-shipper` ก่อนหน้านี้ ตอน Pod ถูก delete kubelet จะหยุด container ธรรมดา (`main`) **ก่อน** ส่ง `SIGTERM` ให้ native sidecar (`initContainers` entry ที่มี `restartPolicy: Always`) ก็ต่อเมื่อ main container ทุกตัว exit ไปแล้วเท่านั้น แล้วค่อยเริ่มนับถอยหลังไปสู่การ `SIGKILL` sidecar ด้วย พิสูจน์ `terminationGracePeriodSeconds: 10`, `main` sleep 2 วินาทีหลัง `SIGTERM` ก่อน exit ส่วน sidecar แค่ trap แล้ว exit ทันที:
+
+```text
+# container "main"
+2026-09-26T07:51:35.310165627Z [main] started
+2026-09-26T07:51:37.315952878Z [main] SIGTERM received, sleeping 2s
+2026-09-26T07:51:39.320772795Z [main] exiting
+
+# container "log-shipper" (native sidecar, initContainers + restartPolicy: Always)
+2026-09-26T07:51:35.245861918Z [sidecar] started
+2026-09-26T07:51:40.267421296Z [sidecar] SIGTERM received, exiting
+```
+
+```text
+$ kubectl get events --field-selector involvedObject.name=term-demo-sidecar
+LAST SEEN   REASON    MESSAGE
+Killing     Stopping container log-shipper
+Killing     Stopping container main
+```
+
+`main` ได้รับ `SIGTERM` ตอน `07:51:37.315` และ exit เสร็จตอน `07:51:39.320`; `log-shipper` ไม่ได้รับ `SIGTERM` ของตัวเองจนกระทั่ง `07:51:40.267` **หลังจาก** `main` หายไปเรียบร้อยแล้ว นี่คือกลไกเบื้องหลัง guarantee "log shipper stream บรรทัดสุดท้ายได้ครบ" จากก่อนหน้านี้ sidecar ถูกออกแบบมาให้เป็นสิ่งสุดท้ายที่ยังยืนอยู่โดยตั้งใจ
+
 ## ทำไมถึงไม่รัน Pod เปล่า ๆ ตรง ๆ ในทางปฏิบัติ
 
 Pod ถูกออกแบบมาให้เป็น ephemeral และแทบไม่มีใคร create Pod ตรง ๆ ถ้า `kubectl apply` Pod เปล่า ๆ แล้ว node ที่ Pod นั้นอยู่ล่ม หรือ container ข้างในพัง เกินกว่าที่ `restartPolicy` จะช่วยได้ **ไม่มีอะไรมา recreate Pod นั้นให้** คือหายไปเฉย ๆ ในทางปฏิบัติคุณแทบจะ create Deployment, StatefulSet หรือ DaemonSet แทนเสมอ controller เหล่านั้นถือ Pod template ไว้ คอย watch state จริงของ cluster และ recreate Pod ทุกครั้งที่ของจริงเบี่ยงไปจากจำนวนที่ต้องการ ส่วนที่เหลือของ module นี้คือ controller พวกนั้น
 
+## อ่านโค้ดที่ AI เขียน
+
+ตอน review Pod spec ที่ AI generate มา (หรือที่ฝังอยู่ใน template ของ Deployment/StatefulSet/DaemonSet) เช็คพวกนี้
+
+- ตั้ง `terminationGracePeriodSeconds: 0` "เพื่อให้ delete เร็วขึ้น" ไหม พิสูจน์แล้วข้างบนว่านี่ทำให้ `preStop` hook ถูกฆ่ากลางคัน (`FailedPreStopHook`) และไม่มีการ deliver `SIGTERM` เลย มันไม่ได้ทำให้ shutdown ปลอดภัยหรือสะอาดขึ้น
+- container ที่อยู่หลัง Service **ไม่มี `preStop`** เลยไหม พิสูจน์แล้วข้างบนว่า `EndpointSlice` entry จะ not-ready ภายใน ~0.5 วินาทีหลัง `kubectl delete` แต่ถ้าไม่มี `preStop` sleep ก็ไม่มีอะไรมาเชื่อมช่องว่างระหว่างที่การเอาออกนั้น propagate ผ่าน kube-proxy/Ingress/mesh dataplane เลย
+- `terminationGracePeriodSeconds` ตั้งไว้ต่ำกว่าเวลาที่ shutdown code ของแอปเองต้องใช้ (flush buffer, drain connection, ปิด DB pool) ไหม container จะโดน `SIGKILL` กลางคัน shutdown พิสูจน์แล้วข้างบนด้วย sleep 15 วินาทีของ main container ที่ถูกตัดที่ ~10 วินาที
+- "sidecar" ที่ตั้ง `restartPolicy: Always` เขียนเป็น entry ธรรมดาใต้ `containers:` แทนที่จะเป็น `initContainers:` ที่มี `restartPolicy: Always` ไหม แบบนั้นมันคือ container ธรรมดาที่ไม่มี guarantee เรื่องลำดับ startup/shutdown เทียบกับ main container เลย ไม่ใช่ native sidecar
+- Pod สมมติว่า `restartPolicy: Always` restart container ที่ exit `0` ด้วยไหม ใช่ จริง ๆ `Always` restart ทุก exit ไม่ว่าจะสำเร็จหรือพัง ซึ่งถูกต้องสำหรับ service ที่รันระยะยาว แต่เป็นจุดสับสนที่พบบ่อยเวลาคนคาดว่า "restart แค่ตอน crash เท่านั้น"
+
+<SpotTheBug code={`# k8s/pods-the-atomic-unit/fast-shutdown.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: web
+spec:
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: web
+      image: myregistry/web:1.4.0
+      ports:
+        - containerPort: 8080`}>
+ดูเหมือนเป็นการปรับแบบไม่มีพิษภัยเพื่อให้ "deploy/delete ไวขึ้น" แต่จริง ๆ คืออันตรายที่พิสูจน์ไว้ข้างบนเป๊ะ ๆ ด้วย `terminationGracePeriodSeconds: 0`, kubelet ไม่รอให้ `preStop` hook รันจบ (ตัวจริงบน cluster เดียวกันนี้ถูกตัดกลางคัน log event `FailedPreStopHook: PreStopHook failed`) และไม่ deliver `SIGTERM` เลย มันไป `SIGKILL` ตรง ๆ วัดได้ข้างบนแค่ **55 มิลลิวินาที** จาก `kubectl delete` จน Pod หายไป สำหรับ Pod ที่ serve traffic จริงอยู่หลัง Service นั่นหมายความว่า in-flight request ถูกฆ่าทิ้งตรง ๆ แอปไม่มีโอกาส close connection แบบสวยงามเลย ซ้อนทับกับปัญหาการแข่งกันเรื่องเอา endpoint ออกที่พูดถึงข้างบนอีก วิธีแก้คือเอา field นี้ออกไปเลย (จะกลับไปใช้ default 30 วินาที) หรือใส่ค่าที่ตรงกับความจริง (`terminationGracePeriodSeconds: 15`) ให้พอดีกับเวลา shutdown จริงของแอป แล้วเพิ่ม `preStop` sleep ถ้าแอปอยู่หลัง Service
+</SpotTheBug>
+
+## Mental Model
+
+การ shutdown ของ Pod ไม่ใช่แค่ "kill process" มันคือ **การส่งมอบงานแบบมี deadline** cluster เริ่มเอา Pod ออกจาก service discovery และรันโค้ด cleanup ของคุณพร้อมกันในจังหวะเดียวกัน และมันจะบังคับจบ process ทันทีที่นาฬิกาที่คุณตั้ง (`terminationGracePeriodSeconds`) หมดเวลา ไม่ว่า cleanup ของคุณจะไปถึงไหนแล้วก็ตาม `preStop` กับ `SIGTERM` handler ของแอปเองไม่ใช่สอง phase อิสระที่มีงบของตัวเอง มันแชร์งบ **เดียวกัน** นับตั้งแต่วินาทีที่ `kubectl delete` รัน guarantee เรื่องลำดับของ native sidecar (start ก่อน หยุดทีหลัง) มีไว้เพื่อให้ support container (log shipper, proxy) ไม่มีวันถูกดึงออกจากใต้สิ่งที่มันกำลัง support อยู่
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ได้อะไร | เสียอะไร |
+|---|---|---|
+| `terminationGracePeriodSeconds` นานขึ้น | แอปมีเวลาจริง ๆ ในการ drain connection/flush data (พิสูจน์ข้างบน: sleep 15 วินาทีของแอปถูกตัดก่อนจบที่งบ default) | `kubectl delete`/rollout ช้าลง; container ที่ hang จริง ๆ ก็ใช้เวลานานขึ้นกว่าจะถูกบังคับเอาออก |
+| `preStop: sleep N` | เชื่อมช่องว่างจริงระหว่าง "Pod ถูก mark ให้ delete" กับ "ทุก dataplane component หยุด route มาแล้ว" (พิสูจน์ข้างบน: endpoint ไปที่ not-ready ใน ~0.5 วินาที ก่อน preStop 5 วินาทีจะจบด้วยซ้ำ) | เพิ่ม N วินาทีให้ทุกการ terminate ของ Pod ไม่ว่าจะมี in-flight traffic ให้ drain จริงหรือไม่ |
+| `terminationGracePeriodSeconds: 0` | เอา Pod ออกได้เร็วระดับเสี้ยววินาที (พิสูจน์ข้างบน: 55ms) | ไม่มี preStop จบ ไม่มี SIGTERM deliver ไม่มี graceful shutdown เลย พิสูจน์ข้างบนด้วย event `FailedPreStopHook` จริง |
+| native sidecar (`initContainers` + `restartPolicy: Always`) | รับประกันลำดับหยุดทีหลังสุด (พิสูจน์ข้างบน) สำหรับ log shipper/proxy ที่ต้องอยู่นานกว่า main container | container เพิ่มอีกตัวที่กินทรัพยากรและต้องดูแลให้ healthy ตลอดอายุ Pod |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"preStop กับ SIGTERM handler ของแอปได้ terminationGracePeriodSeconds เต็ม ๆ คนละชุด"** พิสูจน์แล้วข้างบน มันแชร์งบเดียวกัน `preStop` 5 วินาทีเทียบกับ grace period 15 วินาที เหลือแค่ ~10 วินาทีให้แอป shutdown แบบสวยงามหลัง `SIGTERM`
+- **"Pod หยุดรับ traffic ก็ต่อเมื่อ container exit จริง ๆ แล้ว"** พิสูจน์แล้วข้างบน `EndpointSlice` entry ไปที่ not-ready ~0.5 วินาทีหลัง `kubectl delete` ก่อน container จะได้รับ `SIGTERM` ตั้งหลายวินาที การเอา readiness ออกวิ่งแซงหน้า lifecycle ของ container มันไม่รอ
+- **"terminationGracePeriodSeconds: 0 แค่ข้ามการรอ ขั้นตอน shutdown ยังรันอยู่ แค่เร็วขึ้น"** พิสูจน์แล้วข้างบนด้วย event `FailedPreStopHook` จริง preStop hook ถูกฆ่ากลางคันและ `SIGTERM` ไม่เคยถูก deliver เลย มันไม่ใช่ graceful shutdown แบบเร็ว มันคือไม่มี graceful shutdown เลย
+- **"native sidecar กับ main container หยุดพร้อมกันเพราะอยู่ Pod เดียวกัน"** พิสูจน์แล้วข้างบนด้วย timestamp จริงของแต่ละ container sidecar ได้ `SIGTERM` ช้ากว่า main container exit ไปแล้วเต็ม ๆ หนึ่งวินาที
+
 <Callout title="สรุปหนึ่งบรรทัด">
-**Pod** คือ container หนึ่งตัวหรือมากกว่าที่แชร์ network namespace เดียวกัน (IP เดียว คุยกันผ่าน **localhost** ได้) และแชร์ volume ได้ถ้าต้องการ **init container** รันจนจบตามลำดับก่อนที่ container หลักจะเริ่ม และถ้า `initContainers` ตัวไหนตั้ง `restartPolicy: Always` มันจะกลายเป็น **native sidecar** (GA ตั้งแต่ v1.33) ที่รันอยู่ตลอดอายุ Pod โดย kubelet คุมลำดับ start/stop ให้ phase ของ Pod (`Pending`/`Running`/`Succeeded`/`Failed`/`Unknown`) และ `restartPolicy` (`Always`/`OnFailure`/`Never`) คุม lifecycle ของตัวเอง แต่ **Pod เปล่า ๆ ที่ตายไปแล้วจะไม่ถูก recreate** งานนั้นเป็นของ controller ที่จะเรียนต่อไป
+**Pod** คือ container หนึ่งตัวหรือมากกว่าที่แชร์ network namespace เดียวกัน (IP เดียว คุยกันผ่าน **localhost** ได้) และแชร์ volume ได้ถ้าต้องการ **init container** รันจนจบตามลำดับก่อนที่ container หลักจะเริ่ม และถ้า `initContainers` ตัวไหนตั้ง `restartPolicy: Always` มันจะกลายเป็น **native sidecar** (GA ตั้งแต่ v1.33) ที่รันอยู่ตลอดอายุ Pod โดย kubelet คุมลำดับ start/stop ให้ พิสูจน์แล้วข้างบนว่ามันหยุด *ทีหลังสุด* ด้วย หลัง main container ทุกตัว exit ไปแล้ว ตอน delete การเอาออกจาก endpoint กับ `preStop` hook รัน**พร้อมกัน** (พิสูจน์แล้วข้างบน: endpoint ไปที่ not-ready ใน ~0.5 วินาที ก่อน `preStop` 5 วินาทีจะจบด้วยซ้ำ) `SIGTERM` จะยิงก็ต่อเมื่อ `preStop` return แล้วเท่านั้น และงบ `terminationGracePeriodSeconds` **ทั้งหมด** (รวมเวลาของ `preStop` เองด้วย) คือสิ่งที่คั่นระหว่างนั้นกับ `SIGKILL` ตั้งเป็น `0` (พิสูจน์แล้วข้างบน) จะข้าม graceful shutdown เกือบทั้งหมด ไม่ได้ทำให้เร็วขึ้น phase ของ Pod (`Pending`/`Running`/`Succeeded`/`Failed`/`Unknown`) และ `restartPolicy` (`Always`/`OnFailure`/`Never`) คุม lifecycle ที่เหลือ แต่ **Pod เปล่า ๆ ที่ตายไปแล้วจะไม่ถูก recreate** งานนั้นเป็นของ controller ที่จะเรียนต่อไป
 </Callout>
 
 export const quizPods = [
@@ -104,6 +283,7 @@ export const quizPods = [
       'image ของ container เดียวกัน',
     ],
     answer: 1,
+    explain: 'container ทุกตัวใน Pod ได้ IP/network namespace เดียวกัน (คุยกันผ่าน localhost ได้) และแชร์ volume ที่ mount ได้ถ้าต้องการ ขอบเขตที่แชร์นี้แหละคือเหตุผลทั้งหมดที่ Pod มีอยู่เป็น concept',
   },
   {
     q: 'พฤติกรรมหลักของ init container คืออะไร',
@@ -114,6 +294,7 @@ export const quizPods = [
       'รันบน host network ของ node เท่านั้น ไม่รันใน Pod',
     ],
     answer: 1,
+    explain: 'initContainers รันจนจบตามลำดับก่อนที่ container หลักจะเริ่ม เว้นแต่ตัวไหนตั้ง restartPolicy: Always ด้วยซึ่งจะกลายเป็น native sidecar แทน (พิสูจน์แล้วข้างบนว่ามัน start ก่อนและหยุดทีหลังสุด)',
   },
   {
     q: 'Pod เปล่า ๆ (create ตรง ๆ ไม่มี controller) container ตัวเดียวข้างในพังซ้ำ ๆ แล้ว node ของตัวเองก็ล่มไปเลย เกิดอะไรขึ้นกับ Pod',
@@ -124,6 +305,7 @@ export const quizPods = [
       'scheduler จะพยายาม create Pod นั้นใหม่ไปเรื่อย ๆ ไม่มีสิ้นสุด',
     ],
     answer: 1,
+    explain: 'Pod เปล่า ๆ ไม่มี controller คอย watch พอมันหายไป (node ล่ม หรือ crash ที่ restartPolicy ช่วยไม่ได้) ไม่มีอะไร recreate ให้ Deployment/StatefulSet/DaemonSet มีไว้เพื่อทำหน้าที่นี้โดยเฉพาะ',
   },
   {
     q: 'restartPolicy ของ Pod รับค่าอะไรได้บ้าง',
@@ -134,6 +316,29 @@ export const quizPods = [
       'นับ restart count อย่างเดียว ไม่มีชื่อ policy',
     ],
     answer: 0,
+    explain: 'restartPolicy คือ Always (default ใช้กับ service ที่รันระยะยาว) OnFailure (restart เฉพาะ exit code ไม่เป็นศูนย์ ใช้กับ Job) หรือ Never',
+  },
+  {
+    q: '```yaml\napiVersion: v1\nkind: Pod\nmetadata:\n  name: web\nspec:\n  terminationGracePeriodSeconds: 0\n  containers:\n    - name: web\n      image: myregistry/web:1.4.0\n```\nจากการพิสูจน์บน cluster จริงในบทนี้ เกิดอะไรขึ้นตอน Pod นี้ถูก delete',
+    options: [
+      'shutdown แบบสวยงามแต่เร็ว: preStop รัน แล้ว SIGTERM แล้ว SIGKILL แบบไว',
+      'kubelet ข้ามการรอ preStop ให้จบ และไม่ deliver SIGTERM เลย ไป SIGKILL ตรง ๆ ในหลักมิลลิวินาที',
+      'Kubernetes reject Pod ตั้งแต่ admission เพราะ 0 ไม่ใช่ค่า grace period ที่ valid',
+      'delete จะถูกดีเลย์ไปที่ default ของ cluster 30 วินาทีเสมอไม่ว่า field นี้จะตั้งเป็นอะไร',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วข้างบน: ด้วย terminationGracePeriodSeconds: 0 preStop hook จริงถูกฆ่ากลางคัน (event FailedPreStopHook: PreStopHook failed) และ container ไม่เคยได้รับ SIGTERM เลย kubectl delete return กลับมาใน 55ms API server ยอมรับค่า 0 โดยไม่ reject',
+  },
+  {
+    q: '```text\n# container "main"\n...SIGTERM received, sleeping 2s\n...exiting\n\n# container "log-shipper" (native sidecar)\n...started\n...SIGTERM received, exiting  <-- logged AFTER "main" already exited\n```\nlog ที่มี timestamp จริงนี้พิสูจน์อะไรเรื่องลำดับการหยุดของ native sidecar',
+    options: [
+      'container ทั้งสองตัวได้ SIGTERM พร้อมกันเป๊ะ ๆ เพราะอยู่ Pod เดียวกัน',
+      'sidecar ถูกหยุดก่อน เพื่อคืนทรัพยากรก่อน main container จะ shutdown',
+      'main container ถูกส่ง SIGTERM และปล่อยให้ exit จนจบก่อนที่ native sidecar จะได้รับ SIGTERM ของตัวเอง',
+      'sidecar ไม่เคยได้รับ SIGTERM เลย ได้แต่ SIGKILL อย่างเดียว',
+    ],
+    answer: 2,
+    explain: 'พิสูจน์แล้วข้างบนด้วย timestamp จริงของแต่ละ container: main ได้ SIGTERM และ exit จบก่อนที่ log-shipper (native sidecar, initContainers entry ที่มี restartPolicy: Always) จะได้ SIGTERM ของตัวเอง kubelet การันตีว่า sidecar หยุดทีหลังสุด',
   },
 ];
 

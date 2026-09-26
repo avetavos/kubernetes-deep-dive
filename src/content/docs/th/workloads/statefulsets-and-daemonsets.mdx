@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
@@ -83,6 +84,191 @@ kubectl scale statefulset/db --replicas=2
 
 การ deploy, scale และลบ Pod ของ StatefulSet เกิดขึ้น **ทีละตัว ตามลำดับ** เสมอ `db-1` จะไม่เริ่มจนกว่า `db-0` จะรันและ ready แล้ว ส่วนการ scale ลงก็ลบ ordinal สูงสุดก่อน การเรียงลำดับแบบนี้เองที่ทำให้ logic ตอน bootstrap ของระบบ distributed พึ่งพา "สมาชิกก่อนหน้าขึ้นแล้ว" ได้อย่างปลอดภัย
 
+## `podManagementPolicy`: `OrderedReady` เทียบกับ `Parallel` วัดเวลาจริง
+
+พฤติกรรม "ทีละตัว" นั้นคือ `podManagementPolicy: OrderedReady` ซึ่งเป็นค่า default และมันถูกบังคับด้วยการรอให้ Pod หนึ่งตัว `Ready` จริง ๆ ก่อนจะ create ตัวถัดไป `Parallel` จะ create และ start ทุก replica พร้อมกันเลย ไม่มี guarantee เรื่องลำดับตอน startup เลย (ยังคง identity กับ storage ต่อ Pod ไว้เหมือนเดิม) ความต่างนี้ไม่ใช่เรื่องเล็ก ๆ พิสูจน์ 3 replica แต่ละ container ใช้เวลา ~5 วินาทีกว่าจะ `Ready`:
+
+```yaml
+# k8s/statefulsets-and-daemonsets/sts-ordered.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sts-ordered
+spec:
+  serviceName: sts-svc
+  podManagementPolicy: OrderedReady
+  replicas: 3
+  selector:
+    matchLabels:
+      app: sts-demo
+  template:
+    metadata:
+      labels:
+        app: sts-demo
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.38
+          command: ['sh', '-c', 'sleep 5 && touch /tmp/ready && sleep 3600']
+          readinessProbe:
+            exec:
+              command: ['test', '-f', '/tmp/ready']
+            periodSeconds: 1
+```
+
+```text
+$ time (kubectl apply -f sts-ordered.yaml && kubectl rollout status statefulset/sts-ordered)
+Waiting for 3 pods to be ready...
+Waiting for 2 pods to be ready...
+Waiting for 2 pods to be ready...
+Waiting for 1 pods to be ready...
+Waiting for 1 pods to be ready...
+partitioned roll out complete: 3 new pods have been updated...
+OrderedReady: all 3 Ready in 18.37s
+```
+
+manifest เดียวกัน เปลี่ยนแค่ `podManagementPolicy: Parallel`:
+
+```text
+$ time (kubectl apply -f sts-parallel.yaml && kubectl rollout status statefulset/sts-parallel)
+Waiting for 3 pods to be ready...
+Waiting for 2 pods to be ready...
+Waiting for 1 pods to be ready...
+partitioned roll out complete: 3 new pods have been updated...
+Parallel: all 3 Ready in 6.17s
+```
+
+18.4 วินาที เทียบกับ 6.2 วินาที คือประมาณ 3 เท่า เพราะ `OrderedReady` รอให้ startup 5 วินาทีของแต่ละตัวจบจริง ๆ ตามลำดับ ก่อนจะ *create* ตัวถัดไปด้วยซ้ำ (`sts-1` จะไม่ถูก create จนกว่า `sts-0` จะ `Ready`) ส่วน `Parallel` create ทั้งสามตัวทันที แล้วแต่ละตัวก็ใช้เวลา ~5 วินาทีของตัวเองพร้อมกัน เลือกใช้ `Parallel` เมื่อ replica ไม่ได้พึ่งพาลำดับ bootstrap จริง ๆ (cache ส่วนใหญ่ worker ที่ shard แบบไม่พึ่งกันหลายตัวที่ใช้ StatefulSet แค่เพื่อ identity/storage คงที่) คง default `OrderedReady` ไว้เมื่อ logic ตอน startup ของ ordinal หลังพึ่งพาว่า ordinal ก่อนหน้าขึ้นแล้ว
+
+## `serviceName` ที่หายไปหรือไม่ใช่ headless: DNS record ไม่มีอยู่จริง ๆ
+
+`serviceName` ไม่ถูก validate กับ Service จริงตอน create เลย API server ยอมรับ StatefulSet ที่ `serviceName` ชี้ไปที่ไม่มีอะไรเลย:
+
+```text
+$ kubectl apply --dry-run=server -f sts-badsvc.yaml
+statefulset.apps/sts-bad created (server dry run)   # accepted -- no check that "sts-badsvc" exists
+```
+
+ผลที่ตามมาโผล่มาแค่ตอน DNS lookup fail เท่านั้น พิสูจน์ด้วย `nslookup` จากข้างใน Pod เทียบ headless Service จริง (`sts-svc`, `clusterIP: None`) กับ Service แบบ `ClusterIP` ธรรมดา (`sts-clusterip`) ที่มี Pod selector เดียวกัน:
+
+```text
+$ kubectl exec sts-good-0 -- nslookup sts-good-0.sts-svc.default.svc.cluster.local
+Server:		10.96.0.10
+Name:	sts-good-0.sts-svc.default.svc.cluster.local
+Address: 10.244.1.10
+
+$ kubectl exec sts-good-0 -- nslookup sts-good-0.sts-clusterip.default.svc.cluster.local
+Server:		10.96.0.10
+** server can't find sts-good-0.sts-clusterip.default.svc.cluster.local: NXDOMAIN
+
+$ kubectl exec sts-good-0 -- nslookup sts-clusterip.default.svc.cluster.local
+Server:		10.96.0.10
+Name:	sts-clusterip.default.svc.cluster.local
+Address: 10.96.140.243
+```
+
+DNS name ต่อ Pod (`<pod>.<service>...`) มีอยู่ได้ก็เพราะ CoreDNS สร้างมันขึ้นจาก endpoint list ของ Service ที่เป็น **headless** เท่านั้น Service แบบ `ClusterIP` ธรรมดายัง resolve ชื่อของตัวเองได้ปกติ (A record เดียว คือ cluster IP) แค่ไม่เคยได้ record subdomain ต่อ Pod เลย ชี้ `serviceName` ไปที่ Service ที่ไม่มีอยู่จริง หรือ Service จริงแต่ไม่ใช่ headless แล้วทุก lookup `<pod-name>.<serviceName>` ที่ peer-discovery bootstrap พึ่งพาอยู่จะได้ `NXDOMAIN` กลับมาทุกครั้ง โดยไม่มี error โผล่ที่ `kubectl get`/`describe` เลยสักที่ เพราะตัว StatefulSet เองก็ healthy สมบูรณ์แบบ
+
+## Canary rollout ด้วย `updateStrategy.rollingUpdate.partition`
+
+`partition` กัน rolling update ให้ทำแค่กับ Pod ที่ **ordinal มากกว่าหรือเท่ากับ** เลข partition เท่านั้น ตัวที่ต่ำกว่านั้นถูกปล่อยไว้เฉย ๆ แม้ Pod template จะเปลี่ยนไปแล้วก็ตาม พิสูจน์ StatefulSet 3 replica, `partition: 2` แล้วเปลี่ยน image:
+
+```yaml
+# k8s/statefulsets-and-daemonsets/sts-partition.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sts-good
+spec:
+  serviceName: sts-svc
+  replicas: 3
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 2
+  selector:
+    matchLabels:
+      app: sts-demo
+  template:
+    metadata:
+      labels:
+        app: sts-demo
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.37
+```
+
+```text
+$ kubectl set image statefulset/sts-good app=busybox:1.37
+statefulset.apps/sts-good image updated
+
+$ kubectl get pods -l app=sts-demo -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[0].image}{"\n"}{end}'
+sts-good-0	busybox:1.38
+sts-good-1	busybox:1.38
+sts-good-2	busybox:1.37
+```
+
+มีแค่ `sts-good-2` (ordinal `2 >= partition 2`) เท่านั้นที่ได้ image ใหม่ `sts-good-0` กับ `sts-good-1` ไม่ถูกแตะเลย นี่แหละคือ pattern canary เป๊ะ ๆ ตรวจสอบ template ใหม่บน ordinal สูงสุดก่อน แล้วค่อยลด `partition` (หรือเอาออก) เพื่อให้ rollout เดินหน้าต่อลงมาจนถึง `0`
+
+## PVC retention: `persistentVolumeClaimRetentionPolicy`
+
+ปกติแล้ว PVC ที่ create จาก `volumeClaimTemplates` จะ **อยู่รอดยาวกว่า** StatefulSet และ Pod ของมันเสมอ การลบ StatefulSet หรือ scale ลง จะทิ้ง PVC (และ PV/data ที่ bind อยู่) ไว้แบบตั้งใจ เพราะการทำ disk ของ `db-0` หายไปโดยไม่ตั้งใจมักเป็น failure ที่แย่กว่า `persistentVolumeClaimRetentionPolicy` ให้คุณเลือก opt-in การลบอัตโนมัติแทนได้:
+
+```yaml
+# k8s/statefulsets-and-daemonsets/sts-pvc-retain.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sts-pvc-demo
+spec:
+  serviceName: sts-svc
+  replicas: 2
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Delete
+    whenScaled: Delete
+  selector:
+    matchLabels:
+      app: sts-pvc-demo
+  template:
+    metadata:
+      labels:
+        app: sts-pvc-demo
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.38
+          command: ['sh', '-c', 'sleep 3600']
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ['ReadWriteOnce']
+        resources:
+          requests:
+            storage: 1Mi
+```
+
+```text
+$ kubectl get pvc -l app=sts-pvc-demo
+NAME                  STATUS   VOLUME                                     AGE
+data-sts-pvc-demo-0   Bound    pvc-e233e68c-64ce-4ec8-9248-d37388c6adb8   17s
+data-sts-pvc-demo-1   Bound    pvc-dcc96b32-548f-4983-9540-18e503b4bcef   11s
+
+$ kubectl scale statefulset sts-pvc-demo --replicas=0
+statefulset.apps/sts-pvc-demo scaled
+
+# ... after sts-pvc-demo-1 finishes terminating ...
+$ kubectl get pvc -l app=sts-pvc-demo
+NAME                  STATUS   VOLUME                                     AGE
+data-sts-pvc-demo-0   Bound    pvc-e233e68c-64ce-4ec8-9248-d37388c6adb8   44s
+```
+
+`data-sts-pvc-demo-1` หายไปแล้ว `whenScaled: Delete` ลบมันทิ้งทันทีที่ Pod ของมัน terminate เสร็จสมบูรณ์ (ใช้เวลาตาม termination grace period ปกติของ container ไม่ใช่ตัว retention policy เองที่ควบคุมเวลานี้) scale ขึ้นกลับมาจะ create PVC **ใหม่เอี่ยม** ว่างเปล่าให้ ordinal 1 ไม่ใช่ตัวเก่า ถ้าไม่มี policy นี้ (default คือเหมือน `Retain` ทั้งคู่) การ scale `sts-pvc-demo` ขึ้นกลับมาจะ rebind PVC `data-sts-pvc-demo-1` *ตัวเดิม* พร้อม data เก่าครบเลย
+
 ## DaemonSet: หนึ่ง Pod บนทุก node
 
 **DaemonSet** ไม่มีค่า `replicas` เลย แต่จะ schedule Pod ที่ตรงเงื่อนไขพอดีหนึ่งตัวลงทุก node ใน cluster (หรือบางส่วน ถ้าจำกัดขอบเขตด้วย node selector หรือ affinity rule) พอ node ใหม่เข้าร่วม cluster DaemonSet controller ก็จะ schedule Pod ของตัวเองลง node นั้นให้อัตโนมัติ พอ node ออกไป Pod ก็หายไปด้วย นี่คือรูปแบบสำหรับ agent ระดับ node เช่น log collector, monitoring และ metrics agent และ network plugin
@@ -118,7 +304,7 @@ spec:
 kubectl get pods -l app=node-log-agent -o wide
 ```
 
-<Mermaid title="StatefulSet: ordered Pods with their own storage. DaemonSet: one Pod per node" code={statefulDaemonDiagram} />
+<Mermaid title="StatefulSet: Pod เรียงลำดับพร้อม storage ของตัวเอง. DaemonSet: หนึ่ง Pod ต่อหนึ่ง node" code={statefulDaemonDiagram} />
 
 export const statefulDaemonDiagram = `flowchart TB
   subgraph ss["StatefulSet db (ordered identity)"]
@@ -132,12 +318,165 @@ export const statefulDaemonDiagram = `flowchart TB
     n3["Node 3"] --> a3["log-agent"]
   end`;
 
+## DaemonSet `updateStrategy`: `maxSurge` ให้ตัวแทนขึ้นมาก่อนตัวเก่าจะลง
+
+`RollingUpdate` default ของ DaemonSet (`maxUnavailable: 1, maxSurge: 0`) ฆ่า Pod เก่าบน node ก่อนจะ create ตัวแทน สำหรับ agent ระดับ node นี่หมายถึงช่วง coverage ขาดหายไปสั้น ๆ บน node นั้น การตั้ง `maxSurge` (Kubernetes 1.22+) ให้ Pod **surge** ของ generation ใหม่ขึ้นมา *คู่กับ* ตัวเก่าบน node เดียวกันก่อน แล้วค่อยเอาตัวเก่าออกเมื่อตัวใหม่พร้อมแล้วเท่านั้น:
+
+```yaml
+# k8s/statefulsets-and-daemonsets/ds-maxsurge.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-agent
+spec:
+  selector:
+    matchLabels:
+      app: node-agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: node-agent
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+      containers:
+        - name: agent
+          image: busybox:1.38
+          command: ['sh', '-c', 'sleep 3600']
+```
+
+กลาง rollout ด้วย image ตัวใหม่ที่ ready ช้า `kubectl get pods -o wide` จับได้ว่า surge Pod กับ Pod เก่าอยู่ **บน node เดียวกัน** พร้อมกัน:
+
+```text
+$ kubectl get pods -l app=node-agent -o wide
+NAME               READY   STATUS    NODE
+node-agent-5bk74   1/1     Running   workloads-control-plane   # old generation, still serving
+node-agent-t2wvw   0/1     Running   workloads-control-plane   # new generation, surged in, not Ready yet
+node-agent-swgpf   1/1     Running   workloads-worker2
+node-agent-wh4m7   1/1     Running   workloads-worker
+```
+
+Pod สองตัวที่มี label `app=node-agent` อยู่บน `workloads-control-plane` พร้อมกัน นั่นคือ capacity ส่วนเกินที่ `maxSurge: 1` ซื้อมา และเป็นเหตุผลว่าทำไม `maxUnavailable: 0` ถึงปลอดภัยที่จะคู่กับมันตรงนี้ (ต่างจาก Deployment การผสมนี้ valid สำหรับ DaemonSet ตราบใดที่ `maxSurge` ไม่เป็น 0): Pod เก่าจะถูกเอาออกก็ต่อเมื่อตัวแทนถูกยืนยันว่า `Ready` แล้วเท่านั้น
+
+## Node selection: DaemonSet ไม่จำเป็นต้องหมายถึง *ทุก* node
+
+`nodeSelector` (หรือ node affinity) จำกัดขอบเขต DaemonSet ให้เหลือแค่บาง node เหมือน Pod template ทั่วไป DaemonSet controller จะ schedule ลงเฉพาะ node ที่ตรงเงื่อนไขเป๊ะ ๆ ไม่เกินนั้น:
+
+```yaml
+# k8s/statefulsets-and-daemonsets/ds-nodeselect.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gpu-agent
+spec:
+  selector:
+    matchLabels:
+      app: gpu-agent
+  template:
+    metadata:
+      labels:
+        app: gpu-agent
+    spec:
+      nodeSelector:
+        gpu: 'true'
+      containers:
+        - name: agent
+          image: busybox:1.38
+          command: ['sh', '-c', 'sleep 3600']
+```
+
+```text
+$ kubectl label node workloads-worker gpu=true
+node/workloads-worker labeled
+
+$ kubectl apply -f ds-nodeselect.yaml && kubectl rollout status daemonset/gpu-agent
+daemon set "gpu-agent" successfully rolled out
+
+$ kubectl get pods -l app=gpu-agent -o wide
+NAME              READY   STATUS    NODE
+gpu-agent-pdtsz   1/1     Running   workloads-worker
+
+$ kubectl get daemonset gpu-agent -o jsonpath='{.status.desiredNumberScheduled}{" desired, "}{.status.currentNumberScheduled}{" scheduled (out of 3 nodes)"}'
+1 desired, 1 scheduled (out of 3 nodes)
+```
+
+`desiredNumberScheduled: 1` บน cluster 3 node คือ controller บอกตรง ๆ ว่ามี node ที่ match กี่ตัว อีกสอง node ที่เหลือไม่เคยได้ Pod เลย ไม่เคยเป็น candidate ด้วยซ้ำ
+
 ## สาม controller สามความกังวลที่ต่างกัน
 
-Deployment ไม่สนใจว่า replica แต่ละตัวจะไปลง node ไหน และ Pod ของตัวเองถูกออกแบบให้สลับกันได้ StatefulSet สนใจ **identity คงที่ต่อ ordinal** ชื่อเดิม storage เดิมทุกครั้ง DaemonSet สนใจ **coverage ระดับ node** หนึ่ง Pod ต่อหนึ่ง node จำนวนที่คุณไม่ต้องตั้งเองเพราะตามจำนวน node ของ cluster ไปเอง
+Deployment ไม่สนใจว่า replica แต่ละตัวจะไปลง node ไหน และ Pod ของตัวเองถูกออกแบบให้สลับกันได้ StatefulSet สนใจ **identity คงที่ต่อ ordinal** ชื่อเดิม storage เดิมทุกครั้ง DaemonSet สนใจ **coverage ระดับ node** หนึ่ง Pod ต่อหนึ่ง node ที่ตรงเงื่อนไข จำนวนที่คุณไม่ต้องตั้งเองเพราะตามจำนวน node (หรือ node ส่วนย่อยที่ label ไว้) ของ cluster ไปเอง
+
+## อ่านโค้ดที่ AI เขียน
+
+ตอน review StatefulSet หรือ DaemonSet ที่ AI generate มา เช็คพวกนี้
+
+- StatefulSet ที่ไม่มี headless Service เลย หรือ `serviceName` ชี้ไปที่ Service แบบ `ClusterIP` ธรรมดา พิสูจน์แล้วข้างบนว่านี่ไม่ error ที่ไหนเลย แค่ทำให้ทุก `<pod>.<service>` DNS lookup คืน `NXDOMAIN`
+- `podManagementPolicy: Parallel` บน StatefulSet ที่ init logic คาดว่า `ordinal-1` ขึ้นแล้ว (การเปลี่ยนแบบ copy-paste "ให้เร็วขึ้น" ที่พบบ่อย) พิสูจน์แล้วข้างบนว่า `Parallel` เอา guarantee เรื่องลำดับ startup ออกไปจริง ๆ ไม่ใช่แค่ปรับ performance
+- ไม่มี `persistentVolumeClaimRetentionPolicy` บน StatefulSet ที่ผู้เขียนคาดว่าจะ ephemeral เต็มตัว (เช่น ใน environment ทดสอบ/CI แบบใช้แล้วทิ้ง) default จะเก็บ PVC ไว้ตลอดไป พิสูจน์แล้วข้างบน scale ไป `0` แล้วกลับมาไม่ได้ทำให้ข้อมูลว่างเปล่าเลย เว้นแต่ตั้ง `whenScaled: Delete`
+- DaemonSet ที่ใช้ `maxUnavailable: 1, maxSurge: 0` default อยู่หน้าอะไรที่ latency-sensitive (webhook injector sidecar ของ service mesh, agent ที่ใกล้ชิดกับ CNI) ที่ช่วง coverage ขาดหายบน node ตอน rollout มีค่าใช้จ่ายจริง `maxSurge` (พิสูจน์แล้วข้างบน) คือทางแก้ ไม่ใช่การ freeze rollout ด้วยมือ
+- คิดว่า DaemonSet รันบนทุก node ใน cluster แน่นอนโดยไม่เช็ค `nodeSelector`/affinity/toleration เลย พิสูจน์แล้วข้างบน `status.desiredNumberScheduled` อาจน้อยกว่าจำนวน node มาก และ node control-plane ต้องมี toleration ชัดเจนถึงจะได้ Pod
+
+<SpotTheBug code={`# k8s/statefulsets-and-daemonsets/db-ephemeral.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+spec:
+  serviceName: db
+  podManagementPolicy: Parallel
+  replicas: 3
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      containers:
+        - name: postgres
+          image: myregistry/postgres:18
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ['ReadWriteOnce']
+        resources:
+          requests:
+            storage: 10Gi`}>
+มีปัญหาจริงสองอย่าง ไม่ใช่แค่หนึ่ง อย่างแรก `podManagementPolicy: Parallel` บน StatefulSet ของ **database** ทิ้ง guarantee เรื่องลำดับ ("node 0 ขึ้นก่อนที่ node 1 จะพยายาม join") ที่ bootstrap logic ของ clustered database ส่วนใหญ่พึ่งพาอยู่ พิสูจน์แล้วข้างบนว่า `Parallel` create ทั้งสาม Pod พร้อมกันโดยไม่มีลำดับ startup เลย ซึ่งเป็น correctness bug สำหรับ Postgres cluster ไม่ใช่แค่เรื่องความเร็ว อย่างที่สอง ไม่มี Service ชื่อ `db` ถูก define ไว้ที่ไหนเลยใน manifest นี้ (หรือ fence อื่นในบทเดียวกัน) `serviceName: db` reference Service ที่อาจไม่มีอยู่จริง และพิสูจน์แล้วข้างบนว่า API server ไม่ validate เรื่องนี้ตอน create เลย อาการเดียวที่จะเห็นคือทุก `<pod>.db.<ns>.svc.cluster.local` lookup ของ peer คืน `NXDOMAIN` เงียบ ๆ โดยตัว StatefulSet เองรายงานว่า healthy สมบูรณ์แบบ ทางแก้: สร้าง headless Service ที่ชื่อ `db` (`clusterIP: None`, selector ตรงกัน) คู่กับ StatefulSet นี้ แล้วเอา `podManagementPolicy: Parallel` ออก (หรือเปลี่ยนเป็น default `OrderedReady`) เว้นแต่ทุก replica bootstrap เป็นอิสระจากกันจริง ๆ
+</SpotTheBug>
+
+## Mental Model
+
+StatefulSet ไม่ใช่ "Deployment ที่มี storage" มันคือ controller ที่หน้าที่ทั้งหมดคือ **ผูก ordinal เข้ากับ identity คงที่** (ชื่อ, DNS record, PVC) แล้วบังคับลำดับรอบ ๆ การเปลี่ยนแปลงของ binding นั้น ทุกปุ่มตรงนี้ (`podManagementPolicy`, `partition`, PVC retention) จริง ๆ แล้วคือคำถามว่า "จะบังคับลำดับเข้มแค่ไหน และ identity อยู่รอดนานแค่ไหน" DaemonSet เป็น controller แบบตรงกันข้าม มันไม่จัดการ identity เลย มันจัดการ **coverage** desired state ไม่ใช่ตัวเลขที่คุณเลือกเอง มันคือ "หนึ่ง Pod ทุกที่ที่ selector นี้ match node" และทุกปุ่มตรงนี้ (`nodeSelector`, `maxSurge`) คือคำถามว่า "node ไหนบ้าง และ overlap แค่ไหนระหว่างเปลี่ยนแปลง"
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ได้อะไร | เสียอะไร |
+|---|---|---|
+| `podManagementPolicy: OrderedReady` (default) | พึ่งพา "ordinal ก่อนหน้าขึ้นแล้ว" ใน bootstrap logic ได้อย่างปลอดภัย | พิสูจน์แล้วข้างบน: ช้ากว่า `Parallel` ประมาณ 3 เท่ากว่าจะ Ready ครบสำหรับจำนวน replica เท่ากัน |
+| `podManagementPolicy: Parallel` | พิสูจน์แล้วข้างบน: ทุก replica start พร้อมกัน เร็วกว่ามากกว่าจะ Ready ครบ | ไม่มี guarantee ลำดับ startup เลย ตัวเลือกผิดสำหรับอะไรที่ bootstrap พึ่งพามัน |
+| `updateStrategy.rollingUpdate.partition` | canary template ใหม่บน ordinal สูงสุดก่อน พิสูจน์แล้วข้างบน ก่อนจะเชื่อมันทุกที่ | ต้องลด/เอา partition ออกด้วยมือเพื่อให้ rollout จบ ไม่มีอะไรทำให้อัตโนมัติ |
+| `persistentVolumeClaimRetentionPolicy: Delete` | scale ลงหรือลบเคลียร์ storage จริง พิสูจน์แล้วข้างบน | default คือ `Retain` ด้วยเหตุผล การเลือก `Delete` หมายความว่า scale-to-0 ผิดพลาดจะทำลาย data |
+| DaemonSet `maxSurge` | ไม่มีช่วง coverage ขาดหายระดับ node ระหว่าง rollout พิสูจน์แล้วข้างบน | รันสอง Pod ต่อ node ที่กำลังอัปเดตชั่วคราว node ที่ทรัพยากรตึงอาจไม่มีที่พอสำหรับทั้งคู่ |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"OrderedReady เทียบกับ Parallel เป็นแค่รายละเอียด implementation ข้างใน ไม่ได้เปลี่ยนพฤติกรรมจริง"** พิสูจน์แล้วข้างบนด้วยเวลาจริง 18.4 วินาที เทียบกับ 6.2 วินาที สำหรับ 3 replica เดียวกัน `OrderedReady` serialize การ create จริง ๆ ไม่ใช่แค่ report readiness ต่างกัน
+- **"ถ้า serviceName ผิด StatefulSet จะโชว์ error"** พิสูจน์แล้วข้างบน API server ยอมรับ `serviceName` ที่ไม่มีอยู่จริงหรือไม่ใช่ headless โดยไม่บ่นอะไรเลย อาการเดียวคือ `NXDOMAIN` บน DNS name ต่อ Pod
+- **"partition หยุด rollout ทั้งหมด"** พิสูจน์แล้วข้างบน มันไม่ได้หยุดอะไรเลย มันขีดเส้น ทุก ordinal `>= partition` อัปเดตทันทีตามปกติ มีแค่ ordinal ที่ต่ำกว่าเท่านั้นที่ถูกปล่อยไว้เฉย ๆ
+- **"ลบ StatefulSet จะเคลียร์ storage ของมันด้วย"** พฤติกรรม default ตรงกันข้ามเลย PVC จาก `volumeClaimTemplates` อยู่รอดยาวกว่า StatefulSet เสมอ เว้นแต่ `persistentVolumeClaimRetentionPolicy` จะ opt-in `Delete` พิสูจน์แล้วข้างบน
+- **"DaemonSet รันบนทุก node ใน cluster เสมอ"** พิสูจน์แล้วข้างบน `nodeSelector` (หรือ affinity/toleration) จำกัดขอบเขตให้เหลือบางส่วน และ `status.desiredNumberScheduled` รายงานตรง ๆ ว่ามี node ที่ match กี่ตัว
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**StatefulSet** ให้ Pod มี ordinal name คงที่ (`db-0`, `db-1`, ...) มี PersistentVolumeClaim ของตัวเองต่อ Pod ผ่าน `volumeClaimTemplates` มีลำดับตอน rollout/scaling/deletion และต้องมี **headless Service** เพื่อให้แต่ละ Pod มี DNS ของตัวเอง **DaemonSet** schedule Pod ที่ตรงเงื่อนไขพอดีหนึ่งตัวลงทุก node (node ใหม่ได้ Pod อัตโนมัติ) โดยไม่มีค่า `replicas` ให้ตั้ง สรุปคือ Deployment = replica สลับกันได้ StatefulSet = identity ต่อ ordinal DaemonSet = coverage แบบหนึ่งต่อ node
+**StatefulSet** ให้ Pod มี ordinal name คงที่ (`db-0`, `db-1`, ...) มี PersistentVolumeClaim ของตัวเองต่อ Pod ผ่าน `volumeClaimTemplates` (อยู่รอดยาวกว่า StatefulSet เว้นแต่ `persistentVolumeClaimRetentionPolicy` บอกว่า `Delete` พิสูจน์แล้วข้างบน) และมีลำดับตอน rollout/scaling/deletion ผ่าน `podManagementPolicy: OrderedReady` (default ช้ากว่า `Parallel` ประมาณ 3 เท่าแต่ปลอดภัยสำหรับ bootstrap ที่พึ่งพากัน พิสูจน์แล้วข้างบน) บวก `updateStrategy.rollingUpdate.partition` สำหรับ canary ตาม ordinal (พิสูจน์แล้วข้างบน) ต้องมี **headless Service** จริงเพื่อให้มี DNS ต่อ Pod ชี้ `serviceName` ไปที่ไม่มีอะไรหรือ Service ที่ไม่ใช่ headless แล้ว API server จะเงียบในขณะที่ทุก lookup ต่อ Pod คืน `NXDOMAIN` (พิสูจน์แล้วข้างบน) **DaemonSet** schedule Pod ที่ตรงเงื่อนไขพอดีหนึ่งตัวลงทุก node ที่ `nodeSelector`/affinity/toleration ยอมให้ไปถึง (พิสูจน์แล้วข้างบน ไม่จำเป็นต้องเป็นทุกตัว) โดยไม่มีค่า `replicas` ให้ตั้ง และ `updateStrategy.rollingUpdate.maxSurge` (พิสูจน์แล้วข้างบน) ช่วยไม่ให้ coverage ขาดหายระดับ node ระหว่าง rollout สรุปคือ Deployment = replica สลับกันได้ StatefulSet = identity ต่อ ordinal DaemonSet = coverage แบบหนึ่งต่อ node ที่ตรงเงื่อนไข
 </Callout>
 
 export const quizStatefulDaemon = [
@@ -150,6 +489,7 @@ export const quizStatefulDaemon = [
       'ภูมิคุ้มกันจากการถูก evict โดย scheduler',
     ],
     answer: 1,
+    explain: 'แต่ละ ordinal ได้ชื่อที่คาดเดาได้และ PVC ของตัวเอง (จาก volumeClaimTemplates) ที่ตามมันไปทุกครั้งที่ reschedule Pod ของ Deployment ไม่มีทั้งสองอย่างนี้เลย',
   },
   {
     q: 'ทำไม StatefulSet ต้องมี headless Service (clusterIP: None)',
@@ -160,6 +500,7 @@ export const quizStatefulDaemon = [
       'เพื่อให้ทุก Pod ได้ IP address เดียวกันเป๊ะ ๆ',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วข้างบน: headless Service คือสิ่งที่ทำให้ CoreDNS สร้าง record <pod>.<service> ต่อ Pod ชี้ serviceName ไปที่ Service ที่ไม่ใช่ headless แทน แล้ว lookup พวกนั้นจะคืน NXDOMAIN โดยไม่มี error อื่นเลย',
   },
   {
     q: 'ทำไมถึงใช้ DaemonSet สำหรับ log-collection agent แทน Deployment',
@@ -170,6 +511,7 @@ export const quizStatefulDaemon = [
       'DaemonSet รันได้เฉพาะใน default namespace เท่านั้น',
     ],
     answer: 1,
+    explain: 'จำนวนที่ต้องการของ DaemonSet มาจาก node ที่ match ไม่ได้ตั้งเอง พิสูจน์แล้วข้างบนด้วย status.desiredNumberScheduled และ node ใหม่ก็ได้ Pod นี้อัตโนมัติด้วย',
   },
   {
     q: 'สิ่งที่ Deployment ตั้งใจไม่การันตี ต่างจาก StatefulSet คืออะไร',
@@ -180,6 +522,29 @@ export const quizStatefulDaemon = [
       'label selector ที่ match กับ Pod ของตัวเอง',
     ],
     answer: 0,
+    explain: 'replica ของ Deployment ถูกออกแบบให้สลับกันได้ ไม่มีชื่อคงที่ ไม่มี storage ต่อ Pod ไม่มี guarantee เรื่องลำดับ StatefulSet มีไว้เพื่อเพิ่มสิ่งเหล่านี้โดยเฉพาะ',
+  },
+  {
+    q: '```text\nOrderedReady: all 3 Ready in 18.37s\nParallel:     all 3 Ready in 6.17s\n```\nStatefulSet 3 replica เดียวกัน container ที่ ready ใน ~5 วินาทีเหมือนกัน เปลี่ยนแค่ podManagementPolicy เวลาจริงนี้พิสูจน์อะไร',
+    options: [
+      'Parallel ไม่ปลอดภัยเสมอและไม่ควรใช้เลย',
+      'OrderedReady serialize การ create Pod จริง ๆ (แต่ละ ordinal รอตัวก่อนหน้า Ready ก่อน) ส่วน Parallel create ทุก replica พร้อมกัน',
+      'ความต่างของเวลาเป็นแค่ measurement noise ทั้งสอง policy พฤติกรรมเหมือนกัน',
+      'OrderedReady มีผลแค่ตอนลบ ไม่มีผลตอน create',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วข้างบน: 18.4 วินาทีคือประมาณ 3 เท่าของ ~6 วินาทีที่ replica เดียวใช้ แปลว่า OrderedReady create (ไม่ใช่แค่ report) แต่ละ Pod ทีละตัวตามลำดับจริง ส่วน Parallel create ทั้งสามพร้อมกัน',
+  },
+  {
+    q: '```yaml\napiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: db\nspec:\n  serviceName: db-svc-that-does-not-exist\n  replicas: 3\n```\nเกิดอะไรขึ้นเมื่อ apply สิ่งนี้บน cluster จริง แล้วจะสังเกตเห็นได้ยังไง',
+    options: [
+      'API server reject: "serviceName: Service not found"',
+      'ถูกยอมรับโดยไม่มี error อาการเดียวคือทุก DNS lookup <pod>.db-svc-that-does-not-exist คืน NXDOMAIN',
+      'StatefulSet ค้างอยู่ Pending ตลอดไปรอ Service',
+      'Kubernetes สร้าง headless Service ที่หายไปให้อัตโนมัติ',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วข้างบนด้วย dry-run=server จริงและ nslookup จริง: serviceName ไม่ถูก validate กับ Service ที่มีอยู่จริงเลย StatefulSet และ Pod ของมันขึ้นมา healthy สมบูรณ์ อาการเดียวที่เห็นปัญหาคือ NXDOMAIN บน DNS name ต่อ Pod',
   },
 ];
 

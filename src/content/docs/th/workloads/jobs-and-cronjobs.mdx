@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
@@ -37,7 +38,28 @@ spec:
           args: ['--month=2026-06']
 ```
 
-`completions: 5` หมายความว่า Job จะยังไม่จบจนกว่า Pod 5 ตัวจะ exit สำเร็จ `parallelism: 2` จำกัดว่า Pod พวกนั้นรันพร้อมกันได้กี่ตัว `backoffLimit: 3` คือจำนวนครั้งที่ยอมให้พังได้ก่อนที่ Job จะยอมแพ้แล้วตีตัวเองเป็น `Failed` `activeDeadlineSeconds: 600` คือ timeout รวมของทั้ง Job นับเป็นเวลาจริง พอเกินก็ terminate ทันทีไม่สนว่าสำเร็จไปกี่ตัวแล้ว สังเกต `restartPolicy: OnFailure` ด้วย Pod template ของ Job ต้องใช้ `OnFailure` หรือ `Never` เท่านั้น ห้ามใช้ `Always` เพราะจุดประสงค์ทั้งหมดของ Job คือหยุดเมื่องานเสร็จ
+`completions: 5` หมายความว่า Job จะยังไม่จบจนกว่า Pod 5 ตัวจะ exit สำเร็จ `parallelism: 2` จำกัดว่า Pod พวกนั้นรันพร้อมกันได้กี่ตัว `backoffLimit: 3` คือจำนวนครั้งที่ยอมให้พังได้ก่อนที่ Job จะยอมแพ้แล้วตีตัวเองเป็น `Failed` `activeDeadlineSeconds: 600` คือ timeout รวมของทั้ง Job นับเป็นเวลาจริง พอเกินก็ terminate ทันทีไม่สนว่าสำเร็จไปกี่ตัวแล้ว สังเกต `restartPolicy: OnFailure` ด้วย Pod template ของ Job ต้องใช้ `OnFailure` หรือ `Never` เท่านั้น ห้ามใช้ `Always` เพราะจุดประสงค์ทั้งหมดของ Job คือหยุดเมื่องานเสร็จ พิสูจน์แล้วบน API server จริง:
+
+```yaml
+# k8s/jobs-and-cronjobs/job-bad-restart.yaml — @expect-error restartPolicy: Always is not a valid Job Pod template value
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bad-job
+spec:
+  template:
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: work
+          image: busybox:1.38
+          command: ['sh', '-c', 'echo hi']
+```
+
+```text
+$ kubectl apply --dry-run=server -f job-bad-restart.yaml
+The Job "bad-job" is invalid: spec.template.spec.restartPolicy: Required value: valid values: "OnFailure", "Never"
+```
 
 ```bash
 # Watch completions accumulate, then check the Job's final status
@@ -47,6 +69,164 @@ kubectl describe job report-backfill
 # Logs from a finished Job's Pods
 kubectl logs -l job-name=report-backfill --tail=100
 ```
+
+## `backoffLimit` เทียบกับ `activeDeadlineSeconds`: สองวิธีที่ Job ยอมแพ้ต่างกัน
+
+ทั้งคู่หยุด Job ที่พังได้ แต่คนละแกน `backoffLimit` นับ **จำนวนครั้งที่พัง** `activeDeadlineSeconds` คือ **เพดานเวลาจริง** ของทั้ง Job ไม่ว่าจะใช้ attempt ไปกี่ครั้งแล้วก็ตาม พิสูจน์ทั้งคู่ ด้วย condition จริงจาก cluster จริง:
+
+```text
+# backoffLimit: 2, container always exits 1, no activeDeadlineSeconds set
+$ kubectl get pods -l job-name=backoff-demo --no-headers | wc -l
+3   # ordinals 0, 1, 2 -- backoffLimit + 1 attempts, exactly
+
+$ kubectl get job backoff-demo -o jsonpath='{range .status.conditions[*]}{.type}{"="}{.status}{" reason="}{.reason}{" message="}{.message}{"\n"}{end}'
+FailureTarget=True reason=BackoffLimitExceeded message=Job has reached the specified backoff limit
+Failed=True reason=BackoffLimitExceeded message=Job has reached the specified backoff limit
+```
+
+```text
+# backoffLimit: 6 (would normally allow 7 attempts), activeDeadlineSeconds: 8, container always exits 1
+$ kubectl get pods -l job-name=deadline-demo --no-headers | wc -l
+1   # cut off by the deadline before a 2nd attempt's backoff delay even elapsed
+
+$ kubectl get job deadline-demo -o jsonpath='{range .status.conditions[*]}{.type}{"="}{.status}{" reason="}{.reason}{" message="}{.message}{"\n"}{end}'
+FailureTarget=True reason=DeadlineExceeded message=Job was active longer than specified deadline
+Failed=True reason=DeadlineExceeded message=Job was active longer than specified deadline
+```
+
+`backoffLimit: 2` หมายถึง Pod attempt 3 ครั้งเป๊ะ ๆ ก่อนจะ `BackoffLimitExceeded` จริง `activeDeadlineSeconds: 8` ตัด Job ก่อนที่ `backoffLimit: 6` ที่สูงกว่ามากจะถูกแตะด้วยซ้ำ ด้วย reason ที่ต่างกันชัดเจน (`DeadlineExceeded`) ใครมาถึงก่อนคนนั้นชนะ ใช้ `activeDeadlineSeconds` เมื่อต้องการเพดานเวลารันรวมแบบเด็ดขาดไม่ว่าจะ retry กี่ครั้ง (batch job ตอนกลางคืนที่ห้ามยังรันอยู่ตอน 6 โมงเช้า) และใช้ `backoffLimit` เมื่อสิ่งที่สำคัญคือจำกัด *จำนวนครั้ง* ที่ retry ไม่ว่าจะใช้เวลานานแค่ไหน
+
+## `podFailurePolicy`: action ตาม exit code จริง ไม่ใช่แค่ "มันพัง"
+
+GA ตั้งแต่ Kubernetes **v1.28** (feature gate `JobPodFailurePolicy` ถูกเอาออก/lock เป็น true ใน 1.32 — [feature gate history](https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates-removed/)) `podFailurePolicy` ให้ Job react ต่าง exit code ต่างกันได้ แทนที่จะปฏิบัติกับทุกความพังเหมือนกันหมดเทียบกับ `backoffLimit` สอง action ของมัน พิสูจน์แล้ว:
+
+**`FailJob`** หยุดทั้ง Job ทันทีเมื่อเจอ exit code ที่ระบุไว้ ไม่สนใจ `backoffLimit` เลย (ไม่ retry error ที่ fatal ไม่ transient ให้เสียเวลา):
+
+```yaml
+# k8s/jobs-and-cronjobs/job-podfailurepolicy-failjob.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pfp-failjob
+spec:
+  backoffLimit: 6
+  podFailurePolicy:
+    rules:
+      - action: FailJob
+        onExitCodes:
+          containerName: work
+          operator: In
+          values: [42]
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: work
+          image: busybox:1.38
+          command: ['sh', '-c', 'echo simulating a fatal, non-retryable config error; exit 42']
+```
+
+```text
+$ kubectl get pods -l job-name=pfp-failjob
+NAME                READY   STATUS   RESTARTS   AGE
+pfp-failjob-48t28   0/1     Error    0          4s
+
+$ kubectl get job pfp-failjob -o jsonpath='{range .status.conditions[*]}{.type}{"="}{.status}{" reason="}{.reason}{" message="}{.message}{"\n"}{end}'
+FailureTarget=True reason=PodFailurePolicy message=Container work for pod default/pfp-failjob-48t28 failed with exit code 42 matching FailJob rule at index 0
+Failed=True reason=PodFailurePolicy message=Container work for pod default/pfp-failjob-48t28 failed with exit code 42 matching FailJob rule at index 0
+```
+
+มี Pod รันแค่ **หนึ่ง** ตัวเท่านั้น ทั้งที่ `backoffLimit: 6` `FailJob` ตัดสั้นข้ามงบ retry ไปเลย
+
+**`Ignore`** ไม่นับ exit code นี้เข้า `backoffLimit` เลย retry ต่อไปเรื่อย ๆ ไม่สนใจ:
+
+```yaml
+# k8s/jobs-and-cronjobs/job-podfailurepolicy-ignore.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pfp-ignore
+spec:
+  backoffLimit: 0
+  podFailurePolicy:
+    rules:
+      - action: Ignore
+        onExitCodes:
+          containerName: work
+          operator: In
+          values: [1]
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: work
+          image: busybox:1.38
+          command: ['sh', '-c', 'echo transient failure, will keep getting ignored; exit 1']
+```
+
+```text
+$ kubectl get pods -l job-name=pfp-ignore
+NAME               READY   STATUS   RESTARTS   AGE
+pfp-ignore-q52jr   0/1     Error    0          15s
+pfp-ignore-xlnn4   0/1     Error    0          5s
+
+$ kubectl get job pfp-ignore -o jsonpath='{.status.failed}'
+     # empty/0 -- despite backoffLimit: 0, two Pods have already failed and a new one keeps getting created
+```
+
+ด้วย `backoffLimit: 0` Job ปกติจะยอมแพ้หลังพังครั้งแรกเลย ตรงนี้ Pod พังไปแล้วสองตัว และ Job ก็ยังสร้างตัวใหม่ต่อไปเรื่อย ๆ `status.failed` ไม่เพิ่มเลย เพราะ `Ignore` แปลว่า exit code นี้ไม่เคยถูกนับเข้างบ backoff เลย
+
+## Indexed Job: แต่ละ Pod รู้ index ของตัวเอง
+
+`completionMode: Indexed` ให้แต่ละ Pod มี completion index คงที่ ไม่ซ้ำกัน (`0`..`completions-1`) ที่ inject มาเป็น env var `JOB_COMPLETION_INDEX` และ label `batch.kubernetes.io/job-completion-index` ของ Pod มีประโยชน์สำหรับ shard ข้อมูลข้าม Pod โดยไม่ต้องมีการประสานงานระหว่าง Pod เลย:
+
+```yaml
+# k8s/jobs-and-cronjobs/job-indexed.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: indexed-report
+spec:
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  ttlSecondsAfterFinished: 60
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: work
+          image: busybox:1.38
+          command: ['sh', '-c', 'echo "this is completion index $JOB_COMPLETION_INDEX"']
+```
+
+```text
+$ kubectl get pods -l job-name=indexed-report
+NAME                     READY   STATUS      AGE
+indexed-report-0-9j8ff   0/1     Completed   3s
+indexed-report-1-ncff4   0/1     Completed   3s
+indexed-report-2-lw5cv   0/1     Completed   3s
+indexed-report-3-clz2x   0/1     Completed   3s
+
+$ kubectl logs indexed-report-0-9j8ff
+this is completion index 0
+$ kubectl logs indexed-report-2-lw5cv
+this is completion index 2
+```
+
+ชื่อ Pod เองก็ฝัง index ไว้ (`indexed-report-<index>-<suffix>`) แต่ละ container อ่าน `$JOB_COMPLETION_INDEX` ที่ต่างกันจริง ๆ และ `ttlSecondsAfterFinished: 60` หมายความว่าทั้ง Job (พร้อม Pod ของมัน) จะถูก garbage-collect อัตโนมัติ ~60 วินาทีหลัง complete พิสูจน์ตรง ๆ:
+
+```text
+$ kubectl get job ttl-demo
+NAME       STATUS     COMPLETIONS   DURATION   AGE
+ttl-demo   Complete   1/1           3s         4s
+
+# ...15s later (ttlSecondsAfterFinished: 15 on this one)...
+$ kubectl get job ttl-demo
+Error from server (NotFound): jobs.batch "ttl-demo" not found
+```
+
+ถ้าไม่มี `ttlSecondsAfterFinished` Job ที่ complete แล้ว (พร้อม Pod ของมัน) จะอยู่ตลอดไปจนกว่าจะลบด้วยมือ สำหรับ Job แบบ batch ที่รันบ่อย ๆ นี่สะสมเหมือนกับ CronJob history ที่ไม่มีขอบเขต ซึ่งพูดถึงต่อไป
 
 ## CronJob: ตั้งเวลารัน Job
 
@@ -74,9 +254,82 @@ spec:
               image: myregistry/nightly-report:1.0.0
 ```
 
-`schedule: '0 2 * * *'` รันตอน 02:00 ทุกวัน ตาม cron syntax มาตรฐาน `concurrencyPolicy` ตัดสินว่าจะทำยังไงถ้า run ก่อนหน้ายังไม่จบตอนที่ run ถัดไปถึงกำหนด `Allow` (ค่า default) ปล่อยให้รันคู่กันไปเลย `Forbid` ข้าม run ใหม่ไปทั้งหมด และ `Replace` ยกเลิก Job ที่ยังรันอยู่แล้วเริ่ม Job ใหม่แทนที่ `startingDeadlineSeconds` กำหนดว่า run ที่พลาดเวลาไปแล้วยังเริ่มได้ช้าสุดแค่ไหน `successfulJobsHistoryLimit` กับ `failedJobsHistoryLimit` คุมว่า CronJob จะเก็บ Job object เก่าไว้ให้ตรวจสอบกี่ตัวก่อนจะ garbage-collect ทิ้ง
+`schedule: '0 2 * * *'` รันตอน 02:00 ทุกวัน ตาม cron syntax มาตรฐาน `concurrencyPolicy` ตัดสินว่าจะทำยังไงถ้า run ก่อนหน้ายังไม่จบตอนที่ run ถัดไปถึงกำหนด `Allow` (ค่า default) ปล่อยให้รันคู่กันไปเลย `Forbid` ข้าม run ใหม่ไปทั้งหมด และ `Replace` ยกเลิก Job ที่ยังรันอยู่แล้วเริ่ม Job ใหม่แทนที่ `startingDeadlineSeconds` กำหนดว่า run ที่พลาดเวลาไปแล้วยังเริ่มได้ช้าสุดแค่ไหน `successfulJobsHistoryLimit` กับ `failedJobsHistoryLimit` คุมว่า CronJob จะเก็บ Job object เก่าไว้ให้ตรวจสอบกี่ตัวก่อนจะ garbage-collect ทิ้ง `timeZone` (ชื่อ IANA แบบ `'Asia/Bangkok'`) ปักหมุด schedule ไว้กับ time zone จริง แทนที่จะใช้ time zone ของ process `kube-controller-manager` เอง ถูก validate กับ system time zone database จริงทั้งตอน admission และตอนรัน
 
-<Mermaid title="A CronJob creates a Job on its schedule; the Job creates Pods that run to completion" code={jobsDiagram} />
+### `concurrencyPolicy` พิสูจน์ด้วย schedule ที่ทับซ้อนกันจริง
+
+สอง CronJob ทั้งคู่ `schedule: '* * * * *'` (ทุกนาที) รัน Job ที่ sleep 90 วินาที ตัวหนึ่ง `concurrencyPolicy: Allow` อีกตัว `Forbid`:
+
+```yaml
+# k8s/jobs-and-cronjobs/cj-allow.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: slow-allow
+spec:
+  schedule: '* * * * *'
+  concurrencyPolicy: Allow
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: work
+              image: busybox:1.38
+              command: ['sh', '-c', 'echo start $(date +%T); sleep 90; echo done $(date +%T)']
+```
+
+```yaml
+# k8s/jobs-and-cronjobs/cj-forbid.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: slow-forbid
+spec:
+  schedule: '* * * * *'
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: work
+              image: busybox:1.38
+              command: ['sh', '-c', 'echo start $(date +%T); sleep 90; echo done $(date +%T)']
+```
+
+สังเกตบน cluster จริงนานกว่า 3 นาที:
+
+```text
+# concurrencyPolicy: Allow -- events, in order
+08:03:00   SuccessfulCreate   Created job slow-allow-29840163
+08:04:00   SuccessfulCreate   Created job slow-allow-29840164   # <-- created while -163 (90s job) is STILL RUNNING
+08:04:32   SawCompletedJob    Saw completed job: slow-allow-29840163, condition: Complete
+08:05:00   SuccessfulCreate   Created job slow-allow-29840165   # <-- created while -164 is STILL RUNNING
+08:05:32   SawCompletedJob    Saw completed job: slow-allow-29840164, condition: Complete
+08:06:00   SuccessfulCreate   Created job slow-allow-29840166
+08:06:32   SuccessfulDelete   Deleted job slow-allow-29840163   # successfulJobsHistoryLimit: 2 pruning the oldest
+```
+
+```text
+# concurrencyPolicy: Forbid -- events, same 3+ minutes, same cluster
+08:03:00   SuccessfulCreate   Created job slow-forbid-29840163
+08:04:32   SawCompletedJob    Saw completed job: slow-forbid-29840163, condition: Complete
+08:04:32   SuccessfulCreate   Created job slow-forbid-29840164   # the 08:04:00 tick, held until -163 finished
+08:06:05   JobAlreadyActive   Not starting job because prior execution is running and concurrency policy is Forbid
+08:06:05   SawCompletedJob    Saw completed job: slow-forbid-29840164, condition: Complete
+08:06:05   SuccessfulCreate   Created job slow-forbid-29840166   # note: -29840165 (the 08:05:00 tick) never exists at all
+```
+
+ชื่อ Job ของแต่ละนาทีฝังไว้ว่ามันเป็นของ schedule เวลาไหน (ส่วนต่อท้าย `...163`/`...164`/...) ด้วย `Allow` `slow-allow-29840164` (กำหนด `08:04:00`) ถูก create ตรงเวลาเป๊ะ ๆ **ในขณะที่** `slow-allow-29840163` (Job 90 วินาทีของนาทีก่อนหน้า) ยังเหลืออีก `08:04:00`–`08:04:32` กว่าจะ complete overlap จริงที่พิสูจน์ได้ สอง Job มี Pod รันพร้อมกันจริง ๆ ด้วย `Forbid` tick ของ `08:04:00` ไม่ได้ถูกข้ามไปเฉย ๆ แต่ถูก *กัก* ไว้ controller create `slow-forbid-29840164` ทันทีที่ `-163` complete (`08:04:32` ไม่ใช่ `08:04:00`) และ tick ถัดไปที่ถึงกำหนด (`08:05:00` ซึ่งจะเป็น `-29840165`) ถูกข้ามไป **ถาวร** ทันทีที่รู้ว่า `-164` ยังทำงานอยู่ (`JobAlreadyActive` log ตอน controller reconcile ครั้งถัดไปที่ `08:06:05`) `-29840165` ไม่เคยปรากฏใน `kubectl get jobs` เลย controller กระโดดไปที่ tick ที่ถึงกำหนดถัดไปเลย (`-29840166`) แทนที่จะ queue ทุก tick ที่พลาดไป บรรทัด `SuccessfulDelete` บน CronJob `Allow` คือ `successfulJobsHistoryLimit: 2` ทำงานจริง พอถึง `08:06:32` มี Job ที่ complete แล้ว 3 ตัว ตัวเก่าสุด (`-163`) เลยถูก garbage-collect ทิ้ง
+
+<Mermaid title="CronJob สร้าง Job ตาม schedule ของมัน Job นั้นก็สร้าง Pod ที่รันจนจบงาน" code={jobsDiagram} />
 
 export const jobsDiagram = `flowchart LR
   cj["CronJob nightly-report (schedule: 0 2 * * *)"] -->|creates| j["Job nightly-report-29102026"]
@@ -84,6 +337,46 @@ export const jobsDiagram = `flowchart LR
   j -->|creates| p2["Pod (runs to completion)"]
   p1 --> done["Succeeded, Pods stop"]
   p2 --> done`;
+
+### `startingDeadlineSeconds`, `timeZone` และ history limits
+
+```text
+$ kubectl explain cronjob.spec.startingDeadlineSeconds
+FIELD: startingDeadlineSeconds <integer>
+
+DESCRIPTION:
+    Optional deadline in seconds for starting the job if it misses scheduled
+    time for any reason.  Missed jobs executions will be counted as failed ones.
+```
+
+การพิสูจน์ `Forbid` ข้างบนแสดงพฤติกรรม missed-schedule *default* (ไม่ตั้ง `startingDeadlineSeconds`) ให้เห็นตรง ๆ อยู่แล้ว controller ไม่ queue ทุก tick ที่พลาดไป มันพยายามแค่ tick ที่ถึงกำหนดล่าสุดตัวเดียวเท่านั้น แล้วยอมแพ้กับตัวเก่ากว่านั้นทันทีที่ concurrency เคลียร์ `-29840165` ถูกข้ามไปตลอดกาล ไม่ใช่แค่เลื่อนออกไป การตั้ง `startingDeadlineSeconds` ทำให้การข้ามนั้นมีขอบเขตชัดเจนและตั้งใจ (แทนที่จะเป็นผลข้างเคียงที่โผล่ขึ้นมาเองจาก controller ตามหลังไปไกลแค่ไหน) และตามคำอธิบายของ field เองข้างบน มันนับ miss ที่ช้าเกินไปว่าเป็น run ที่ **failed** แทนที่จะหายไปเงียบ ๆ
+
+`timeZone` ถูกยอมรับและ validate ตอน admission กับ system time zone database จริง:
+
+```yaml
+# k8s/jobs-and-cronjobs/cj-timezone.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: tz-demo
+spec:
+  schedule: '30 2 * * *'
+  timeZone: 'Asia/Bangkok'
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: work
+              image: busybox:1.38
+              command: ['echo', 'hi']
+```
+
+```text
+$ kubectl apply --dry-run=server -f cj-timezone.yaml
+cronjob.batch/tz-demo created (server dry run)
+```
 
 ## จัดการ Job และ CronJob
 
@@ -96,10 +389,60 @@ kubectl get jobs --selector=job-name
 kubectl create job nightly-report-manual --from=cronjob/nightly-report
 ```
 
-เพราะ schedule ของ CronJob ยิงซ้ำได้หลายรอบ `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` เลยสำคัญในทางปฏิบัติ ถ้าไม่ตั้งไว้ Job และ Pod object เก่าจะสะสมไปเรื่อย ๆ ทุกคืน
+เพราะ schedule ของ CronJob ยิงซ้ำได้หลายรอบ `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` เลยสำคัญในทางปฏิบัติ ถึงแม้ทั้งคู่จะ default เป็นตัวเลขเล็ก ๆ ที่มีขอบเขต (`3`/`1` พิสูจน์ด้านล่าง) ไม่ใช่ "ไม่มีขอบเขต" ก็ตาม พิสูจน์แล้วข้างบน `successfulJobsHistoryLimit: 2` ทำให้เกิด `SuccessfulDelete` บน Job ที่ complete เก่าสุดจริง ๆ ทันทีที่ตัวที่ 3 เสร็จ
+
+## อ่านโค้ดที่ AI เขียน
+
+ตอน review Job หรือ CronJob ที่ AI generate มา เช็คพวกนี้
+
+- `restartPolicy: Always` บน Pod template ของ Job พิสูจน์แล้วข้างบนว่านี่คือ API server reject จริงทันที (`Required value: valid values: "OnFailure", "Never"`) ไม่ใช่อะไรที่จะค่อย ๆ เสื่อมลงเงียบ ๆ
+- มีทั้ง `activeDeadlineSeconds` และ `backoffLimit` แต่ผู้เขียนคิดว่ามีแค่ตัวเดียวที่ "ใช้จริง" พิสูจน์แล้วข้างบนว่าใครมาถึงเงื่อนไขก่อนคนนั้นชนะ พร้อม `reason` ที่ต่างกันชัดเจน (`DeadlineExceeded` เทียบกับ `BackoffLimitExceeded`) alert ที่ผูกกับ reason string ผิดตัวจะพลาดอีกเส้นทางไปเลย
+- rule `podFailurePolicy` ที่ใช้ `Ignore` บน exit code ที่เกิดขึ้นได้ตลอดไปจริง ๆ (เช่น input file พังที่ไม่มีวันถูกต้อง) พิสูจน์แล้วข้างบนว่า `Ignore` ไม่นับเข้า `backoffLimit` เลยจริง ๆ ดังนั้น Job ที่ความพังจริง ๆ ถาวร ไม่ใช่ transient จะ retry ไม่มีสิ้นสุดโดยไม่มีอะไรมาหยุดอัตโนมัติ
+- CronJob ที่ `schedule: '* * * * *'` (หรือถี่พอ ๆ กัน) กับ Job ที่รันนานกว่าช่วง schedule ได้ โดยไม่ตั้ง `concurrencyPolicy` เลย default คือ `Allow` พิสูจน์แล้วข้างบนว่ามันรัน Job ที่ทับซ้อนกันจริง ๆ คู่กันไปเลย ซึ่งแทบไม่ใช่สิ่งที่ผู้เขียน "รันทุกนาที" ตั้งใจไว้ สำหรับ job ที่ runtime ไม่ถูกจำกัดแน่นอน
+- ไม่มี `ttlSecondsAfterFinished` บน Job แบบ batch ที่รันซ้ำ ๆ ที่ไม่ได้อยู่ภายใต้ CronJob เลย พิสูจน์แล้วข้างบนว่า Job (ต่างจาก history limit ของ CronJob เองที่ default เป็นตัวเลขมีขอบเขต `3`/`1`) ไม่มี TTL default เลย สะสมไม่มีขอบเขตจนกว่าจะลบด้วยมือ
+
+<SpotTheBug code={`# k8s/jobs-and-cronjobs/nightly-cleanup.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly-cleanup
+spec:
+  schedule: '*/1 * * * *'
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: cleanup
+              image: myregistry/cleanup-job:2.0.0`}>
+บั๊กจริงคือ ไม่ได้ตั้ง `concurrencyPolicy` เลย มันเลย default เป็น `Allow` พิสูจน์แล้วข้างบนด้วย schedule จริงว่า `Allow` รัน Job ใหม่ทุก tick ของนาทีจริง ๆ **แม้ว่า run ก่อนหน้ายังทำงานอยู่** ซึ่งแทบไม่ใช่สิ่งที่ตั้งใจสำหรับ cleanup job ที่ scan/mutate shared state (สอง cleanup run ที่ทับซ้อนแข่งกันเองคือ correctness bug ไม่ใช่แค่เปลืองทรัพยากร) ทางแก้: เพิ่ม `concurrencyPolicy: Forbid` (พิสูจน์แล้วข้างบนว่ามันกัก tick ที่ยังถึงกำหนดไว้จนกว่า run ก่อนหน้าจะจบ หรือทิ้งไปเลยถ้าตามหลังไปไกลเกิน ไม่มีวันรันสองตัวพร้อมกันเด็ดขาด) `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` ไม่ได้ตั้งไว้ตรงนี้ ซึ่งจริง ๆ ไม่เป็นไร พิสูจน์แล้วข้างบนว่ามัน default เป็น `3`/`1` ที่มีขอบเขต ไม่ใช่ไม่มีขอบเขต การไม่ตั้งอันนี้เพียงอย่างเดียวเลยไม่ใช่บั๊ก
+</SpotTheBug>
+
+## Mental Model
+
+Job ไม่ใช่แค่ "Pod ที่มี retry" มันคือ **ตัวนับ completion ที่มีงบ retry** `completions`/`parallelism` บอกเป้าหมายกับ concurrency `backoffLimit`/`activeDeadlineSeconds`/`podFailurePolicy` คือสามวิธีอิสระจากกันที่ตัวนับนี้จะตัดสินใจว่ามันไม่มีวันถึงเป้าหมายแล้วยอมแพ้ (พิสูจน์แล้วข้างบน: แต่ละอันมี `reason` ของตัวเองชัดเจน) CronJob คือโรงงานผลิต Job ที่ผูกกับนาฬิกา ความซับซ้อนทั้งหมดของมัน `concurrencyPolicy`, `startingDeadlineSeconds`, history limit จริง ๆ แล้วคือคำถามเดียวที่ถูกถามซ้ำ ๆ **"tick ใหม่ถึงกำหนดแล้ว มี Job ที่ฉัน create ไว้ก่อนหน้ายังมีอยู่ไหม ถ้ามีจะทำยังไงกับ tick นี้"**
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ได้อะไร | เสียอะไร |
+|---|---|---|
+| `podFailurePolicy` กับ `FailJob` บน exit code ที่ fatal | หยุดทันทีเมื่อเจอ error ที่ retry ไม่ได้ พิสูจน์แล้วข้างบน (1 Pod ไม่ใช่ `backoffLimit`+1) | ต้องคอยดูแลให้ตรงกับ exit-code contract จริงของแอปตลอด |
+| `podFailurePolicy` กับ `Ignore` บน exit code ที่ transient | ความพังที่ transient จริง ๆ ไม่เสียงบ retry เลย พิสูจน์แล้วข้างบน | ความพังที่*คิดว่า*transient แต่จริง ๆ ไม่ใช่ จะ retry ไม่มีสิ้นสุดโดยไม่มีอะไรหยุด |
+| `completionMode: Indexed` | shard งานได้โดยไม่ต้องประสานงานเลยผ่าน `JOB_COMPLETION_INDEX` พิสูจน์แล้วข้างบน | งานต้อง partition ได้ด้วย integer index ล้วน ๆ ตั้งแต่ต้น |
+| `concurrencyPolicy: Allow` (default) | ง่าย ไม่มีวันบล็อก run ตาม schedule เลย | พิสูจน์แล้วข้างบนว่า run ที่ช้ากับ run ของ tick ถัดไปรันคู่กันจริง ๆ |
+| `concurrencyPolicy: Forbid` | ไม่มี run ที่ทับซ้อนกันเลย พิสูจน์แล้วข้างบน | run ที่ยังทำงานอยู่ตอนหลาย tick ผ่านไปทำให้ tick พวกนั้นถูกข้ามไปเงียบ ๆ ถาวร (พิสูจน์แล้วข้างบน: `-29840165` ไม่เคยมีอยู่จริง) |
+| `ttlSecondsAfterFinished` / history limit | Job/Pod สะสมมีขอบเขต พิสูจน์แล้วข้างบน | history เก่าหายไปเมื่อเกิน TTL/limit ไม่มีบันทึกไว้ตรวจสอบย้อนหลังด้วยมือ |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"backoffLimit กับ activeDeadlineSeconds เป็นปุ่มเดียวกันแค่วัดคนละหน่วย"** พิสูจน์แล้วข้างบน มันเป็นเงื่อนไขอิสระจากกันที่มี reason แยกแยะได้ชัดเจน (`BackoffLimitExceeded` เทียบกับ `DeadlineExceeded`) ใครมาถึงก่อนคนนั้นจบ Job
+- **"podFailurePolicy: Ignore แค่ทำให้ Job retry นานขึ้นอีกนิด"** พิสูจน์แล้วข้างบน มันหมายความว่า exit code นั้น **ไม่ถูกนับเลย** ด้วย `backoffLimit: 0` Job ยังคง retry ต่อหลังพังจริง 2 ครั้ง `status.failed` ไม่ขยับเลย
+- **"concurrencyPolicy: Forbid จะ queue run ที่ถูกข้ามไว้แล้วค่อยตามทีหลัง"** พิสูจน์แล้วข้างบนด้วยชื่อ Job จริง tick ที่ถูกข้ามเพราะ `Forbid` (`-29840165`) ไม่เคยถูก create เลย controller กระโดดไป tick ที่ถึงกำหนดถัดไปเลย ไม่ backfill ทุก tick ที่พลาดไป
+- **"CronJob ที่ไม่ตั้ง history limit ไว้เก็บ history ไม่มีขอบเขต"** พิสูจน์แล้วข้างบนด้วย `kubectl explain` จริง `successfulJobsHistoryLimit` default `3`, `failedJobsHistoryLimit` default `1` ไม่ตั้ง field ไม่ได้แปลว่าไม่มีขอบเขต มันแปลว่าใช้ตัวเลขเล็ก ๆ พวกนี้แทน
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**Job** รัน Pod จนจบงาน ไม่ใช่รันตลอดไป `completions` กำหนดว่าต้องสำเร็จกี่ครั้ง `parallelism` กำหนดว่ารันพร้อมกันได้กี่ตัว `backoffLimit` กำหนดว่ายอมพังได้กี่ครั้ง และ Pod template ของตัวเองต้องใช้ `restartPolicy: OnFailure` หรือ `Never` **CronJob** create Job ตาม `schedule` โดยมี `concurrencyPolicy` (`Allow`/`Forbid`/`Replace`) คุม run ที่ทับซ้อนกัน และ `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` จำกัดว่าจะเก็บ history ไว้แค่ไหน
+**Job** รัน Pod จนจบงาน ไม่ใช่รันตลอดไป `completions`/`parallelism` กำหนดเป้าหมายกับ concurrency และมีเงื่อนไขอิสระสามอย่างที่จบมันได้ก่อนเวลา แต่ละอันมี condition `reason` ของตัวเอง (พิสูจน์แล้วข้างบน) `backoffLimit` (`BackoffLimitExceeded`), `activeDeadlineSeconds` (`DeadlineExceeded`) และ rule `podFailurePolicy` อย่าง `FailJob`/`Ignore` (`PodFailurePolicy`, GA ตั้งแต่ **v1.28**) ที่ action ตาม exit code จริง ไม่ใช่แค่ "พังก็คือพัง" `completionMode: Indexed` ให้แต่ละ Pod มี `JOB_COMPLETION_INDEX` ของตัวเองสำหรับ shard งานแบบไม่ต้องประสานงาน และ `ttlSecondsAfterFinished` garbage-collect Job ที่จบแล้วอัตโนมัติ **CronJob** create Job ตาม `schedule` (ปักหมุด `timeZone` จริงได้) ที่ `concurrencyPolicy` เปลี่ยนพฤติกรรมจริงชัดเจน `Allow` (default) รันคู่กันจริง `Forbid` ข้าม tick ที่ยังถูกบล็อกไปถาวรแทนที่จะ queue (ทั้งคู่พิสูจน์แล้วข้างบน) และ `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` จำกัดว่าจะเก็บ Job เก่าไว้กี่ตัว พิสูจน์แล้วข้างบนด้วย event `SuccessfulDelete` จริง
 </Callout>
 
 export const quizJobs = [
@@ -112,6 +455,7 @@ export const quizJobs = [
       'Job ต้องมี headless Service ส่วน Deployment ไม่ต้อง',
     ],
     answer: 0,
+    explain: 'Job นับ completion ไปสู่เป้าหมายที่มีขอบเขตแล้วหยุด ส่วน Deployment รักษาจำนวน replica ให้รันไม่มีกำหนด restart Pod ไปเรื่อย ๆ',
   },
   {
     q: 'backoffLimit บน Job คุมอะไร',
@@ -122,6 +466,7 @@ export const quizJobs = [
       'เวลารันสูงสุดของทั้ง Job',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วข้างบน: backoffLimit: 2 ทำให้เกิด Pod attempt เป๊ะ ๆ 3 ครั้ง (limit บวก attempt แรก) ก่อน Job condition Failed/BackoffLimitExceeded',
   },
   {
     q: 'Pod template ของ Job ใช้ restartPolicy ค่าไหนได้บ้าง',
@@ -132,6 +477,7 @@ export const quizJobs = [
       'ค่าไหนก็ได้ Job ไม่สนใจ restartPolicy',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วข้างบนด้วย error จริงของ API server: "spec.template.spec.restartPolicy: Required value: valid values: \\"OnFailure\\", \\"Never\\"" Always ถูก reject ทันที',
   },
   {
     q: 'concurrencyPolicy: Forbid บน CronJob ทำอะไร',
@@ -142,6 +488,29 @@ export const quizJobs = [
       'ลบ Job เก่าทันทีหลังจากรันจบ',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วข้างบนด้วย event จริง: tick ที่ถึงกำหนดตอน Job ก่อนหน้ายังทำงานอยู่ถูกข้ามไป ไม่ว่าจะกักไว้จนกว่า Job ก่อนหน้าจะจบ หรือทิ้งไปเลย (JobAlreadyActive) ถ้า tick ถัดไปถึงกำหนดก่อน',
+  },
+  {
+    q: '```yaml\napiVersion: batch/v1\nkind: Job\nspec:\n  backoffLimit: 6\n  podFailurePolicy:\n    rules:\n      - action: FailJob\n        onExitCodes:\n          containerName: work\n          operator: In\n          values: [42]\n```\ncontainer exit 42 เสมอ Job นี้ create Pod กี่ตัวจริง ๆ ก่อนจะพัง',
+    options: [
+      '7 ตัว เพราะ backoffLimit: 6 ยอมให้ retry 6 ครั้ง บวก attempt แรก',
+      '1 ตัว -- FailJob ตัดข้าม backoffLimit ไปเลยเมื่อเจอ exit code ที่ตรง',
+      '0 ตัว Job ถูก reject ตั้งแต่ admission',
+      'ไม่มีสิ้นสุด FailJob แปลว่า retry ต่อไปเรื่อย ๆ',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วข้างบน: มี Pod รันแค่ตัวเดียว ทั้งที่ backoffLimit: 6 ข้อความ condition คือ "...failed with exit code 42 matching FailJob rule at index 0" reason PodFailurePolicy และ Job พังทันที',
+  },
+  {
+    q: '```text\n08:04:00   SuccessfulCreate   Created job slow-allow-29840164\n```\nJob นี้ถูก create ตอน 08:04:00 ในขณะที่ Job 90 วินาทีของนาทีก่อนหน้า (slow-allow-29840163) ยังรันอยู่จนถึง 08:04:32 event log จริงนี้พิสูจน์อะไร',
+    options: [
+      'นี่คือบั๊ก -- CronJob ไม่ควร create Job ที่ทับซ้อนกันเด็ดขาด',
+      'concurrencyPolicy: Allow (default) create Job ใหม่ตาม schedule จริง ๆ แม้ Job ก่อนหน้าจาก CronJob เดียวกันจะยังทำงานอยู่',
+      'controller ไม่สนใจ schedule ของตัวเองเลยตอนโหลดสูง',
+      'สอง Job แชร์ Pod เดียวกัน จึงไม่มี overlap จริง',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วข้างบน: ด้วย concurrencyPolicy: Allow สอง Job แยกกัน (พร้อม Pod ของมัน) รันคู่กันจริงประมาณ 32 วินาที นี่คือสิ่งที่ Allow หมายถึงเป๊ะ ๆ ตรงข้ามกับ Forbid ที่พิสูจน์ใน experiment เดียวกัน',
   },
 ];
 

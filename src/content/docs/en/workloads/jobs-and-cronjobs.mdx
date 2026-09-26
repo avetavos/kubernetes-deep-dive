@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
@@ -37,7 +38,28 @@ spec:
           args: ['--month=2026-06']
 ```
 
-`completions: 5` means the Job is not done until 5 Pods have exited successfully; `parallelism: 2` caps how many of those Pods run at once; `backoffLimit: 3` is how many failed attempts the Job tolerates before it gives up and marks itself `Failed`; `activeDeadlineSeconds: 600` is an overall wall-clock timeout for the whole Job, after which it is terminated regardless of completions. Notice `restartPolicy: OnFailure` — a Job's Pod template must use `OnFailure` or `Never`, never `Always`, because a Job's entire point is to stop once the work is done.
+`completions: 5` means the Job is not done until 5 Pods have exited successfully; `parallelism: 2` caps how many of those Pods run at once; `backoffLimit: 3` is how many failed attempts the Job tolerates before it gives up and marks itself `Failed`; `activeDeadlineSeconds: 600` is an overall wall-clock timeout for the whole Job, after which it is terminated regardless of completions. Notice `restartPolicy: OnFailure` — a Job's Pod template must use `OnFailure` or `Never`, never `Always`, because a Job's entire point is to stop once the work is done — proven on a real API server:
+
+```yaml
+# k8s/jobs-and-cronjobs/job-bad-restart.yaml — @expect-error restartPolicy: Always is not a valid Job Pod template value
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bad-job
+spec:
+  template:
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: work
+          image: busybox:1.38
+          command: ['sh', '-c', 'echo hi']
+```
+
+```text
+$ kubectl apply --dry-run=server -f job-bad-restart.yaml
+The Job "bad-job" is invalid: spec.template.spec.restartPolicy: Required value: valid values: "OnFailure", "Never"
+```
 
 ```bash
 # Watch completions accumulate, then check the Job's final status
@@ -47,6 +69,164 @@ kubectl describe job report-backfill
 # Logs from a finished Job's Pods
 kubectl logs -l job-name=report-backfill --tail=100
 ```
+
+## `backoffLimit` vs `activeDeadlineSeconds`: two different ways a Job gives up
+
+Both stop a failing Job, but on different axes: `backoffLimit` counts **failed attempts**, `activeDeadlineSeconds` is a **wall-clock ceiling** on the whole Job regardless of how many attempts that used. Proof of each, real conditions from a live cluster:
+
+```text
+# backoffLimit: 2, container always exits 1, no activeDeadlineSeconds set
+$ kubectl get pods -l job-name=backoff-demo --no-headers | wc -l
+3   # ordinals 0, 1, 2 -- backoffLimit + 1 attempts, exactly
+
+$ kubectl get job backoff-demo -o jsonpath='{range .status.conditions[*]}{.type}{"="}{.status}{" reason="}{.reason}{" message="}{.message}{"\n"}{end}'
+FailureTarget=True reason=BackoffLimitExceeded message=Job has reached the specified backoff limit
+Failed=True reason=BackoffLimitExceeded message=Job has reached the specified backoff limit
+```
+
+```text
+# backoffLimit: 6 (would normally allow 7 attempts), activeDeadlineSeconds: 8, container always exits 1
+$ kubectl get pods -l job-name=deadline-demo --no-headers | wc -l
+1   # cut off by the deadline before a 2nd attempt's backoff delay even elapsed
+
+$ kubectl get job deadline-demo -o jsonpath='{range .status.conditions[*]}{.type}{"="}{.status}{" reason="}{.reason}{" message="}{.message}{"\n"}{end}'
+FailureTarget=True reason=DeadlineExceeded message=Job was active longer than specified deadline
+Failed=True reason=DeadlineExceeded message=Job was active longer than specified deadline
+```
+
+`backoffLimit: 2` really does mean exactly 3 Pod attempts before `BackoffLimitExceeded`; `activeDeadlineSeconds: 8` cuts a Job off well before its much higher `backoffLimit: 6` would ever be hit, with a different, distinct reason (`DeadlineExceeded`). Whichever fires first wins — set `activeDeadlineSeconds` when you need an absolute ceiling on total run time regardless of retry count (a nightly batch job that must not still be running at 6am), and `backoffLimit` when what matters is bounding *how many times* to retry regardless of how long that took.
+
+## `podFailurePolicy`: acting on the exact exit code, not just "it failed"
+
+GA since Kubernetes **v1.28** (feature gate `JobPodFailurePolicy`, removed/locked-true in 1.32 — [feature gate history](https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates-removed/)), `podFailurePolicy` lets a Job react differently to different container exit codes instead of treating every failure identically against `backoffLimit`. Two of its actions, proven:
+
+**`FailJob`** — stop the whole Job immediately on a specific exit code, ignoring `backoffLimit` entirely (no pointless retries of a fatal, non-transient error):
+
+```yaml
+# k8s/jobs-and-cronjobs/job-podfailurepolicy-failjob.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pfp-failjob
+spec:
+  backoffLimit: 6
+  podFailurePolicy:
+    rules:
+      - action: FailJob
+        onExitCodes:
+          containerName: work
+          operator: In
+          values: [42]
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: work
+          image: busybox:1.38
+          command: ['sh', '-c', 'echo simulating a fatal, non-retryable config error; exit 42']
+```
+
+```text
+$ kubectl get pods -l job-name=pfp-failjob
+NAME                READY   STATUS   RESTARTS   AGE
+pfp-failjob-48t28   0/1     Error    0          4s
+
+$ kubectl get job pfp-failjob -o jsonpath='{range .status.conditions[*]}{.type}{"="}{.status}{" reason="}{.reason}{" message="}{.message}{"\n"}{end}'
+FailureTarget=True reason=PodFailurePolicy message=Container work for pod default/pfp-failjob-48t28 failed with exit code 42 matching FailJob rule at index 0
+Failed=True reason=PodFailurePolicy message=Container work for pod default/pfp-failjob-48t28 failed with exit code 42 matching FailJob rule at index 0
+```
+
+Exactly **one** Pod ran, despite `backoffLimit: 6` — `FailJob` short-circuits straight past the retry budget.
+
+**`Ignore`** — don't count this exit code against `backoffLimit` at all, keep retrying regardless:
+
+```yaml
+# k8s/jobs-and-cronjobs/job-podfailurepolicy-ignore.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pfp-ignore
+spec:
+  backoffLimit: 0
+  podFailurePolicy:
+    rules:
+      - action: Ignore
+        onExitCodes:
+          containerName: work
+          operator: In
+          values: [1]
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: work
+          image: busybox:1.38
+          command: ['sh', '-c', 'echo transient failure, will keep getting ignored; exit 1']
+```
+
+```text
+$ kubectl get pods -l job-name=pfp-ignore
+NAME               READY   STATUS   RESTARTS   AGE
+pfp-ignore-q52jr   0/1     Error    0          15s
+pfp-ignore-xlnn4   0/1     Error    0          5s
+
+$ kubectl get job pfp-ignore -o jsonpath='{.status.failed}'
+     # empty/0 -- despite backoffLimit: 0, two Pods have already failed and a new one keeps getting created
+```
+
+With `backoffLimit: 0`, a normal Job gives up after its very first failure. Here, two Pods have already failed exit code 1 and the Job just keeps creating more — `status.failed` never increments, because `Ignore` means this exit code is never counted toward the backoff budget at all.
+
+## Indexed Jobs: each Pod knows its own index
+
+`completionMode: Indexed` gives each Pod a fixed, unique completion index (`0`..`completions-1`), injected as the `JOB_COMPLETION_INDEX` env var and as the `batch.kubernetes.io/job-completion-index` Pod label — useful for sharding a dataset across Pods without any Pod-to-Pod coordination:
+
+```yaml
+# k8s/jobs-and-cronjobs/job-indexed.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: indexed-report
+spec:
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  ttlSecondsAfterFinished: 60
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: work
+          image: busybox:1.38
+          command: ['sh', '-c', 'echo "this is completion index $JOB_COMPLETION_INDEX"']
+```
+
+```text
+$ kubectl get pods -l job-name=indexed-report
+NAME                     READY   STATUS      AGE
+indexed-report-0-9j8ff   0/1     Completed   3s
+indexed-report-1-ncff4   0/1     Completed   3s
+indexed-report-2-lw5cv   0/1     Completed   3s
+indexed-report-3-clz2x   0/1     Completed   3s
+
+$ kubectl logs indexed-report-0-9j8ff
+this is completion index 0
+$ kubectl logs indexed-report-2-lw5cv
+this is completion index 2
+```
+
+The Pod names themselves embed the index (`indexed-report-<index>-<suffix>`), each container really did read a different `$JOB_COMPLETION_INDEX`, and `ttlSecondsAfterFinished: 60` means the whole Job (and its Pods) is garbage-collected automatically ~60s after it completes — proven directly:
+
+```text
+$ kubectl get job ttl-demo
+NAME       STATUS     COMPLETIONS   DURATION   AGE
+ttl-demo   Complete   1/1           3s         4s
+
+# ...15s later (ttlSecondsAfterFinished: 15 on this one)...
+$ kubectl get job ttl-demo
+Error from server (NotFound): jobs.batch "ttl-demo" not found
+```
+
+Without `ttlSecondsAfterFinished`, completed Jobs (and their Pods) stay around forever until deleted by hand — for a frequently-run batch Job this accumulates the same way un-bounded CronJob history does, covered next.
 
 ## CronJobs: scheduling Jobs
 
@@ -74,7 +254,80 @@ spec:
               image: myregistry/nightly-report:1.0.0
 ```
 
-`schedule: '0 2 * * *'` runs at 02:00 every day, in standard cron syntax. `concurrencyPolicy` decides what happens if a previous run is still going when the next one is due: `Allow` (the default) runs them side by side, `Forbid` skips the new run entirely, and `Replace` cancels the still-running Job and starts the new one in its place. `startingDeadlineSeconds` bounds how late a missed run is still allowed to start. `successfulJobsHistoryLimit` and `failedJobsHistoryLimit` control how many old Job objects the CronJob keeps around for inspection before garbage-collecting them.
+`schedule: '0 2 * * *'` runs at 02:00 every day, in standard cron syntax. `concurrencyPolicy` decides what happens if a previous run is still going when the next one is due: `Allow` (the default) runs them side by side, `Forbid` skips the new run entirely, and `Replace` cancels the still-running Job and starts the new one in its place. `startingDeadlineSeconds` bounds how late a missed run is still allowed to start. `successfulJobsHistoryLimit` and `failedJobsHistoryLimit` control how many old Job objects the CronJob keeps around for inspection before garbage-collecting them. `timeZone` (a IANA name like `'Asia/Bangkok'`) pins the schedule to a real time zone instead of the `kube-controller-manager` process's own zone — validated against the system time zone database at both admission and execution time.
+
+### `concurrencyPolicy`, proven with an overlapping real schedule
+
+Two CronJobs, both `schedule: '* * * * *'` (every minute), running a Job that sleeps 90 seconds — one `concurrencyPolicy: Allow`, one `Forbid`:
+
+```yaml
+# k8s/jobs-and-cronjobs/cj-allow.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: slow-allow
+spec:
+  schedule: '* * * * *'
+  concurrencyPolicy: Allow
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: work
+              image: busybox:1.38
+              command: ['sh', '-c', 'echo start $(date +%T); sleep 90; echo done $(date +%T)']
+```
+
+```yaml
+# k8s/jobs-and-cronjobs/cj-forbid.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: slow-forbid
+spec:
+  schedule: '* * * * *'
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: work
+              image: busybox:1.38
+              command: ['sh', '-c', 'echo start $(date +%T); sleep 90; echo done $(date +%T)']
+```
+
+Observed for a bit over 3 minutes on a live cluster:
+
+```text
+# concurrencyPolicy: Allow -- events, in order
+08:03:00   SuccessfulCreate   Created job slow-allow-29840163
+08:04:00   SuccessfulCreate   Created job slow-allow-29840164   # <-- created while -163 (90s job) is STILL RUNNING
+08:04:32   SawCompletedJob    Saw completed job: slow-allow-29840163, condition: Complete
+08:05:00   SuccessfulCreate   Created job slow-allow-29840165   # <-- created while -164 is STILL RUNNING
+08:05:32   SawCompletedJob    Saw completed job: slow-allow-29840164, condition: Complete
+08:06:00   SuccessfulCreate   Created job slow-allow-29840166
+08:06:32   SuccessfulDelete   Deleted job slow-allow-29840163   # successfulJobsHistoryLimit: 2 pruning the oldest
+```
+
+```text
+# concurrencyPolicy: Forbid -- events, same 3+ minutes, same cluster
+08:03:00   SuccessfulCreate   Created job slow-forbid-29840163
+08:04:32   SawCompletedJob    Saw completed job: slow-forbid-29840163, condition: Complete
+08:04:32   SuccessfulCreate   Created job slow-forbid-29840164   # the 08:04:00 tick, held until -163 finished
+08:06:05   JobAlreadyActive   Not starting job because prior execution is running and concurrency policy is Forbid
+08:06:05   SawCompletedJob    Saw completed job: slow-forbid-29840164, condition: Complete
+08:06:05   SuccessfulCreate   Created job slow-forbid-29840166   # note: -29840165 (the 08:05:00 tick) never exists at all
+```
+
+Every minute-tick's Job name encodes which scheduled time it's for (the `...163`/`...164`/... suffix). With `Allow`, `slow-allow-29840164` (due at `08:04:00`) is created exactly on schedule, **while** `slow-allow-29840163` (the previous minute's 90-second Job) is still `08:04:00`–`08:04:32` away from completing — real, provable overlap, two Jobs' Pods running at once. With `Forbid`, the `08:04:00` tick isn't skipped outright — it's *held*: the controller creates `slow-forbid-29840164` the instant `-163` completes (`08:04:32`, not `08:04:00`), and the next due tick (`08:05:00`, which would have been `-29840165`) is skipped **permanently** once it's clear `-164` is still active (`JobAlreadyActive`, logged when the controller next reconciles at `08:06:05`) — `-29840165` never appears in `kubectl get jobs` at all, the controller jumps straight to the next still-due tick (`-29840166`) rather than queuing every missed one. The `SuccessfulDelete` line on the `Allow` CronJob is `successfulJobsHistoryLimit: 2` for real: by `08:06:32` there were 3 completed Jobs, so the oldest (`-163`) was garbage-collected.
 
 <Mermaid title="A CronJob creates a Job on its schedule; the Job creates Pods that run to completion" code={jobsDiagram} />
 
@@ -84,6 +337,46 @@ export const jobsDiagram = `flowchart LR
   j -->|creates| p2["Pod (runs to completion)"]
   p1 --> done["Succeeded, Pods stop"]
   p2 --> done`;
+
+### `startingDeadlineSeconds`, `timeZone`, and history limits
+
+```text
+$ kubectl explain cronjob.spec.startingDeadlineSeconds
+FIELD: startingDeadlineSeconds <integer>
+
+DESCRIPTION:
+    Optional deadline in seconds for starting the job if it misses scheduled
+    time for any reason.  Missed jobs executions will be counted as failed ones.
+```
+
+The `Forbid` proof above already shows the *default* (`startingDeadlineSeconds` unset) missed-schedule behavior directly: the controller does not queue up every missed tick, it only ever tries to satisfy the single most recent due one, and gives up on older ones once concurrency clears — `-29840165` was skipped forever, not deferred. Setting `startingDeadlineSeconds` makes that skip bound explicit and intentional (rather than an emergent side effect of how far behind the controller happens to be) and, per the field's own description above, counts a too-late miss as a **failed** run rather than silently vanishing.
+
+`timeZone` is accepted and validated at admission time against the real system time zone database:
+
+```yaml
+# k8s/jobs-and-cronjobs/cj-timezone.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: tz-demo
+spec:
+  schedule: '30 2 * * *'
+  timeZone: 'Asia/Bangkok'
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: work
+              image: busybox:1.38
+              command: ['echo', 'hi']
+```
+
+```text
+$ kubectl apply --dry-run=server -f cj-timezone.yaml
+cronjob.batch/tz-demo created (server dry run)
+```
 
 ## Operating Jobs and CronJobs
 
@@ -96,10 +389,60 @@ kubectl get jobs --selector=job-name
 kubectl create job nightly-report-manual --from=cronjob/nightly-report
 ```
 
-Because a CronJob's schedule can fire many times, `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` matter in practice: without them old Job and Pod objects would accumulate forever every night.
+Because a CronJob's schedule can fire many times, `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` matter in practice, even though both default to a small, bounded number (`3`/`1`, proven below) rather than "unbounded" — proven above, `successfulJobsHistoryLimit: 2` really did trigger a `SuccessfulDelete` on the oldest completed Job once a 3rd one finished.
+
+## Reading AI-generated code
+
+When reviewing a generated Job or CronJob, check for:
+
+- `restartPolicy: Always` on a Job's Pod template — proven above, this is a real, immediate API-server rejection (`Required value: valid values: "OnFailure", "Never"`), not something that silently degrades.
+- `activeDeadlineSeconds` and `backoffLimit` both present but the author assumes only one "really" applies — proven above, whichever condition is met first wins, with a distinct `reason` (`DeadlineExceeded` vs `BackoffLimitExceeded`) — an alert keyed on the wrong reason string will miss the other path entirely.
+- A `podFailurePolicy` rule using `Ignore` on an exit code that can legitimately happen forever (e.g. a bad input file that will never become valid) — proven above, `Ignore` truly never counts toward `backoffLimit`, so a Job whose failure is actually permanent, not transient, will retry indefinitely with no automatic stop.
+- A CronJob with `schedule: '* * * * *'` (or similarly tight) and a Job that can run longer than the schedule interval, with no `concurrencyPolicy` set at all — the default is `Allow`, proven above to genuinely run overlapping Jobs side by side, which is rarely what a "run this every minute" author intended for a job whose runtime isn't tightly bounded.
+- No `ttlSecondsAfterFinished` on a bare, recurring Job that isn't managed by a CronJob at all — proven above, a Job (unlike a CronJob's own history limits, which default to a bounded `3`/`1`) has no default TTL whatsoever and accumulates without limit until deleted by hand.
+
+<SpotTheBug code={`# k8s/jobs-and-cronjobs/nightly-cleanup.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly-cleanup
+spec:
+  schedule: '*/1 * * * *'
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: cleanup
+              image: myregistry/cleanup-job:2.0.0`}>
+The real bug: no `concurrencyPolicy` is set, so it defaults to `Allow` — proven above with a live schedule, `Allow` genuinely runs a new Job every single minute-tick **even while a previous run is still active**, which is almost never intended for a cleanup job that scans/mutates shared state (two overlapping cleanup runs racing each other is a correctness bug, not just wasted resources). The fix: add `concurrencyPolicy: Forbid` (proven above: this holds a still-due tick until the previous run finishes, or drops it entirely if too far behind, rather than ever running two at once). `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` are left unset here, which is fine on its own — proven above, they default to a bounded `3`/`1`, not unbounded — so that omission alone is not the bug.
+</SpotTheBug>
+
+## Mental Model
+
+A Job is not "a Pod with retries," it is a **completion counter with a retry budget** — `completions`/`parallelism` describe the target and the concurrency, `backoffLimit`/`activeDeadlineSeconds`/`podFailurePolicy` are three independent ways that counter can decide it will never reach the target and give up (proven above: each produces its own distinct `reason`). A CronJob is a Job *factory* keyed on a clock, and its entire behavioral complexity — `concurrencyPolicy`, `startingDeadlineSeconds`, history limits — is really one question asked repeatedly: **"a new tick is due — does a previous Job created by me still exist, and if so, what do I do about this one?"**
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| `podFailurePolicy` with `FailJob` on fatal exit codes | Stops immediately on a non-retryable error, proven above (1 Pod, not `backoffLimit`+1) | One more thing to keep in sync with the app's actual exit-code contract |
+| `podFailurePolicy` with `Ignore` on transient exit codes | A truly transient failure never burns the retry budget, proven above | A failure you *thought* was transient but isn't retries forever with nothing to stop it |
+| `completionMode: Indexed` | Zero-coordination sharding via `JOB_COMPLETION_INDEX`, proven above | Work must be genuinely partitionable by a plain integer index up front |
+| `concurrencyPolicy: Allow` (default) | Simple; never blocks a scheduled run | Proven above: a slow run and the next tick's run genuinely execute side by side |
+| `concurrencyPolicy: Forbid` | No overlapping runs, ever, proven above | A run that's still active when several ticks pass causes those ticks to be silently, permanently skipped (proven above: `-29840165` never existed) |
+| `ttlSecondsAfterFinished` / history limits | Bounded Job/Pod accumulation, proven above | Old Job history is gone once past the TTL/limit — no manual forensic record retained |
+
+## Common Misconceptions
+
+- **"backoffLimit and activeDeadlineSeconds are basically the same knob, just measured differently."** Proven above: they're independent conditions with independent, distinguishable reasons (`BackoffLimitExceeded` vs `DeadlineExceeded`) — whichever is hit first ends the Job.
+- **"podFailurePolicy: Ignore just means the Job retries a bit longer."** Proven above: it means that exit code is **never counted** at all — with `backoffLimit: 0`, a Job kept retrying after 2 real failures, `status.failed` stayed unset.
+- **"concurrencyPolicy: Forbid queues up the skipped runs and catches up later."** Proven above with real Job names: a tick skipped due to `Forbid` (`-29840165`) never gets created at all — the controller jumps to the next still-due tick, it does not backfill every missed one.
+- **"A CronJob with no history limits set keeps every run forever."** `kubectl explain` confirms real, documented defaults: `successfulJobsHistoryLimit` defaults to `3`, `failedJobsHistoryLimit` to `1` — leaving the fields unset does not mean unbounded, it means those specific small numbers.
 
 <Callout title="The one-line takeaway">
-A **Job** runs Pods to completion instead of forever — `completions` sets how many successes are needed, `parallelism` how many run at once, `backoffLimit` how many failures it tolerates, and its Pod template must use `restartPolicy: OnFailure` or `Never`; a **CronJob** creates Jobs on a `schedule`, with `concurrencyPolicy` (`Allow`/`Forbid`/`Replace`) governing overlapping runs and `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` bounding how much history is kept.
+A **Job** runs Pods to completion instead of forever — `completions`/`parallelism` set the target and concurrency, and three independent conditions can end it early, each with a distinct condition `reason` (proven above): `backoffLimit` (`BackoffLimitExceeded`), `activeDeadlineSeconds` (`DeadlineExceeded`), and `podFailurePolicy` rules like `FailJob`/`Ignore` (`PodFailurePolicy`, GA since **v1.28**) acting on specific exit codes instead of "any failure." `completionMode: Indexed` gives each Pod its own `JOB_COMPLETION_INDEX` for coordination-free sharding, and `ttlSecondsAfterFinished` garbage-collects a finished Job automatically. A **CronJob** creates Jobs on a `schedule` (optionally pinned to a real `timeZone`), where `concurrencyPolicy` genuinely changes real-world behavior — `Allow` (default) truly overlaps runs, `Forbid` truly skips a still-blocked tick permanently rather than queuing it (both proven above) — and `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` bound how many old Jobs are kept, proven above with a real `SuccessfulDelete` event.
 </Callout>
 
 export const quizJobs = [
@@ -112,6 +455,7 @@ export const quizJobs = [
       'A Job requires a headless Service, a Deployment does not',
     ],
     answer: 0,
+    explain: 'A Job tracks completions toward a finite target and stops; a Deployment keeps its replica count running indefinitely, restarting Pods forever.',
   },
   {
     q: 'What does backoffLimit control on a Job?',
@@ -122,6 +466,7 @@ export const quizJobs = [
       'The maximum runtime of the whole Job',
     ],
     answer: 1,
+    explain: 'Proven above: backoffLimit: 2 produced exactly 3 Pod attempts (the limit plus the initial try) before the Job condition Failed/BackoffLimitExceeded.',
   },
   {
     q: 'Which restartPolicy values are valid for a Job\'s Pod template?',
@@ -132,6 +477,7 @@ export const quizJobs = [
       'Any value, restartPolicy is ignored by Job',
     ],
     answer: 1,
+    explain: 'Proven above with the real API-server error: "spec.template.spec.restartPolicy: Required value: valid values: \\"OnFailure\\", \\"Never\\"" -- Always is rejected outright.',
   },
   {
     q: 'What does concurrencyPolicy: Forbid do on a CronJob?',
@@ -142,6 +488,29 @@ export const quizJobs = [
       'It deletes old Jobs immediately after they finish',
     ],
     answer: 1,
+    explain: 'Proven above with real events: a tick due while a prior Job is still active is skipped -- either held until the prior Job completes, or dropped entirely (JobAlreadyActive) if a later tick becomes due first.',
+  },
+  {
+    q: '```yaml\napiVersion: batch/v1\nkind: Job\nspec:\n  backoffLimit: 6\n  podFailurePolicy:\n    rules:\n      - action: FailJob\n        onExitCodes:\n          containerName: work\n          operator: In\n          values: [42]\n```\nThe container always exits 42. How many Pods does this Job actually create before failing?',
+    options: [
+      '7, since backoffLimit: 6 allows 6 retries plus the initial attempt',
+      '1 -- FailJob short-circuits past backoffLimit entirely on a matching exit code',
+      '0, the Job is rejected at admission',
+      'Infinite, FailJob means keep retrying',
+    ],
+    answer: 1,
+    explain: 'Proven above: exactly one Pod ran despite backoffLimit: 6 -- the condition message was "...failed with exit code 42 matching FailJob rule at index 0", reason PodFailurePolicy, and the Job failed immediately.',
+  },
+  {
+    q: '```text\n08:04:00   SuccessfulCreate   Created job slow-allow-29840164\n```\nThis Job was created at 08:04:00 while the previous minute\'s 90-second Job (slow-allow-29840163) was still running until 08:04:32. What does this real event log prove?',
+    options: [
+      'This is a bug -- CronJobs should never create overlapping Jobs',
+      'concurrencyPolicy: Allow (the default) genuinely creates a new Job on schedule even while a previous one from the same CronJob is still active',
+      'The CronJob controller ignores its own schedule under load',
+      'Both Jobs share the same Pod, so there is no real overlap',
+    ],
+    answer: 1,
+    explain: 'Proven above: with concurrencyPolicy: Allow, two separate Jobs (and their Pods) genuinely ran side by side for ~32 seconds -- this is exactly what Allow means, in contrast to Forbid proven in the same experiment.',
   },
 ];
 

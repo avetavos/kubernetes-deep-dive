@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
@@ -75,7 +76,7 @@ spec:
 
 chain ความเป็นเจ้าของจะเป็น **Deployment → ReplicaSet → Pod** เสมอ Deployment เป็นเจ้าของ ReplicaSet หนึ่งตัวหรือมากกว่านั้น (ตัวปัจจุบัน บวกกับตัวเก่าที่เก็บไว้เพื่อ rollback history) และ ReplicaSet แต่ละตัวก็เป็นเจ้าของ Pod ของตัวเอง
 
-<Mermaid title="A Deployment shifts replicas from an old ReplicaSet to a new one during a rollout" code={deploymentsDiagram} />
+<Mermaid title="Deployment ย้าย replica จาก ReplicaSet เก่าไปยังตัวใหม่ระหว่าง rollout" code={deploymentsDiagram} />
 
 export const deploymentsDiagram = `flowchart LR
   dep["Deployment web"] --> rsOld["ReplicaSet web-abc123 (old): 3 -> 0"]
@@ -99,11 +100,165 @@ spec:
 
 `Recreate` ทำให้เกิด outage สั้น ๆ จึงสงวนไว้ใช้กับกรณีที่ version เก่ากับใหม่รันคู่กันจริง ๆ ไม่ได้ เช่น application ที่ทนไม่ได้ถ้ามี schema สอง version ยิง database เดียวกันพร้อมกัน
 
+## `maxUnavailable: 0` กับ `maxSurge: 0` พร้อมกัน: API server reject จริง
+
+สองปุ่มนี้ไม่ได้เป็นอิสระจากกัน รวมกันแล้วต้องเหลือทาง *บางอย่าง* ให้ rollout เดินหน้าได้ ตั้งทั้งคู่เป็น `0` หมายความว่า "ห้าม Pod unavailable เด็ดขาด แล้วก็ห้าม create เพิ่มด้วย" นั่นไม่ใช่ strategy มันคือ rollout ที่ไม่มีวันย้าย replica จากเก่าไปใหม่ได้เลยแม้แต่ตัวเดียว API server reject มันตรง ๆ ไม่ใช่ตอน runtime แต่ตอน `apply`:
+
+```yaml
+# k8s/deployments-and-replicasets/deployment-zero-zero.yaml — @expect-error maxUnavailable: 0 is invalid when maxSurge is also 0
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 0
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10
+```
+
+```text
+$ kubectl apply --dry-run=server -f deployment-zero-zero.yaml
+The Deployment "web" is invalid: spec.strategy.rollingUpdate.maxUnavailable: Invalid value: 0: may not be 0 when `maxSurge` is 0
+```
+
+นั่นคือข้อความ error จริงจาก API server 1.37 ตัวจริง ถูกจับได้ตอน apply เลย ไม่ใช่ไปเจอทีหลังว่า rollout ค้าง
+
+## `minReadySeconds`: ready ไม่เท่ากับ available
+
+Pod ที่ถึง `Ready` แล้วไม่ได้นับเป็น *available* ให้ rollout ทันที `minReadySeconds` คือเวลาเพิ่มที่ Pod ต้องอยู่ใน `Ready` ต่อเนื่องก่อนที่ Deployment controller จะถือว่ามัน available และปล่อยให้ rollout ไปต่อที่ Pod ถัดไป ด้วย `minReadySeconds: 5` บน Deployment ที่ Pod ถึง `Ready` เกือบจะทันที rollout จริงจะหยุดค้างที่ข้อความนี้ซ้ำ ๆ หลายครั้งก่อนจะจบจริง:
+
+```yaml
+# k8s/deployments-and-replicasets/deployment-minreadyseconds.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  minReadySeconds: 5
+  progressDeadlineSeconds: 30
+  selector:
+    matchLabels:
+      app: web
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10
+```
+
+```text
+$ kubectl apply -f deployment-with-minreadyseconds.yaml && kubectl rollout status deployment/web
+Waiting for deployment "web" rollout to finish: 0 of 3 updated replicas are available...
+Waiting for deployment "web" rollout to finish: 0 of 3 updated replicas are available...
+Waiting for deployment "web" rollout to finish: 0 of 3 updated replicas are available...
+deployment "web" successfully rolled out
+```
+
+ข้อความ "0 of 3 ... available" สามบรรทัดติดกัน สำหรับ Pod ที่ `Ready` ไปแล้วภายในไม่ถึงวินาที คือ `minReadySeconds` กำลังทำงานของมัน Deployment จงใจกัน Pod ใหม่ไว้ที่สถานะ "Ready แต่ยังไม่ available" อีก 5 วินาทีก่อนจะเชื่อมัน ซึ่งเป็น guard ที่ต้องการเป๊ะ ๆ กับ Pod ที่ผ่าน readiness probe ทันทีแต่จริง ๆ ยังไม่ warm ขึ้นมา
+
+## `progressDeadlineSeconds` กับ `ProgressDeadlineExceeded`
+
+`progressDeadlineSeconds` จำกัดว่า Deployment controller จะรอ rollout ให้มี progress *ใด ๆ* นานแค่ไหนก่อนจะยอมแพ้แล้ว mark ว่าค้าง นี่คือสิ่งที่จับ rollout ไปยัง image พังที่ไม่มีวันผ่าน readiness probe แทนที่จะปล่อยให้มันเป็น "in progress" ตลอดไป พิสูจน์: Deployment ที่มี `progressDeadlineSeconds: 15` กับ readiness probe ที่ fail เสมอ:
+
+```yaml
+# k8s/deployments-and-replicasets/deployment-progress-deadline.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-baddeploy
+spec:
+  replicas: 2
+  progressDeadlineSeconds: 15
+  selector:
+    matchLabels:
+      app: web-baddeploy
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: web-baddeploy
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10
+          readinessProbe:
+            exec:
+              command: ['false']
+            periodSeconds: 2
+            failureThreshold: 1
+```
+
+```text
+$ kubectl rollout status deployment/web-baddeploy --timeout=5s
+error: deployment "web-baddeploy" exceeded its progress deadline
+```
+
+```text
+$ kubectl get deployment web-baddeploy -o jsonpath='{range .status.conditions[*]}{.type}{"="}{.status}{" reason="}{.reason}{" msg="}{.message}{"\n"}{end}'
+Available=False reason=MinimumReplicasUnavailable msg=Deployment does not have minimum availability.
+Progressing=False reason=ProgressDeadlineExceeded msg=ReplicaSet "web-baddeploy-56d9694579" has timed out progressing.
+```
+
+`Progressing=False` กับ `reason: ProgressDeadlineExceeded` คือสัญญาณจริงที่ query ได้ alert หรือ CI gate ควร watch condition นี้ ไม่ใช่แค่ "Deployment เสร็จหรือยัง" เพราะ rollout ที่ค้างจะนั่งเงียบ ๆ ที่ `Progressing=True` ตลอดไปโดยไม่มี readiness มาถึงเลยถ้าไม่มีตัวนี้
+
+## `selector` เป็น immutable
+
+`spec.selector` ของ Deployment ถูกตั้งครั้งเดียวแล้วไม่มีวันเปลี่ยนได้อีกเลย แม้แต่จะเพิ่ม label เข้าไปก็ไม่ได้ เพราะการเปลี่ยน selector จะทำให้ Pod/ReplicaSet เดิมที่ selector เก่าจับอยู่กลายเป็น orphan แบบเงียบ ๆ พิสูจน์ เปลี่ยน selector ของ Deployment ที่มีอยู่แล้วจาก `{app: web}` เป็น `{app: web, tier: frontend}`:
+
+```text
+$ kubectl apply -f deployment-selector-changed.yaml
+The Deployment "web" is invalid: spec.selector: Invalid value: {"matchLabels":{"app":"web","tier":"frontend"}}: field is immutable
+```
+
+ถ้าจำเป็นต้องเปลี่ยน selector จริง ๆ ทางเดียวคือลบแล้ว create Deployment ใหม่ (ใช้ `--cascade=orphan` ถ้าอยากให้ Pod เดิมรอด แล้วค่อยไป adopt ภายใต้ selector ใหม่) ไม่มีทาง migrate ในที่เดิมได้เลย
+
+## `pod-template-hash`: chain ความเป็นเจ้าของทำงานยังไงจริง ๆ
+
+Pod ทุกตัวที่ ReplicaSet ของ Deployment สร้างขึ้นจะได้ label เพิ่มมาอันหนึ่ง `pod-template-hash` คำนวณมาจาก (และไม่ซ้ำกับ) Pod template ของ ReplicaSet นั้น นี่คือวิธีที่ Deployment แยก "Pod ของ ReplicaSet เก่า" ออกจาก "Pod ของ ReplicaSet ใหม่" โดยไม่ต้องมี bookkeeping อะไรเพิ่มเลย:
+
+```text
+$ kubectl get pods -l app=web --show-labels
+NAME                   READY   STATUS    RESTARTS   AGE   LABELS
+web-795568db48-6c6tv   1/1     Running   0          5s    app=web,pod-template-hash=795568db48
+web-795568db48-j4fh2   1/1     Running   0          5s    app=web,pod-template-hash=795568db48
+web-795568db48-wll9g   1/1     Running   0          5s    app=web,pod-template-hash=795568db48
+```
+
+ReplicaSet เองก็ชื่อ `<deployment>-<pod-template-hash>` (`web-795568db48` ข้างบน) hash เดียวกันนี้คือทั้งส่วนต่อท้ายชื่อ ReplicaSet และ label `pod-template-hash` ของ Pod ทุกตัวของมัน ซึ่งก็เป็นเหตุผลที่ Service selector ที่จับแค่ `app: web` (ไม่จับ hash) ยัง route ถูกตลอด rollout ด้วย มันไม่จำเป็นต้องรู้เลยว่า ReplicaSet ไหนคือตัว current
+
 ## จัดการ rollout
 
 ```bash
 # Trigger a rollout by changing the Pod template (e.g. a new image), then watch it
 kubectl set image deployment/web web=myregistry/web:1.2.0
+kubectl annotate deployment/web kubernetes.io/change-cause="bump to 1.2.0" --overwrite
 kubectl rollout status deployment/web
 
 # See every revision this Deployment has kept
@@ -116,8 +271,105 @@ kubectl rollout undo deployment/web
 kubectl scale deployment/web --replicas=5
 ```
 
+output จริงจาก sequence นี้ บน Deployment ที่ create มาพร้อม `kubernetes.io/change-cause: "initial rollout: web:1.0.0"` แล้วอัปเดตเป็น `pause:3.9` พร้อม change-cause ใหม่ แล้ว rollback:
+
+```text
+$ kubectl rollout history deployment/web
+deployment.apps/web
+REVISION  CHANGE-CAUSE
+1         initial rollout: web:1.0.0
+2         bump pause 3.9 -> testing rollback
+
+$ kubectl rollout history deployment/web --revision=2
+deployment.apps/web with revision #2
+Pod Template:
+  Labels:	app=web
+	pod-template-hash=587c49f48d
+  Annotations:	kubernetes.io/change-cause: bump pause 3.9 -> testing rollback
+  Containers:
+   web:
+    Image:	registry.k8s.io/pause:3.9
+...
+
+$ kubectl rollout undo deployment/web
+Warning: resource deployments/web was previously managed with 'kubectl apply'. Rolling back will not update the kubectl.kubernetes.io/last-applied-configuration annotation, which may cause unexpected behavior on future 'kubectl apply' operations. Consider using 'kubectl apply' with your previous configuration file instead.
+deployment.apps/web rolled back
+
+$ kubectl rollout history deployment/web
+deployment.apps/web
+REVISION  CHANGE-CAUSE
+2         bump pause 3.9 -> testing rollback
+3         initial rollout: web:1.0.0
+```
+
+มีสองอย่างที่น่าสังเกตใน output จริง: `kubectl rollout history` จะโชว์ `CHANGE-CAUSE` ก็ต่อเมื่อ Deployment มี annotation `kubernetes.io/change-cause` เท่านั้น (kubectl 1.36 ไม่มี flag `--record` แล้ว มันถูกเอาออกไป ต้อง annotate เองตรง ๆ) และ `rollout undo` ไม่ได้ลบ revision 1 ทิ้ง มันทำให้การ rollback **กลายเป็น** revision ใหม่ (3) โดย copy template ของ revision 1 มาข้างหน้า แล้ว CLI ตัวจริงก็เตือนด้วยว่า Deployment ที่จัดการด้วย `apply` อาจ drift annotation `last-applied-configuration` หลัง `undo` ได้
+
+## อ่านโค้ดที่ AI เขียน
+
+ตอน review Deployment ที่ AI generate มา เช็คพวกนี้
+
+- `maxUnavailable: 0` คู่กับ `maxSurge: 0` พิสูจน์แล้วข้างบนว่านี่คือ API server reject จริงทันที ไม่ใช่ค่า rollout ที่ "ปลอดภัยเป็นพิเศษ"
+- `selector` ที่ถูกเปลี่ยนบน Deployment *ที่มีอยู่แล้ว* (แทนที่จะตั้งครั้งเดียวตอน create) พิสูจน์แล้วข้างบนว่า `spec.selector` เป็น immutable apply จะ fail ด้วย `field is immutable` ทางแก้ที่ generate มาควร create Deployment ใหม่ ไม่ใช่พยายามแก้ selector ในที่เดิม
+- ไม่มี `progressDeadlineSeconds` เลย (หรือปล่อยเป็น default 600 วินาที) บน Deployment ที่อยู่หลัง SLA/alert ถ้าไม่มีอันนี้ rollout ไปยัง image ที่พังจะนั่งอยู่ที่ `Progressing=True` ตลอดไปโดยไม่มีสัญญาณ `ProgressDeadlineExceeded` อัตโนมัติให้ page พิสูจน์แล้วข้างบน
+- rollout ที่เปลี่ยนแปลงโดยไม่มี annotation `kubernetes.io/change-cause` เลย `kubectl rollout history` จะโชว์ revision ที่ `CHANGE-CAUSE` ว่างเปล่า ทำให้ `rollout undo` กลายเป็นการเดาแทนที่จะเป็นการตัดสินใจที่มีข้อมูล
+- `minReadySeconds` ถูกเข้าใจผิดว่าหมายถึง "รอนานแค่ไหนก่อนจะเริ่ม Pod ถัดไป" ทั้งที่จริง ๆ มันหมายถึง "Pod ต้องอยู่ Ready นานแค่ไหนก่อนจะนับเป็น available" ความต่างนี้สำคัญตอนอ่าน output ของ `kubectl rollout status` พิสูจน์แล้วข้างบนด้วยบรรทัด "0 of N replicas are available" ที่ซ้ำกัน
+
+<SpotTheBug code={`# k8s/deployments-and-replicasets/web-fast-rollback.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: web
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 0
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: myregistry/web:2.0.0`}>
+โค้ดนี้พยายามจะสื่อ "zero-downtime ไม่ใช้ capacity เกิน" แต่จริง ๆ มันอธิบาย rollout ที่ไม่มีวันขยับได้เลย ด้วย `maxUnavailable: 0` ไม่มี Pod เดิมตัวไหนดับได้ก่อนตัวแทนจะพร้อม ด้วย `maxSurge: 0` ก็สร้าง Pod แทนเกินจำนวนที่ต้องการไม่ได้เลยด้วย ไม่เหลือทางไหนให้สร้าง Pod ใหม่หรือเคลียร์ที่ให้เลย นี่ไม่ใช่ rollout ที่ช้า มันคือ rollout ที่ *ถูก reject* พิสูจน์แล้วข้างบนบน API server 1.37 จริง:
+
+```text
+The Deployment "web" is invalid: spec.strategy.rollingUpdate.maxUnavailable: Invalid value: 0: may not be 0 when `maxSurge` is 0
+```
+
+ทางแก้คือเลือกปุ่มใดปุ่มหนึ่งให้เป็น "พื้นที่ให้ขยับ" `maxSurge: 1` (สร้าง Pod เกินทีละตัว zero-downtime จริง) หรือ `maxUnavailable: 1` (ยอมให้ Pod หายไปชั่วคราวทีละตัว ไม่ใช้ capacity เกิน) ห้ามเป็น `0` ทั้งคู่เด็ดขาด
+</SpotTheBug>
+
+## Mental Model
+
+Deployment ไม่ใช่ "สิ่งที่รัน Pod ของคุณ" มันคือ **ตัวสร้าง ReplicaSet** ทีละตัวต่อ Pod template ที่แตกต่างกันทุกแบบที่มันเคยได้รับมา และ rollout ทั้งหมดก็คือเรื่องราวของการย้ายจำนวน replica ระหว่างสองตัวนี้เป๊ะ ๆ (เก่า, ใหม่) ภายใต้ข้อจำกัดของ `maxUnavailable`/`maxSurge` feature อื่น ๆ ที่เหลือล้วนเป็นข้อจำกัดของการย้ายนี้ (`minReadySeconds` ทำให้ Pod ใหม่นับช้าลง `progressDeadlineSeconds` จำกัดว่าการย้ายจะค้างได้นานแค่ไหน) หรือเป็นข้อเท็จจริงเกี่ยวกับ bookkeeping ของมัน (`selector` คือคำถามที่ immutable ว่า "Pod ไหนเป็นของฉัน" `pod-template-hash` คือคำตอบที่ immutable ว่า "Pod นี้มาจาก generation ไหน" annotation change-cause คือร่องรอยที่มนุษย์อ่านได้ผ่าน `rollout history`)
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ได้อะไร | เสียอะไร |
+|---|---|---|
+| `maxSurge: 1, maxUnavailable: 0` | zero-downtime จริง capacity ไม่มีวันลดลงเลย | ใช้ทรัพยากรมากกว่าจำนวน replica ปกติชั่วคราว |
+| `maxUnavailable: 1, maxSurge: 0` | ไม่มีวันใช้ทรัพยากรเกินจำนวน replica ปกติเลย | capacity ลดลงหนึ่ง replica ชั่วคราวระหว่าง rollout |
+| `maxUnavailable: 0, maxSurge: 0` | ไม่มีเลย พิสูจน์แล้วข้างบนว่านี่คือ reject จริงทันที | apply ไม่ผ่านเลย |
+| `minReadySeconds > 0` | จับ Pod ที่ผ่าน readiness ทันทีแต่จริง ๆ ยังไม่ warm ขึ้นมาได้ (พิสูจน์ข้างบน) | rollout ทุกครั้งช้าลงตามจำนวนวินาทีนั้น ไม่ว่าจะจำเป็นหรือไม่ |
+| `progressDeadlineSeconds` (ใส่เอง ไม่ใช้ default 600 วินาที) | rollout ที่ค้างจะโผล่ `ProgressDeadlineExceeded` เร็วพอจะ page ได้ (พิสูจน์ข้างบน) | ตั้งค่าต่ำเกินไปอาจ flag rollout ที่แค่ช้าจริง ๆ (image ใหญ่ cache เย็น) ว่าพังไปด้วย |
+| annotation `kubernetes.io/change-cause` | `rollout history`/`rollout undo` กลายเป็นการดำเนินการที่มีข้อมูลและตรวจสอบได้ (พิสูจน์ข้างบน) | ต้องจำตั้งทุกครั้งที่เปลี่ยนแปลง ไม่มีอะไรบังคับ |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ตั้งทั้ง maxUnavailable และ maxSurge เป็น 0 คือ rollout ที่ปลอดภัยที่สุด"** พิสูจน์แล้วข้างบน มันไม่ถูก apply เลย API server reject ด้วย error จริง
+- **"minReadySeconds ดีเลย์ตอนที่ rollout เริ่ม"** พิสูจน์แล้วข้างบน มันดีเลย์ตอนที่ Pod ที่ Ready อยู่แล้วจะนับเป็น *available* ซึ่งเป็นตัวที่ gate ขั้นตอนถัดไปของ rollout Pod นั้น serve traffic จริงอยู่ตลอดช่วงนี้ แค่ยังไม่ถูกเชื่อว่าเป็นสัญญาณ progress ของ rollout เท่านั้น
+- **"selector ของ Deployment แก้ได้เหมือน field อื่น ตราบใดที่ selector ใหม่ยัง match Pod เดิม"** พิสูจน์แล้วข้างบน `spec.selector` เป็น immutable ที่ระดับ API ไม่ว่าค่าใหม่จะ match Pod เดิมหรือ Pod ต่างกันก็ตาม
+- **"kubectl rollout undo apply manifest ของ revision 1 กลับมาแล้วก็ไม่มีอะไรให้ undo ย้อนไปได้อีก"** พิสูจน์แล้วข้างบน undo สร้าง revision ใหม่เอี่ยม (3) ที่มี template ของ revision 1 history ยังโตต่อไปเรื่อย ๆ มันไม่ใช่ stack ที่ว่างเปล่าลง
+
 <Callout title="สรุปหนึ่งบรรทัด">
-**ReplicaSet** ทำให้จำนวน Pod ที่ตรงกับ selector คงที่ **Deployment** จัดการ ReplicaSet ให้คุณตาม chain **Deployment → ReplicaSet → Pod** และเพิ่ม rolling update แบบ declarative (ปรับด้วย `maxUnavailable`/`maxSurge` หรือ strategy `Recreate` ที่ยอมรับ downtime) พร้อม revision history ที่ดูได้ด้วย `kubectl rollout history` และ undo ได้ด้วย `kubectl rollout undo`
+**ReplicaSet** ทำให้จำนวน Pod ที่ตรงกับ selector คงที่ **Deployment** จัดการ ReplicaSet ให้คุณตาม chain **Deployment → ReplicaSet → Pod** (แต่ละ generation ติด **`pod-template-hash`** immutable ของตัวเอง) และเพิ่ม rolling update แบบ declarative ปรับด้วย `maxUnavailable`/`maxSurge` ทั้งคู่เป็น `0` พร้อมกันคือ API server reject จริงที่พิสูจน์แล้ว ไม่ใช่ค่าที่ปลอดภัยเป็นพิเศษ บวก `minReadySeconds` (Ready ≠ available พิสูจน์แล้วข้างบน) และ `progressDeadlineSeconds` (rollout ที่ค้างโผล่เป็น `Progressing=False, reason=ProgressDeadlineExceeded` พิสูจน์แล้วข้างบน) `spec.selector` เป็น immutable ตั้งแต่ตั้งครั้งแรก ดู history ด้วย `kubectl rollout history` (มาจาก annotation `kubernetes.io/change-cause` ไม่ใช่ flag `--record`) และ undo ด้วย `kubectl rollout undo` ซึ่งเพิ่ม revision ใหม่แทนที่จะลบอะไรทิ้ง
 </Callout>
 
 export const quizDeployments = [
@@ -130,6 +382,7 @@ export const quizDeployments = [
       'ReplicaSet เป็นคนจัดการ Deployment ไม่ใช่ทางกลับกัน',
     ],
     answer: 1,
+    explain: 'คุณแก้ Deployment (image, replicas, strategy) มันจะ create ReplicaSet ใหม่เมื่อ Pod template เปลี่ยน แล้วย้าย replica จาก ReplicaSet เก่าไปตัวใหม่ให้เอง',
   },
   {
     q: 'ระหว่าง RollingUpdate maxUnavailable กับ maxSurge แต่ละตัวคุมอะไร',
@@ -140,6 +393,7 @@ export const quizDeployments = [
       'maxSurge ลบ Pod เก่าทันทีโดยไม่สนใจว่า ready หรือยัง',
     ],
     answer: 0,
+    explain: 'maxUnavailable จำกัดว่า rollout จะลดต่ำกว่าจำนวน replica ที่ต้องการได้แค่ไหน maxSurge จำกัดว่าจะขึ้นเกินจำนวนที่ต้องการได้ชั่วคราวแค่ไหนตอนสร้างตัวแทน',
   },
   {
     q: 'จะ rollback Deployment กลับไป revision ก่อนหน้าที่ยังทำงานได้ปกติยังไง',
@@ -150,6 +404,7 @@ export const quizDeployments = [
       'แก้ selector ของ ReplicaSet',
     ],
     answer: 1,
+    explain: 'kubectl rollout undo rollback Deployment กลับไป revision ก่อนหน้า (หรือระบุ revision ด้วย --to-revision) พิสูจน์แล้วข้างบนว่ามันเพิ่ม revision ใหม่แทนที่จะลบ history ทิ้ง',
   },
   {
     q: 'ทำไมถึงเลือกใช้ strategy Recreate แทน RollingUpdate',
@@ -160,6 +415,29 @@ export const quizDeployments = [
       'ทุก Deployment ต้องใช้ strategy นี้โดย default',
     ],
     answer: 1,
+    explain: 'Recreate terminate Pod เก่าทุกตัวก่อนจะ create ตัวใหม่ ทำให้เกิด outage สั้น ๆ คุ้มค่าก็ต่อเมื่อสอง version รันคู่กันจริง ๆ ไม่ได้ (เช่น schema เปลี่ยนแบบเข้ากันไม่ได้)',
+  },
+  {
+    q: '```yaml\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxUnavailable: 0\n      maxSurge: 0\n```\nเกิดอะไรขึ้นเมื่อ apply สิ่งนี้บน cluster 1.37 จริง',
+    options: [
+      'rollout ทีละ Pod แบบช้า ๆ แต่สำเร็จ',
+      'API server reject ทันทีด้วย validation error สอง field นี้เป็น 0 พร้อมกันไม่ได้',
+      'มันเงียบ ๆ fallback ไปเป็น maxSurge: 1 แทน',
+      'ถูกยอมรับ แต่ rollout ค้างตลอดไปโดยไม่มี error',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วข้างบนด้วย error จริง: "spec.strategy.rollingUpdate.maxUnavailable: Invalid value: 0: may not be 0 when `maxSurge` is 0" ถูก reject ตอน apply เลย ไม่ใช่ไปเจอทีหลังว่า rollout ค้าง',
+  },
+  {
+    q: '```text\nThe Deployment "web" is invalid: spec.selector: Invalid value: {"matchLabels":{"app":"web","tier":"frontend"}}: field is immutable\n```\nการเปลี่ยนแปลงจริงแบบไหนบน Deployment ที่มีอยู่แล้วที่ทำให้เกิด error นี้เป๊ะ ๆ',
+    options: [
+      'เปลี่ยน container image',
+      'เปลี่ยน spec.selector.matchLabels บน Deployment ที่มีอยู่แล้ว',
+      'scale replica จาก 3 เป็น 5',
+      'เพิ่ม environment variable ใหม่',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วข้างบน: spec.selector ถูกตั้งครั้งเดียวตอน create แล้วไม่มีวันเปลี่ยนได้อีกเลย แม้แต่จะเพิ่ม label ทางเดียวคือลบแล้ว create Deployment ใหม่',
   },
 ];
 

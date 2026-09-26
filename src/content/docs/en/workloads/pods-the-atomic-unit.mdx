@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
@@ -86,12 +87,190 @@ kubectl get pod app-with-sidecar --watch
 kubectl describe pod app-with-sidecar
 ```
 
+## Pod termination lifecycle: SIGTERM, grace period, and preStop
+
+`kubectl delete pod` does not kill a Pod's containers directly. It sets `metadata.deletionTimestamp` and then, **in parallel**, two things start:
+
+1. The endpoint controller starts removing the Pod from every Service's `Endpoints`/`EndpointSlice` it backs.
+2. The kubelet runs the container's `preStop` hook (if one is defined), then sends **SIGTERM** to PID 1 of each container, then waits — and if the container still hasn't exited once the **whole** `terminationGracePeriodSeconds` budget (which the `preStop` hook's own running time counts against) has elapsed, the kubelet sends **SIGKILL**.
+
+```text
+$ kubectl explain pod.spec.terminationGracePeriodSeconds
+KIND:       Pod
+VERSION:    v1
+
+FIELD: terminationGracePeriodSeconds <integer>
+
+DESCRIPTION:
+    Optional duration in seconds the pod needs to terminate gracefully. May be
+    decreased in delete request. Value must be non-negative integer. The value
+    zero indicates stop immediately via the kill signal (no opportunity to shut
+    down). If this value is nil, the default grace period will be used instead.
+    The grace period is the duration in seconds after the processes running in
+    the pod are sent a termination signal and the time when the processes are
+    forcibly halted with a kill signal. Set this value longer than the expected
+    cleanup time for your process. Defaults to 30 seconds.
+```
+
+<Mermaid title="Pod termination: endpoint removal and preStop race in parallel, SIGTERM only fires after preStop returns" code={terminationDiagram} />
+
+export const terminationDiagram = `sequenceDiagram
+  participant K as kubectl delete
+  participant EP as Endpoint controller
+  participant Kubelet
+  participant C as Container "main"
+  K->>Kubelet: pod.deletionTimestamp set
+  par endpoint removal
+    EP->>EP: remove Pod from EndpointSlice
+  and preStop hook
+    Kubelet->>C: run preStop hook
+  end
+  Kubelet->>C: SIGTERM (sent only after preStop returns)
+  Note over C: remaining grace = terminationGracePeriodSeconds minus preStop's own duration
+  Kubelet->>C: SIGKILL (if still running once remaining grace runs out)`;
+
+### Proof: the race between endpoint removal and preStop, real timestamps
+
+A `Pod` (`terminationGracePeriodSeconds: 15`) traps `SIGTERM` and, on receipt, sleeps 15s before exiting; its `preStop` hook sleeps 5s. It sits behind a headless-free `ClusterIP` Service. Deleting it while polling the backing `EndpointSlice` every 300ms and streaming the container's own timestamped log gives this real timeline (container log in UTC, endpoint poll in local time UTC+7 — only the deltas matter):
+
+```text
+# container log (kubectl logs -f term-demo --timestamps)
+2026-09-26T07:50:24.632391178Z main started
+2026-09-26T07:50:32.496035750Z preStop start
+2026-09-26T07:50:37.500057586Z preStop end
+2026-09-26T07:50:37.649504711Z SIGTERM received, sleeping 15s before exit
+# (never logged: "main exiting now" -- SIGKILL cut it off, see below)
+```
+
+```text
+# endpoint poll (kubectl get endpointslice -l kubernetes.io/service-name=term-demo, every 300ms)
+14:50:31.946884000 ready=true  addrs=[10.244.2.2]
+14:50:32.428941000 DELETE ISSUED
+14:50:32.424496000 ready=true  addrs=[10.244.2.2]   # still true -- preStop hasn't even started yet
+14:50:32.902948000 ready=false addrs=[10.244.2.2]   # <-- endpoint marked not-ready ~0.47s after delete
+...(unchanged ready=false for the next ~15s)...
+14:50:47.575059000 ready=false addrs=[]             # <-- endpoint entry fully removed
+14:50:47.925334000 DELETE RETURNED
+```
+
+```text
+# kubectl get events --field-selector involvedObject.name=term-demo
+LAST SEEN   REASON    MESSAGE
+0s          Killing   Stopping container main
+```
+
+Reading the two logs side by side: the `Endpoints`/`EndpointSlice` entry goes **not-ready within half a second of `kubectl delete`** — well before the 5-second `preStop` hook even finishes (`07:50:37.500`), let alone before `SIGTERM` is sent (`07:50:37.649`). This is *the* race the spec warns about: **readiness removal is not sequenced after preStop, it happens concurrently with it.** A client that keeps sending traffic based on a cached endpoint list (a client-side load balancer, an in-cluster proxy that didn't yet notice the update) can still hit the Pod for the whole `preStop` window — which is exactly the problem `preStop: sleep N` is for: it buys the time a real Service/kube-proxy/Ingress dataplane update needs to fully propagate before the container actually stops accepting new connections, **not** a guarantee that no traffic arrives during it.
+
+The full picture: `preStop` ran for its 5s, `SIGTERM` landed at `07:50:37.649`, and the container's trap handler asked for 15 more seconds to exit gracefully — but the Pod was fully gone by `14:50:47.925`, only **~15.1s after the delete was issued**, not the ~20s the container asked for (5s preStop + 15s graceful exit). The container's `"main exiting now"` line **never appears in the log** — it was `SIGKILL`ed mid-sleep. That is `terminationGracePeriodSeconds: 15` doing exactly what it says: the budget is consumed from the moment `kubectl delete` is issued, `preStop`'s own 5s comes **out of** that same 15s, leaving only ~10s after `SIGTERM` for the container to actually exit.
+
+### `terminationGracePeriodSeconds: 0` is dangerous
+
+Setting it to `0` does not give the container a fast, clean shutdown — it skips almost the entire sequence above. Same Pod, `terminationGracePeriodSeconds: 0`:
+
+```text
+$ kubectl apply --dry-run=server -f term-demo-zero.yaml
+pod/term-demo-zero created (server dry run)     # the API server accepts it -- no validation rejects grace period 0
+```
+
+```text
+# container log
+2026-09-26T07:51:15.005753381Z main started
+2026-09-26T07:51:16.088548048Z preStop ran       # preStop *started* and logged its first line...
+# ...and nothing else. No "SIGTERM received" line was ever logged.
+```
+
+```text
+$ time kubectl delete pod term-demo-zero
+pod "term-demo-zero" deleted
+# real  0m0.055s
+```
+
+```text
+# kubectl get events --field-selector involvedObject.name=term-demo-zero
+LAST SEEN   REASON              MESSAGE
+3s          Killing             Stopping container main
+0s          FailedPreStopHook   PreStopHook failed
+```
+
+The delete call returned in **55 milliseconds**. The `preStop` hook was started, logged its first line, and was then killed mid-execution before its own `sleep 5` finished — the real, exact kubelet event is `FailedPreStopHook: PreStopHook failed`. The container's own `SIGTERM` trap handler never ran at all: there was no grace period left in which to deliver it and wait, so the kubelet went straight to `SIGKILL`. `terminationGracePeriodSeconds: 0` is for a Pod you are certain holds no state and needs no cleanup at all (some debug/test workloads) — it is never the right fix for "my rollout/delete is too slow," because it also throws away in-flight request draining, log flushing, and the endpoint-removal grace window discussed above.
+
+### Native sidecars stop last, proven
+
+Extending the `wait-for-db` / `log-shipper` example from earlier: on Pod deletion, kubelet stops ordinary containers (`main`) **first**, sends `SIGTERM` to the native sidecar (`initContainers` entry with `restartPolicy: Always`) only **after** every main container has exited, and only then starts counting down toward `SIGKILL`-ing the sidecar too. Proof, `terminationGracePeriodSeconds: 10`, `main` sleeps 2s after `SIGTERM` before exiting, sidecar just traps and exits immediately:
+
+```text
+# container "main"
+2026-09-26T07:51:35.310165627Z [main] started
+2026-09-26T07:51:37.315952878Z [main] SIGTERM received, sleeping 2s
+2026-09-26T07:51:39.320772795Z [main] exiting
+
+# container "log-shipper" (native sidecar, initContainers + restartPolicy: Always)
+2026-09-26T07:51:35.245861918Z [sidecar] started
+2026-09-26T07:51:40.267421296Z [sidecar] SIGTERM received, exiting
+```
+
+```text
+$ kubectl get events --field-selector involvedObject.name=term-demo-sidecar
+LAST SEEN   REASON    MESSAGE
+Killing     Stopping container log-shipper
+Killing     Stopping container main
+```
+
+`main` receives `SIGTERM` at `07:51:37.315` and finishes exiting at `07:51:39.320`; `log-shipper` does not receive its own `SIGTERM` until `07:51:40.267` — **after** `main` was already fully gone. This is the mechanism behind the "log shipper drains the final lines" guarantee from earlier: the sidecar is deliberately the last thing standing.
+
 ## Why bare Pods are not how you run things
 
 A Pod is ephemeral by design and it is rarely something you create directly. If you `kubectl apply` a bare Pod and its node fails, or the container inside it crashes past what `restartPolicy` will fix, **nothing recreates that Pod** — it is simply gone. In practice you almost always create a Deployment, StatefulSet, or DaemonSet instead: those controllers own a Pod template, watch the actual state of the cluster, and recreate Pods whenever reality drifts from the desired count. The rest of this module is those controllers.
 
+## Reading AI-generated code
+
+When reviewing a generated Pod spec (or one embedded in a Deployment/StatefulSet/DaemonSet template), check for:
+
+- Does it set `terminationGracePeriodSeconds: 0` "to make deletes faster" — proven above, this skips the `preStop` hook mid-execution (`FailedPreStopHook`) and never delivers `SIGTERM` at all, it does not make shutdown safer or cleaner.
+- Does a container behind a Service have **no `preStop`** at all — proven above, the Service's `EndpointSlice` entry goes not-ready within ~0.5s of `kubectl delete`, but without a `preStop` sleep there's nothing bridging the gap while that removal propagates through kube-proxy/Ingress/mesh dataplanes.
+- Is `terminationGracePeriodSeconds` set lower than the time the app's own shutdown code needs (flushing buffers, draining connections, closing DB pools) — the container gets `SIGKILL`ed mid-shutdown, proven above with the main container's own 15s exit sleep getting cut off at ~10s.
+- Is a `restartPolicy: Always` "sidecar" written as a plain entry under `containers:` instead of `initContainers:` with `restartPolicy: Always` — that's just an ordinary container with no startup/shutdown ordering guarantee relative to the main container at all, not a native sidecar.
+- Does the Pod assume `restartPolicy: Always` restarts a container that exited `0` — it does; `Always` restarts on *any* exit, success or failure, which is correct for long-running services but is a common source of confusion when someone expects "only restart on crash."
+
+<SpotTheBug code={`# k8s/pods-the-atomic-unit/fast-shutdown.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: web
+spec:
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: web
+      image: myregistry/web:1.4.0
+      ports:
+        - containerPort: 8080`}>
+This looks like a harmless "make deploys/deletes snappier" tweak, but it is the exact danger proven above: with `terminationGracePeriodSeconds: 0`, the kubelet does not wait for a `preStop` hook to finish (a real one on this same cluster was cut off mid-run, logging the event `FailedPreStopHook: PreStopHook failed`) and never delivers `SIGTERM` at all — it goes straight to `SIGKILL`, measured above at **55 milliseconds** from `kubectl delete` to the Pod being gone. For a Pod serving live traffic behind a Service, that means in-flight requests are killed outright and the app gets zero chance to close connections gracefully, on top of the endpoint-removal race already covered above. The fix is to remove the field entirely (falls back to the 30s default) or set an explicit, honest value (`terminationGracePeriodSeconds: 15`) sized to the app's real shutdown time, and add a `preStop` sleep if the app sits behind a Service.
+</SpotTheBug>
+
+## Mental Model
+
+A Pod's shutdown is not "kill the process," it is a **negotiated handoff with a deadline**: the cluster starts removing the Pod from service discovery and running your cleanup code at the same moment, and it will forcibly end the process once the clock you set (`terminationGracePeriodSeconds`) runs out — no matter how far your own cleanup got. `preStop` and your app's own `SIGTERM` handler are not two independent phases with their own budgets; they share **one** budget, counted from the instant `kubectl delete` runs. A native sidecar's ordering guarantee — starts first, stops last — exists specifically so that a support container (log shipper, proxy) never gets pulled out from under the thing it's supporting.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| Longer `terminationGracePeriodSeconds` | App gets real time to drain connections/flush data (proven above: cut short at the default budget, the app's own 15s exit sleep never completed) | Slower `kubectl delete`/rollouts; a genuinely hung container takes longer to be forcibly removed |
+| `preStop: sleep N` | Bridges the real gap between "Pod marked for deletion" and "every dataplane component stopped routing to it" (proven above: endpoints go not-ready in ~0.5s, well before a 5s preStop even finishes) | Adds N seconds to every single Pod termination, whether or not there was in-flight traffic to drain |
+| `terminationGracePeriodSeconds: 0` | Fractions of a second to fully remove a Pod (proven above: 55ms) | No `preStop` completion, no `SIGTERM` delivery, no graceful shutdown at all — proven above with a real `FailedPreStopHook` event |
+| Native sidecar (`initContainers` + `restartPolicy: Always`) | Guaranteed last-to-stop ordering (proven above) for log shippers/proxies that must outlive the main container | One more container's resource footprint and one more thing to keep healthy for the Pod's whole life |
+
+## Common Misconceptions
+
+- **"`preStop` and the app's `SIGTERM` handler each get the full `terminationGracePeriodSeconds`."** Proven above: they share one budget. A 5s `preStop` against a 15s grace period leaves only ~10s for the app's own graceful shutdown after `SIGTERM`.
+- **"The Pod stops receiving traffic only once the container actually exits."** Proven above: the `EndpointSlice` entry went not-ready ~0.5s after `kubectl delete`, many seconds before the container received `SIGTERM` at all — readiness removal races ahead of the container lifecycle, it doesn't wait for it.
+- **"`terminationGracePeriodSeconds: 0` just skips the wait, the shutdown steps still run, just fast."** Proven above with a real `FailedPreStopHook` event: the `preStop` hook is killed mid-execution and `SIGTERM` is never delivered at all — it is not a fast graceful shutdown, it is no graceful shutdown.
+- **"A native sidecar and the main container stop at the same time since they're in the same Pod."** Proven above with real per-container timestamps: the sidecar's `SIGTERM` arrived a full second *after* the main container had already exited.
+
 <Callout title="The one-line takeaway">
-A **Pod** is one or more containers sharing a network namespace (one IP, reachable over **localhost**) and optionally volumes; **init containers** run to completion in order before main containers start, and a plain `initContainers` entry with `restartPolicy: Always` becomes a **native sidecar** (GA since v1.33) that keeps running for the Pod's whole life with kubelet-managed startup/shutdown ordering; a Pod's phase (`Pending`/`Running`/`Succeeded`/`Failed`/`Unknown`) and its `restartPolicy` (`Always`/`OnFailure`/`Never`) govern its lifecycle, but a **bare Pod that dies is not recreated** — that job belongs to the controllers covered next.
+A **Pod** is one or more containers sharing a network namespace (one IP, reachable over **localhost**) and optionally volumes; **init containers** run to completion in order before main containers start, and a plain `initContainers` entry with `restartPolicy: Always` becomes a **native sidecar** (GA since v1.33) that keeps running for the Pod's whole life with kubelet-managed startup/shutdown ordering — proven above, it also stops *last*, after every main container has exited. On deletion, endpoint removal and the `preStop` hook run **in parallel** (proven above: endpoints go not-ready in ~0.5s, well before a 5s `preStop` finishes), `SIGTERM` fires only once `preStop` returns, and the **whole** `terminationGracePeriodSeconds` budget — `preStop`'s own time included — is what stands between that and `SIGKILL`; setting it to `0` (proven above) skips graceful shutdown almost entirely, it does not make it faster. A Pod's phase (`Pending`/`Running`/`Succeeded`/`Failed`/`Unknown`) and its `restartPolicy` (`Always`/`OnFailure`/`Never`) govern the rest of its lifecycle, but a **bare Pod that dies is not recreated** — that job belongs to the controllers covered next.
 </Callout>
 
 export const quizPods = [
@@ -104,6 +283,7 @@ export const quizPods = [
       'The same container image',
     ],
     answer: 1,
+    explain: 'Every container in a Pod gets the same IP/network namespace (localhost between them) and can optionally share mounted volumes -- that shared boundary is the whole reason a Pod exists as a concept.',
   },
   {
     q: 'What is the defining behavior of an init container?',
@@ -114,6 +294,7 @@ export const quizPods = [
       'It only runs on the node host network, never inside the Pod',
     ],
     answer: 1,
+    explain: 'initContainers run to completion, strictly in order, before any main container starts -- unless one also sets restartPolicy: Always, which makes it a native sidecar instead (proven above: it starts first and stops last).',
   },
   {
     q: 'A bare Pod (created directly, no controller) has its only container crash repeatedly and its node later fails entirely. What happens to the Pod?',
@@ -124,6 +305,7 @@ export const quizPods = [
       'The scheduler retries creating it forever',
     ],
     answer: 1,
+    explain: 'A bare Pod has no controller watching it, so once it is gone (node failure, or a crash restartPolicy cannot fix) nothing recreates it -- Deployments/StatefulSets/DaemonSets exist specifically to own that job.',
   },
   {
     q: 'Which values can a Pod\'s restartPolicy take?',
@@ -134,6 +316,29 @@ export const quizPods = [
       'A restart count only, no named policy',
     ],
     answer: 0,
+    explain: 'restartPolicy is Always (default, long-running services), OnFailure (restart only on non-zero exit, used by Jobs), or Never.',
+  },
+  {
+    q: '```yaml\napiVersion: v1\nkind: Pod\nmetadata:\n  name: web\nspec:\n  terminationGracePeriodSeconds: 0\n  containers:\n    - name: web\n      image: myregistry/web:1.4.0\n```\nBased on the real cluster proof in this lesson, what happens when this Pod is deleted?',
+    options: [
+      'A fast but still graceful shutdown: preStop runs, then SIGTERM, then a quick SIGKILL',
+      'The kubelet skips waiting for preStop to finish and never delivers SIGTERM at all -- it goes straight to SIGKILL in milliseconds',
+      'Kubernetes rejects the Pod at admission because 0 is not a valid grace period',
+      'Deletion is delayed to the cluster default of 30 seconds regardless of this field',
+    ],
+    answer: 1,
+    explain: 'Proven above: with terminationGracePeriodSeconds: 0, a real preStop hook was killed mid-execution (event FailedPreStopHook: PreStopHook failed) and the container never received SIGTERM at all -- kubectl delete returned in 55ms. The API server accepts the value 0 without rejecting it.',
+  },
+  {
+    q: '```text\n# container "main"\n...SIGTERM received, sleeping 2s\n...exiting\n\n# container "log-shipper" (native sidecar)\n...started\n...SIGTERM received, exiting  <-- logged AFTER "main" already exited\n```\nWhat does this real timestamped log prove about native sidecar shutdown ordering?',
+    options: [
+      'Both containers receive SIGTERM at exactly the same instant since they share a Pod',
+      'The sidecar is stopped first, to free resources before the main container shuts down',
+      'The main container is sent SIGTERM and allowed to fully exit before the native sidecar receives its own SIGTERM',
+      'Sidecars never receive SIGTERM at all, only SIGKILL',
+    ],
+    answer: 2,
+    explain: 'Proven above with real per-container timestamps: main received SIGTERM and fully exited before log-shipper (the native sidecar, an initContainers entry with restartPolicy: Always) received its own SIGTERM -- kubelet guarantees sidecars stop last.',
   },
 ];
 
