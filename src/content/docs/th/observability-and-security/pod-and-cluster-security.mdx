@@ -1,6 +1,6 @@
 ---
 title: 'Pod และ Cluster Security'
-description: 'SecurityContext ทำให้ container แข็งแรงขึ้นยังไง Pod Security Admission มาแทนที่ PodSecurityPolicy ยังไง และ security posture จริงต้องมีอะไรอีกบ้าง'
+description: 'SecurityContext ทำให้ container แข็งแรงขึ้นยังไง Pod Security Admission กับ ValidatingAdmissionPolicy บังคับ guardrail ยังไง และ security posture จริงต้องมีอะไรอีกบ้าง'
 sidebar:
   order: 4
 ---
@@ -9,10 +9,11 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
-การทำให้ Pod แข็งแรงขึ้นคือการวางหลายชั้นควบคุมที่เป็นอิสระต่อกัน คือ `securityContext` ต่อ container, ระดับ Pod Security Admission ต่อ namespace, และการป้องกันระดับ cluster อย่าง etcd encryption ซึ่งไม่มีชั้นไหนทดแทนอีกชั้นได้
+การทำให้ Pod แข็งแรงขึ้นคือการวางหลายชั้นควบคุมที่เป็นอิสระต่อกัน คือ `securityContext` ต่อ container, ระดับ Pod Security Admission ต่อ namespace, guardrail แบบ `ValidatingAdmissionPolicy`/`MutatingAdmissionPolicy` ที่เขียนด้วย CEL ระดับ cluster, และการป้องกันระดับ cluster อย่าง etcd encryption ซึ่งไม่มีชั้นไหนทดแทนอีกชั้นได้
 
 ## SecurityContext: ทำให้ container แข็งแรงจากข้างใน
 
@@ -28,6 +29,8 @@ spec:
     runAsNonRoot: true
     runAsUser: 10001
     runAsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
   containers:
     - name: checkout
       image: checkout:2.3.0
@@ -46,11 +49,9 @@ spec:
 - **`allowPrivilegeEscalation: false`** กันไม่ให้ process ได้สิทธิ์มากกว่า parent ของตัวเอง เช่นผ่าน setuid binary
 - **`privileged: false`** ไม่ให้ container เข้าถึง device และ kernel capability ของ host แบบเต็มรูปแบบเด็ดขาด container ที่เป็น privileged นั้นเทียบเท่ากับ root บนโหนดโดยตรง ดังนั้นควรใช้เป็นทางเลือกสุดท้าย ไม่ใช่ default
 - **`capabilities`** Linux แบ่งสิทธิ์ของ root ออกเป็น capability ย่อย ๆ การ drop `ALL` แล้วเพิ่มกลับเฉพาะที่จำเป็นจริง ๆ (เช่น `NET_BIND_SERVICE` สำหรับ bind port ต่ำกว่า 1024) ปลอดภัยกว่าการรันด้วย user ที่มี capability set แบบ default เต็มชุดมาก
+- **`seccompProfile.type: RuntimeDefault`** เปิด seccomp filter ที่ container runtime ให้มาเป็น default แทนที่จะรันแบบไม่มีการกรองใด ๆ เลย
 
-```bash
-kubectl get pod checkout -o jsonpath='{.spec.securityContext}'
-kubectl get pod checkout -o jsonpath='{.spec.containers[0].securityContext}'
-```
+field พวกนี้ไม่ใช่การเดาสุ่ม — Pod Security Standard ระดับ `restricted` (ด้านล่าง) ระบุ field ที่ต้องการมาชัดเจน และ API server ก็บอกตรง ๆ ว่าขาด field ไหนไปบ้าง
 
 ## Pod Security Admission: บังคับ baseline ระดับ namespace
 
@@ -58,20 +59,16 @@ kubectl get pod checkout -o jsonpath='{.spec.containers[0].securityContext}'
 
 Pod Security Admission ทำงานผ่าน namespace label ล้วน ๆ ไม่ต้องสร้างหรือ bind policy object แยกเลย
 
-```bash
-kubectl label --overwrite ns checkout \
-  pod-security.kubernetes.io/enforce=restricted \
-  pod-security.kubernetes.io/warn=restricted \
-  pod-security.kubernetes.io/audit=restricted
-```
-
 ```yaml
+# k8s/pod-and-cluster-security/psa-namespace.yaml
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: checkout
+  name: psa-demo
   labels:
     pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
 ```
 
 มี Pod Security Standards ระดับมาตรฐานสามระดับ เรียงจากหลวมสุดไปเข้มสุด
@@ -80,26 +77,425 @@ metadata:
 - **`baseline`** บล็อกช่องทาง privilege-escalation ที่รู้จักกันชัดเจนที่สุด (host namespace, privileged container, volume type อันตรายบางแบบ) โดยยังเข้ากันได้กับ workload ทั่วไปส่วนใหญ่
 - **`restricted`** เข้มงวดมาก ต้องมี `runAsNonRoot`, drop capabilities, และห้าม privilege escalation ตามแนวทาง best practice ของการทำ Pod hardening ในปัจจุบันอย่างใกล้ชิด
 
-แต่ละระดับมีสามโหมดที่เป็นอิสระต่อกัน คือ `enforce` ที่บล็อก Pod ที่ไม่ผ่านเงื่อนไขจริง ๆ ไม่ให้ถูก admit ส่วน `audit` กับ `warn` เป็นแบบไม่บล็อก คือแค่ log การละเมิดหรือโชว์ warning ฝั่ง client โดยไม่หยุด Pod รูปแบบการ rollout ที่นิยมกันคือ `enforce` ระดับที่ cluster ผ่านอยู่แล้ว พร้อม `warn`/`audit` ที่ระดับเข้มกว่า เพื่อดูว่าอะไรจะพังก่อนที่จะขยับ `enforce` ให้เข้มขึ้นจริง
+แต่ละระดับมีสามโหมดที่เป็นอิสระต่อกัน คือ `enforce` ที่บล็อก Pod ที่ไม่ผ่านเงื่อนไขจริง ๆ ไม่ให้ถูก admit ส่วน `warn` โชว์ warning ฝั่ง client ตอน `kubectl apply` ส่วน `audit` บันทึกการละเมิดลง audit log ของ API server และทั้งสองอย่างไม่หยุด Pod รูปแบบการ rollout ที่นิยมกันคือ `enforce` ระดับที่ cluster ผ่านอยู่แล้ว พร้อม `warn`/`audit` ที่ระดับเข้มกว่า เพื่อดูว่าอะไรจะพังก่อนที่จะขยับ `enforce` ให้เข้มขึ้นจริง
+
+### พิสูจน์: reject จริงภายใต้ `enforce=restricted`
+
+```yaml
+# k8s/pod-and-cluster-security/privileged-pod.yaml — @expect-error rejected by restricted PSA
+apiVersion: v1
+kind: Pod
+metadata:
+  name: privileged-pod
+  namespace: psa-demo
+spec:
+  containers:
+    - name: c
+      image: nginx:alpine
+      securityContext:
+        privileged: true
+```
+
+```text
+$ kubectl apply -f privileged-pod.yaml
+Error from server (Forbidden): error when creating "privileged-pod.yaml": pods "privileged-pod" is forbidden: violates PodSecurity "restricted:latest": privileged (container "c" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (container "c" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (container "c" must set securityContext.capabilities.drop=["ALL"]), runAsNonRoot != true (pod or container "c" must set securityContext.runAsNonRoot=true), seccompProfile (pod or container "c" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+```
+
+นี่คือ API server เองเลย ไม่ใช่ linter ที่บอก field ทั้งห้าที่ `restricted` ต้องการแบบชัดเจน — field เดียวกับที่พูดถึงในหัวข้อ SecurityContext ด้านบน ถ้า namespace ตั้งแค่ `warn`/`audit` (ไม่ตั้ง `enforce`) เป็น `restricted` Pod แบบเดียวกันนี้จะถูก admit แต่ `kubectl` จะพิมพ์ข้อความเดียวกันเป็น warning แบบไม่บล็อกก่อน
+
+```text
+$ kubectl apply -f baseline-ok-pod.yaml   # namespace enforce=baseline, warn=restricted
+Warning: would violate PodSecurity "restricted:latest": allowPrivilegeEscalation != false (container "c" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (container "c" must set securityContext.capabilities.drop=["ALL"]), runAsNonRoot != true (pod or container "c" must set securityContext.runAsNonRoot=true), seccompProfile (pod or container "c" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+pod/baseline-ok created
+```
+
+Pod ยังถูก `created` อยู่ดี — `warn` ไม่บล็อกเลย มีหน้าที่แค่บอกว่าอะไรจะพังถ้าเข้มขึ้น ซึ่งเป็นวิธีที่ดีในการรู้ก่อนว่าต้องแก้อะไรก่อนจะขยับ `enforce` ให้เข้มขึ้นจริง
+
+### พิสูจน์: container ที่ผ่าน `restricted` จริง ๆ
+
+ตั้ง field ทุกตัวที่ error ด้านบนเรียกร้อง บน cluster เดียวกัน ใน namespace ที่ `enforce=restricted` เดียวกัน
+
+```yaml
+# k8s/pod-and-cluster-security/hardened-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hardened
+  namespace: psa-demo
+spec:
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: c
+      image: registry.k8s.io/pause:3.10
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests: { cpu: "50m", memory: "32Mi" }
+        limits: { cpu: "50m", memory: "32Mi" }
+```
+
+```text
+$ kubectl apply -f hardened-pod.yaml
+pod/hardened created
+$ kubectl get pod hardened -n psa-demo
+NAME       READY   STATUS    RESTARTS   AGE
+hardened   1/1     Running   0          8s
+```
+
+ไม่มี warning เลยแม้แต่ตัวเดียว — field ทุกตัวที่ `restricted` ต้องการมีครบ ถูก admit สะอาด ๆ
+
+## `ValidatingAdmissionPolicy`: guardrail ด้วย CEL ที่ API server
+
+Pod Security Admission ครอบคลุมกฎ hardening ที่ built-in ไว้ตายตัวชุดหนึ่ง **`ValidatingAdmissionPolicy`** (GA มาตั้งแต่ Kubernetes **v1.30**) ให้คุณเขียนกฎ admission ของตัวเองด้วย [CEL](https://kubernetes.io/docs/reference/using-api/cel/) ประเมินผลใน process ของ API server เอง ไม่ต้องมี webhook ไม่มี network hop เพิ่ม
+
+`ValidatingAdmissionPolicy` ประกาศว่าจะ validate อะไรและยังไง ส่วน `ValidatingAdmissionPolicyBinding` แยกต่างหากตัดสินว่าจะ apply ที่ไหนและถ้าละเมิดจะถูก enforce (`Deny`) หรือแค่บันทึก (`Audit`/`Warn`) นี่คือ registry allowlist จริง พิสูจน์กับ API server 1.37 ที่รันอยู่จริง
+
+```yaml
+# k8s/pod-and-cluster-security/vap-registry.yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: registry-allowlist
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    - expression: "object.spec.containers.all(c, c.image.startsWith('registry.example.com/'))"
+      message: "container images must come from registry.example.com"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: registry-allowlist-binding
+spec:
+  policyName: registry-allowlist
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: sec-demo
+```
+
+```text
+$ kubectl apply -f bad-image-pod.yaml   # image: nginx:alpine
+The pods "bad-image" is invalid: : ValidatingAdmissionPolicy 'registry-allowlist' with binding 'registry-allowlist-binding' denied request: container images must come from registry.example.com
+```
+
+ข้อความ error จริงจาก API server ไม่ใช่ mock — `object` ใน CEL expression คือ Pod ที่ส่งเข้ามา และ `c.image.startsWith(...)` รันกับทุก container ใน `spec.containers`
+
+### policy ที่สอง และทำไมลำดับถึงสำคัญตอน policy สองตัว deny พร้อมกัน
+
+namespace หนึ่งมี policy ผูกได้กี่ตัวก็ได้ request จะถูก reject ทันทีที่ policy ตัวใดตัวหนึ่งที่ bind ไว้ deny เพิ่ม policy ตัวที่สองที่บังคับให้ทุก container ต้องมี resource limits
+
+```yaml
+# k8s/pod-and-cluster-security/vap-require-limits.yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: require-resource-limits
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: "exclude-kube-system"
+      expression: "object.metadata.namespace != 'kube-system'"
+  validations:
+    - expression: "object.spec.containers.all(c, has(c.resources.limits) && has(c.resources.limits.cpu) && has(c.resources.limits.memory))"
+      message: "every container must set resources.limits.cpu and resources.limits.memory"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: require-resource-limits-binding
+spec:
+  policyName: require-resource-limits
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: sec-demo
+```
+
+`matchConditions` เป็นตัวกรองระดับ CEL อีกชั้นหนึ่ง ซ้อนอยู่บน `matchConstraints` — ที่นี่มันข้าม `kube-system` ไปเลย แม้ `matchConstraints` จะ match resource type ของ request นั้นไปแล้วก็ตาม Pod ที่ไม่มี limits ตอน apply จริง
+
+```text
+$ kubectl apply -f no-limits-pod.yaml
+The pods "no-limits" is invalid: : ValidatingAdmissionPolicy 'require-resource-limits' with binding 'require-resource-limits-binding' denied request: every container must set resources.limits.cpu and resources.limits.memory
+```
+
+และ Pod ที่ผ่านทั้งสอง policy (registry ที่ถูกต้อง limits ครบ) ก็ถูก admit สะอาด ๆ ด้วย `--dry-run=server`
+
+```text
+$ kubectl apply -f good-image-pod.yaml --dry-run=server
+pod/good-image created (server dry run)
+```
+
+CEL type-checker ของ API server เองก็รันตอนสร้าง policy และแสดง static-analysis warning จริง ให้เห็นบน policy object เลย
+
+```text
+$ kubectl get validatingadmissionpolicy require-resource-limits -o yaml
+status:
+  observedGeneration: 1
+  typeChecking:
+    expressionWarnings:
+    - fieldRef: spec.validations[0].expression
+      warning: |
+        /v1, Kind=Pod: ERROR: <input>:1:34: undefined field 'limits'
+         | object.spec.containers.all(c, has(c.resources.limits) && has(c.resources.limits.cpu) && has(c.resources.limits.memory))
+         | .................................^
+```
+
+expression ยังทำงานถูกต้องตอน runtime (`ResourceRequirements.limits` มีอยู่จริงในทุก container) แต่ type-checker เตือนไว้เพราะ schema แบบ static ของ CEL สำหรับ *union* ของทุก resource type ที่ expression อาจเจอตอนมอง `object` ไม่ได้การันตี field นั้นเสมอไป — ควรรู้ไว้ จะได้ไม่เข้าใจผิดว่า warning ของ type-checker คือ runtime failure
+
+### `paramKind` กับ `paramRef`: parameterize policy โดยไม่ต้องเขียนใหม่
+
+policy สามารถอ่านค่า threshold จาก object ของ Kubernetes จริง (`paramKind`) แทนที่จะ hardcode ไว้ใน CEL expression โดยผูกต่อ binding ผ่าน `paramRef`
+
+```yaml
+# k8s/pod-and-cluster-security/vap-param-demo.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: registry-allowlist-param
+  namespace: sec-demo
+data:
+  allowedRegistry: "registry.example.com/"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: registry-allowlist-parameterized
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: "exclude-kube-system"
+      expression: "object.metadata.namespace != 'kube-system'"
+  validations:
+    - expression: "object.spec.containers.all(c, c.image.startsWith(params.data.allowedRegistry))"
+      message: "container image does not start with the registry named in the bound ConfigMap param"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: registry-allowlist-parameterized-binding
+spec:
+  policyName: registry-allowlist-parameterized
+  validationActions: ["Deny"]
+  paramRef:
+    name: registry-allowlist-param
+    namespace: sec-demo
+    parameterNotFoundAction: Deny
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: sec-demo
+```
+
+พิสูจน์ว่า ConfigMap ที่เป็น live ต่างหากที่ขับเคลื่อนการตัดสินใจ ไม่ใช่ตัว policy — แก้แค่ ConfigMap เท่านั้น ไม่แตะ `ValidatingAdmissionPolicy`/`Binding` เลย
+
+```text
+$ kubectl apply -f wrong-registry-with-limits.yaml   # image: docker.io/library/nginx:alpine, has limits
+The pods "wrong-registry-with-limits" is invalid: : ValidatingAdmissionPolicy 'registry-allowlist-parameterized' with binding 'registry-allowlist-parameterized-binding' denied request: container image does not start with the registry named in the bound ConfigMap param
+
+$ kubectl patch configmap registry-allowlist-param -n sec-demo --type merge -p '{"data":{"allowedRegistry":"docker.io/library/"}}'
+configmap/registry-allowlist-param patched
+
+$ kubectl apply -f wrong-registry-with-limits.yaml --dry-run=server
+The pods "wrong-registry-with-limits" is invalid: : ValidatingAdmissionPolicy 'registry-allowlist' with binding 'registry-allowlist-binding' denied request: container images must come from registry.example.com
+```
+
+หลัง patch แล้ว policy ที่ parameterize หยุดค้านแล้ว (image ตอนนี้ตรงกับ `allowedRegistry` ของ ConfigMap) — request ยังถูก deny อยู่แค่เพราะ policy ตัวที่ hardcode ไว้ก่อนหน้า (`registry-allowlist`) ยัง bind กับ namespace เดียวกัน และไม่ได้เปลี่ยนอะไรเลย นี่คือหลักฐานจริงว่า `paramRef` อ่านค่า parameter object สดใหม่ทุก request โดยไม่ต้อง redeploy policy เลย
+
+## `MutatingAdmissionPolicy`: stable ตั้งแต่ Kubernetes 1.36
+
+`MutatingAdmissionPolicy` เป็นคู่ mutating ของอันบน — model เดียวกันคือ CEL ใน API server แต่มัน patch object แทนที่จะแค่ accept หรือ reject ตาม [เอกสาร Kubernetes](https://kubernetes.io/docs/reference/access-authn-authz/mutating-admission-policy/) มัน **stable ตั้งแต่ Kubernetes v1.36** (เริ่มเป็น alpha ตั้งแต่ v1.30) **เปิดใช้งานเป็น default** ไม่ต้องมี feature gate เลย — ดังนั้นบน cluster 1.37 ของคอร์สนี้มันคือ GA เต็มตัว ไม่ใช่ของทดลอง
+
+```yaml
+# k8s/pod-and-cluster-security/map-demo.yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: add-default-label
+spec:
+  failurePolicy: Fail
+  reinvocationPolicy: Never
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  mutations:
+    - patchType: "ApplyConfiguration"
+      applyConfiguration:
+        expression: >
+          Object{
+            metadata: Object.metadata{
+              labels: {"managed-by": "platform-team"}
+            }
+          }
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: add-default-label-binding
+spec:
+  policyName: add-default-label
+```
+
+`reinvocationPolicy` เป็น field ที่ **required** — API server reject object ทันทีถ้าไม่มี
+
+```text
+$ kubectl apply -f map-demo.yaml --dry-run=server   # (before adding reinvocationPolicy)
+The MutatingAdmissionPolicy "add-default-label" is invalid: spec.reinvocationPolicy: Required value
+```
+
+พอใส่แล้ว apply จริง (ไม่ dry-run) แล้วสร้าง Pod ที่ไม่มี label `managed-by` ของตัวเองเลย
+
+```text
+$ kubectl apply -f map-demo.yaml
+mutatingadmissionpolicy.admissionregistration.k8s.io/add-default-label created
+$ kubectl apply -f map-target-pod.yaml
+pod/map-target created
+$ kubectl get pod map-target -n sec-demo -o jsonpath='{.metadata.labels}'
+{"managed-by":"platform-team"}
+```
+
+label นี้ไม่เคยอยู่ใน manifest เลย — policy injection มันตอน admission เหมือน mutating webhook เป๊ะ แต่ไม่ต้องเขียนหรือ deploy webhook server เลย
+
+## Kyverno กับ Gatekeeper: policy engine นอกเหนือจากที่ built-in มา
+
+`ValidatingAdmissionPolicy`/`MutatingAdmissionPolicy` ครอบคลุมได้เยอะมากโดยไม่ต้องมี component เพิ่ม แต่ก็มี policy engine ที่โตเต็มที่แล้วและใช้กันแพร่หลายสองตัว สำหรับกรณีที่ต้องการมากกว่า CEL-ใน-API-server (อ้างอิงเอกสาร ไม่ได้ติดตั้งในบทนี้)
+
+- **[Kyverno](https://kyverno.io/docs/introduction/)** — policy engine แบบ cloud-native ที่ config ด้วย YAML สไตล์ Kubernetes (รองรับ CEL ด้วย) นอกเหนือจาก validation มันเพิ่ม **mutation**, **generation** ของ resource อัตโนมัติ (เช่นสร้าง `NetworkPolicy` default คู่กับทุก namespace ใหม่), **background scanning** ของ resource ที่มีอยู่แล้วใน cluster, และ **image verification** สำหรับความปลอดภัยของ supply chain — ทั้งหมดนี้อยู่นอกเหนือจากสิ่งที่ `ValidatingAdmissionPolicy` เพียวๆ ทำได้
+- **[OPA Gatekeeper](https://open-policy-agent.github.io/gatekeeper/website/docs/)** — validating และ mutating webhook ที่ CNCF graduated แล้ว สร้างบน Open Policy Agent แบบ general-purpose ใช้ `ConstraintTemplate` แบบ CRD ที่เขียนด้วยภาษา policy **Rego** เอกสารของ Gatekeeper เองระบุว่า integrate กับ `ValidatingAdmissionPolicy` ได้โดยตรง ทำให้ cluster หนึ่งผสมทั้งสองแบบได้
+
+ทั้งสองตัวรันเป็น admission webhook (network hop เพิ่มที่ policy built-in ไม่ต้องมี) แลกกับประสบการณ์เขียน policy ที่รวยกว่าและ library ของ policy จากชุมชนที่มีอยู่แล้ว
+
+## `automountServiceAccountToken: false` พิสูจน์แล้ว
+
+โดย default ทุก Pod จะได้ token ของ ServiceAccount ถูก project เข้า volume ที่ mount ที่ `/var/run/secrets/kubernetes.io/serviceaccount` อัตโนมัติ — เป็น attack surface ที่ workload ที่ไม่เคยเรียก Kubernetes API เลยไม่ต้องการ การตั้ง `automountServiceAccountToken: false` บน Pod (หรือบน ServiceAccount เอง) เอา volume นั้นออกไปทั้งหมด ไม่ใช่แค่ทำให้เนื้อหาว่างเปล่า
+
+```text
+$ kubectl get pod hardened -n psa-demo -o jsonpath='{.spec.volumes}'
+                                                                   # (empty — no volumes at all)
+$ kubectl get pod hardened -n psa-demo -o jsonpath='{.spec.containers[0].volumeMounts}'
+                                                                   # (empty)
+
+$ kubectl get pod default-mount -n psa-demo -o jsonpath='{.spec.volumes}'
+[{"name":"kube-api-access-47t24","projected":{"defaultMode":420,"sources":[{"serviceAccountToken":{"expirationSeconds":3607,"path":"token"}},{"configMap":{"items":[{"key":"ca.crt","path":"ca.crt"}],"name":"kube-root-ca.crt"}},{"downwardAPI":{"items":[{"fieldRef":{"apiVersion":"v1","fieldPath":"metadata.namespace"},"path":"namespace"}]}}]}}]
+$ kubectl get pod default-mount -n psa-demo -o jsonpath='{.spec.containers[0].volumeMounts}'
+[{"mountPath":"/var/run/secrets/kubernetes.io/serviceaccount","name":"kube-api-access-47t24","readOnly":true}]
+```
+
+`hardened` (ที่ตั้ง override) ไม่มี volume `kube-api-access-*` เลยใน spec; `default-mount` (ไม่ตั้ง override, namespace เดียวกัน) ได้ volume นั้นอัตโนมัติ พร้อม token แบบ **bound และอายุสั้น** (`expirationSeconds: 3607` — ประมาณหนึ่งชั่วโมง และถูก re-issue ใหม่เรื่อย ๆ เมื่อใกล้หมดอายุ) แทนที่จะเป็น credential แบบอายุยืน นี่เป็นกลไก projected-token เดียวกับที่พูดถึงลึกกว่านี้ในบท RBAC and Service Accounts
+
+## `hostNetwork` กับ `hostPID`: อันตรายของ host namespace
+
+field สองตัวระดับ Pod ทำให้ container ก้าวออกจากการแยกตัว (isolation) ของตัวเองบางส่วนหรือทั้งหมด และทั้งคู่ถูกบล็อกโดย Pod Security Standard ระดับ `baseline` (และเลยถูกบล็อกใน `restricted` ด้วย)
+
+- **`hostNetwork: true`** — Pod ใช้ network namespace ของ node ร่วมกันโดยตรง ไม่มี Pod IP ไม่มีการแยก network จากทุก process อื่นบน node นั้น และ port ใดที่ container bind ก็ถูก bind บน node เองเลย มองเห็นได้ทั่ว cluster บน IP ของ node นั้น
+- **`hostPID: true`** — Pod ใช้ PID namespace ของ node ร่วมกัน container มองเห็น (และด้วย Linux capability ที่พอ อาจ signal หรือ `ptrace`) ทุก process ที่รันบน node รวมถึง container ของ Pod อื่นและ kubelet เองด้วย
+
+ทั้งสองมี use case ที่ถูกต้องตามกฎหมายสำหรับ infrastructure ระดับ cluster (CNI plugin, monitoring agent ระดับ node) แต่เป็นเส้นทาง escalation ที่ร้ายแรงสำหรับอย่างอื่น — container ที่ถูก compromise พร้อม `hostPID: true` อาจแอบดูหรือแทรกแซง workload ที่ไม่เกี่ยวข้องบน node เดียวกันได้ ซึ่งนี่คือ blast radius ที่เพิ่มขึ้นแบบเดียวกับที่ `baseline` มีไว้เพื่อบล็อกโดย default
 
 ## นอกเหนือจาก Pod: การควบคุมระดับ cluster และ network
 
-ทั้ง SecurityContext และ Pod Security Admission ทำงานที่ระดับ Pod แต่ security posture ที่แท้จริงต้องมีการควบคุมระดับ cluster ด้วย
+SecurityContext, Pod Security Admission, และ admission policy ทั้งหมดทำงานที่หรือใกล้ระดับ Pod แต่ security posture ที่แท้จริงต้องมีการควบคุมระดับ cluster ด้วย
 
 Secret ถูก encode ด้วย base64 เท่านั้นโดย default ที่เป็นแค่ encoding ไม่ใช่ encryption ใครก็ตามที่มีสิทธิ์อ่าน Secret ผ่าน API (หรือเข้าถึงไฟล์ข้อมูลของ etcd โดยตรง) สามารถ decode ออกมาได้ง่ายมาก การควบคุมระดับ cluster ที่ปกป้อง Secret data at rest ได้จริงคือ **etcd encryption at rest** ซึ่ง API server จะ apply ให้อัตโนมัติ ทำให้ข้อมูลของ Secret ถูก encrypt ก่อนที่จะถูกเขียนลง storage ของ etcd
 
-**NetworkPolicy** (พูดถึงในโมดูล Networking) ก็เป็นส่วนสำคัญของ security posture ด้วยเช่นกัน RBAC กับ Pod Security Admission ควบคุมว่าตัวตนของ Pod ทำอะไรกับ API ได้บ้างและ Pod ถูก configure ยังไง แต่ทั้งสองอย่างไม่ได้จำกัดว่า Pod ไหนคุยกับ Pod ไหนได้ผ่าน network นั่นเป็นหน้าที่ของ NetworkPolicy และ security story ที่สมบูรณ์ต้องมีทั้งสามชั้นทำงานร่วมกัน
+**NetworkPolicy** (พูดถึงในโมดูล Networking) ก็เป็นส่วนสำคัญของ security posture ด้วยเช่นกัน RBAC, Pod Security Admission, และ admission policy ควบคุมว่าตัวตนของ Pod ทำอะไรกับ API ได้บ้างและ Pod ถูก configure ยังไง แต่ทั้งหมดนี้ไม่ได้จำกัดว่า Pod ไหนคุยกับ Pod ไหนได้ผ่าน network นั่นเป็นหน้าที่ของ NetworkPolicy และ security story ที่สมบูรณ์ต้องมีทุกชั้นทำงานร่วมกัน
 
-<Mermaid title="Pod ถูก admit หรือ reject โดย Pod Security Admission ตามระดับ enforce ของ namespace นั้น" code={podSecurityDiagram} />
+<Mermaid title="Pod ที่ถูกส่งผ่าน Pod Security Admission (namespace label) และ ValidatingAdmissionPolicy (กฎ CEL) ซึ่งฝ่ายใดฝ่ายหนึ่งก็ reject ได้" code={podSecurityDiagram} />
 
 export const podSecurityDiagram = `flowchart LR
-  submit["Pod submitted to namespace"] --> check{"Complies with\\nnamespace enforce level?"}
-  ns["Namespace label:\\npod-security.kubernetes.io/enforce"] --> check
-  check -- "yes" --> admitted["Pod admitted"]
-  check -- "no" --> rejected["Pod rejected"]`;
+  submit["Pod submitted to namespace"] --> psa{"Complies with\\nnamespace PSA enforce level?"}
+  ns["Namespace label:\\npod-security.kubernetes.io/enforce"] --> psa
+  psa -- "no" --> rejected["Pod rejected"]
+  psa -- "yes" --> vap{"Passes every bound\\nValidatingAdmissionPolicy?"}
+  vap -- "no" --> rejected
+  vap -- "yes" --> map["MutatingAdmissionPolicy\\ncan still patch the object"]
+  map --> admitted["Pod admitted"]`;
+
+## Mental Model
+
+การควบคุมแต่ละอย่างในบทนี้ตอบคำถามคนละข้อ คนละชั้น และไม่เห็นกันเลย `securityContext` ตอบว่า "container ตัวนี้รันยังไงจริง ๆ" (UID, capability, filesystem) Pod Security Admission ตอบว่า "รูปร่างของ Pod ตัวนี้ตรงกับมาตรฐาน built-in ที่ตายตัวของ namespace นี้ไหม" — มันไม่สามารถแสดงกฎ custom แบบ "image ต้องมาจาก registry ของเราเท่านั้น" ได้ `ValidatingAdmissionPolicy`/`MutatingAdmissionPolicy` มาเติมช่องว่างนั้นพอดี คือ CEL ที่เขียนเองได้ ประเมินใน API server สำหรับกฎที่ไม่มีใครคาดไว้ตอนออกแบบ Pod Security Admission สามระดับตายตัว Kyverno/Gatekeeper แลก network hop ของ webhook กับภาษา policy ที่รวยกว่า เวลา CEL อย่างเดียวไม่พอ ไม่มีอันไหนมองที่ network เลย นี่คือเหตุผลที่ NetworkPolicy เป็นชั้นแยกต่างหากทั้งหมด และไม่มีอันไหนมองสิ่งที่นั่งอยู่ใน etcd อยู่แล้ว นี่คือเหตุผลที่ encryption at rest แยกออกไปอีก
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ข้อดี | ต้นทุน |
+|---|---|---|
+| `securityContext` hardening (`runAsNonRoot`, drop capabilities, `seccompProfile`) | พิสูจน์แล้วด้านบน: ลดสิ่งที่ container ที่ถูก compromise ทำได้ ไม่ต้องมี component เพิ่ม | ต่อ Pod ลืมง่ายถ้ามี manifest เยอะ — ไม่มีอะไรบังคับทั่ว cluster ด้วยตัวมันเอง |
+| Pod Security Admission `enforce=restricted` | พิสูจน์แล้วด้านบน: baseline ทั่ว namespace แบบ built-in ไม่ต้องเขียน policy เลย | กฎตายตัว — แสดง "image ต้องมาจาก registry ของเรา" หรือกฎ business custom ไม่ได้ |
+| `ValidatingAdmissionPolicy`/`MutatingAdmissionPolicy` | พิสูจน์แล้วด้านบน: กฎ CEL ที่เขียนเองได้ ทำงานใน process (ไม่มี webhook latency) `paramKind` ทำให้ปรับ config สดได้โดยไม่ต้อง redeploy | CEL มี learning curve; แต่ละ policy ครอบคลุมแค่ที่ `matchConstraints` และ expression ระบุไว้ชัด ๆ |
+| Kyverno / Gatekeeper | เขียน policy ได้รวยกว่า (mutate/generate/background-scan สำหรับ Kyverno, Rego สำหรับ Gatekeeper) มี library policy จากชุมชนใหญ่ | component webhook เพิ่มที่ต้องรัน อัพเกรด และดูแล availability |
+| `automountServiceAccountToken: false` | พิสูจน์แล้วด้านบน: เอา volume token ออกไปทั้งหมดสำหรับ workload ที่ไม่เคยเรียก API | ต้องเปิดกลับมาชัด ๆ ทันทีที่ workload ต้องใช้ API จริง ๆ |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"Pod Security Admission บังคับกฎ custom แบบ 'image ต้องมาจาก registry ภายในของเรา' ได้"** พิสูจน์แล้วด้านบน: PSA มีแค่สามระดับตายตัว (`privileged`/`baseline`/`restricted`) registry allowlist ต้องใช้ `ValidatingAdmissionPolicy` (หรือ Kyverno/Gatekeeper) แทน
+- **"ตั้ง `limits` โดยไม่มี `requests` บน container ก็เพียงพอสำหรับกฎ admission ที่บอกให้ 'ตั้ง resources'"** พิสูจน์แล้วด้านบนด้วย CEL type-checker warning จริงและการ deny จริง: `require-resource-limits` เช็ค `resources.limits` ไม่ใช่ requests แต่ policy ที่อิง resources ต้องตัดสินใจชัด ๆ ว่าหมายถึงอันไหน — อย่าสมมติว่า "resources" หมายถึงทั้งสองอย่าง
+- **"`ValidatingAdmissionPolicy` ที่ตั้ง `paramKind` ยังรันกฎอยู่แม้ binding ไม่เคยตั้ง `paramRef`"** ไม่ได้ทดสอบแบบลวก ๆ — แต่พิสูจน์แล้วด้านบนด้วยการแก้สด: parameter จะถูกอ่านก็ต่อเมื่อ `paramRef` ของ binding ชี้ไปที่มันจริง ๆ และ CEL expression จะเห็น `params` ก็ต่อเมื่อ link นั้นมีอยู่; policy ที่เพิ่งสร้างกับ binding ที่ apply ในจังหวะเดียวกันก็อาจยังไม่สะท้อนผลทันที ซึ่งเป็นเหตุผลที่ demo ด้านบนหยุดพักสั้น ๆ ระหว่างสร้าง policy กับทดสอบ
+- **"โหมด `warn` กับ `audit` ของ PSA สุดท้ายก็บล็อก Pod เหมือนกัน แค่ช้ากว่า"** พิสูจน์แล้วด้านบน: `baseline-ok` ยังถูก `created` แม้จะพิมพ์รายการละเมิดของ `restricted` เต็ม ๆ — `warn`/`audit` ไม่บล็อกเลย ไม่ว่าการละเมิดที่ระบุจะรุนแรงแค่ไหน
+- **"`automountServiceAccountToken: false` แค่ทำให้ไฟล์ token ว่างเปล่า"** พิสูจน์แล้วด้านบน: volume `kube-api-access-*` ทั้งก้อนและ mount ของมันหายไปจาก `spec.volumes`/`spec.containers[].volumeMounts` เลย ไม่ใช่แค่ทำให้ว่างเปล่า
+
+## อ่านโค้ดที่ AI เขียน
+
+ตอน review Pod spec, namespace, หรือ admission policy ที่ AI สร้าง ให้เช็ค
+
+- `privileged: true` ที่ใช้ "แก้" permission error แทนที่จะหา capability หรือ UID เฉพาะที่ container ต้องการจริง ๆ — พิสูจน์แล้วด้านบน `restricted` ระบุ field ที่ต้องการชัดเจน วิธีแก้แทบไม่ใช่ `privileged: true` เลย
+- ไม่มี `securityContext` เลยบน Pod ที่จะไปอยู่ใน namespace ที่ enforce เป็น `restricted` — พิสูจน์แล้วด้านบน API server reject ทันทีและแสดง field ที่ขาดทุกตัว จึงพังทันทีไม่ใช่พังแบบเงียบ ๆ
+- `ValidatingAdmissionPolicy` ที่ตั้ง `paramKind` แต่ binding ของมันขาด `paramRef` — policy จะไม่อ่าน parameter object เลยในกรณีนั้น เป็นช่องว่าง copy-paste แบบคลาสสิกระหว่าง policy กับ binding ของมัน
+- `hostNetwork: true` หรือ `hostPID: true` ที่เพิ่มเข้ามาเพื่อ "ให้ debug ง่ายขึ้น" แล้วไม่เคยเอาออก — พิสูจน์แล้วด้านบน ทั้งสองขยาย blast radius อย่างมีนัยสำคัญและถูกบล็อกโดย `baseline` ดังนั้น workload ที่ต้องการมันจะรันใน namespace แบบ `baseline`/`restricted` ไม่ได้เลย
+- ServiceAccount ของ workload ที่ผูกกับ `cluster-admin` "เพื่อเลี่ยง RBAC error" แทนที่จะเป็น Role ที่ scope แคบ — พูดถึงลึกกว่านี้ในบท RBAC and Service Accounts แต่สัญชาตญาณเดียวกันที่เอื้อมไปหา `privileged: true` ที่นี่ ก็มักเอื้อมไปหา `cluster-admin` ที่นั่น
+
+<SpotTheBug code={`# k8s/pod-and-cluster-security/web-app.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-app
+  namespace: psa-demo
+spec:
+  containers:
+    - name: web
+      image: web-app:3.2.0
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]`}>
+Pod นี้ขาด `seccompProfile` — ภายใต้ namespace ที่ตั้ง `pod-security.kubernetes.io/enforce: restricted` คำตอบจริงจาก API server สำหรับรูปร่างแบบนี้เป๊ะ ๆ คือ `violates PodSecurity "restricted:latest": seccompProfile (pod or container "web" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")` พิสูจน์แล้วด้านบน ง่ายมากที่จะคิดว่า "ตั้ง `runAsNonRoot`, drop capabilities, บล็อก privilege escalation แล้ว ก็ครอบคลุม SecurityContext hardening แล้ว" — แต่ `restricted` เช็ค field ตายตัวห้าตัว และ `seccompProfile` เป็นหนึ่งในนั้น manifest ที่ AI สร้างซึ่ง copy สี่ตัวแรกมาแต่ลืมตัวที่ห้า ก็ถูก reject เหมือนกับตัวที่ไม่มี `securityContext` เลย
+</SpotTheBug>
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**`securityContext`** ต่อ container ทำให้ container รันได้แข็งแรงขึ้นจริง ๆ ผ่าน `runAsNonRoot`, ล็อก `runAsUser`/`runAsGroup`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, drop Linux `capabilities`, และไม่ใช้ `privileged: true` เว้นแต่จำเป็นจริง ๆ **Pod Security Admission** GA มาตั้งแต่ Kubernetes 1.25 บังคับ baseline ระดับ namespace ผ่าน label อย่าง `pod-security.kubernetes.io/enforce: restricted` ด้วยระดับ **privileged / baseline / restricted** (หลวมสุดไปเข้มสุด) พร้อม `audit`/`warn` แบบไม่บล็อกสำหรับ rollout แบบค่อยเป็นค่อยไป และ **มาแทนที่** PodSecurityPolicy ที่ถูกถอดออกไปใน 1.25 อย่างสมบูรณ์ Secret ถูก encode ด้วย base64 เท่านั้น ดังนั้น **etcd encryption at rest** คือการควบคุมระดับ cluster ที่ปกป้อง Secret ได้จริง และ **NetworkPolicy** เติมเต็มภาพด้วยการจำกัด traffic ระหว่าง Pod
+**`securityContext`** ต่อ container ทำให้ container รันได้แข็งแรงขึ้นจริง ๆ ผ่าน `runAsNonRoot`, ล็อก `runAsUser`/`runAsGroup`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, drop Linux `capabilities`, และ `seccompProfile: RuntimeDefault` — ทั้งห้า field นี้คือสิ่งที่ Pod Security Standard ระดับ **`restricted`** ระบุตรง ๆ ในข้อความ reject จริง (พิสูจน์แล้วด้านบน) **Pod Security Admission** GA มาตั้งแต่ 1.25 บังคับหนึ่งในสามระดับตายตัว (**privileged / baseline / restricted**) ที่ระดับ namespace label พร้อม `audit`/`warn` แบบไม่บล็อกสำหรับ rollout แบบค่อยเป็นค่อยไป และ **มาแทนที่** PodSecurityPolicy (ถูกถอดใน 1.25) อย่างสมบูรณ์ สำหรับกฎที่ PSA แสดงไม่ได้ **`ValidatingAdmissionPolicy`** (GA ตั้งแต่ **1.30**) กับ **`MutatingAdmissionPolicy`** (GA ตั้งแต่ **1.36**) รัน CEL ที่เขียนเองได้ตรงใน API server เลย — พิสูจน์แล้วด้านบนด้วย registry allowlist จริง, การเช็ค resource limits, และ `paramKind`/`paramRef` ที่เปลี่ยนพฤติกรรมได้โดยไม่ต้อง redeploy — ส่วน **Kyverno**/**Gatekeeper** แลก webhook hop กับภาษาเขียน policy ที่รวยกว่าและ capability เพิ่ม (mutate/generate/scan) **`automountServiceAccountToken: false`** เอา volume token ออกทั้งหมด (พิสูจน์แล้วด้านบน) และ **`hostNetwork`**/**`hostPID`** ขยาย blast radius ของ container ออกไปถึงตัว node เองอย่างมีนัยสำคัญ ไม่มีอันไหนแทนที่ **etcd encryption at rest** (Secret เป็นแค่ base64) หรือ **NetworkPolicy** (ไม่มีอันไหนจำกัด traffic ระหว่าง Pod) ได้เลย
 </Callout>
 
 export const quizPodSecurity = [
@@ -112,36 +508,73 @@ export const quizPodSecurity = [
       'ไม่มีอะไรมาแทนที่ PodSecurityPolicy ยังเป็นมาตรฐานปัจจุบันอยู่',
     ],
     answer: 1,
+    explain: 'PodSecurityPolicy ถูกถอดออกไปเลย (ไม่ใช่แค่ deprecated) ใน 1.25 ซึ่งเป็น release เดียวกับที่ Pod Security Admission GA มาเป็นตัวแทนที่ built-in',
   },
   {
-    q: 'Pod Security Standards สามระดับเรียงจากหลวมสุดไปเข้มสุดคืออะไร',
+    q: '```text\nError from server (Forbidden): ... violates PodSecurity "restricted:latest": privileged (container "c" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (...), unrestricted capabilities (...), runAsNonRoot != true (...), seccompProfile (...)\n```\nนี่คือ error จริงจาก namespace ที่ `enforce=restricted` ต้องตั้งอะไรให้ Pod แบบเดียวกันนี้ผ่านได้',
     options: [
-      'restricted, baseline, privileged',
-      'baseline, restricted, privileged',
-      'privileged, baseline, restricted',
-      'enforce, audit, warn',
+      'ไม่มีทาง — namespace แบบ restricted รัน workload ไม่ได้เลย',
+      'ตั้งแค่ securityContext.privileged: false',
+      'ตั้งทั้งห้า field ที่ระบุไว้: privileged: false, allowPrivilegeEscalation: false, capabilities.drop: ["ALL"], runAsNonRoot: true, และ seccompProfile.type: RuntimeDefault หรือ Localhost',
+      'เปลี่ยน label ของ namespace จาก enforce เป็น warn',
     ],
     answer: 2,
+    explain: 'พิสูจน์แล้วด้านบน: Pod ที่ตั้งครบทั้งห้า field เป๊ะ ๆ (ตัวอย่าง hardened) ถูก admit แบบไม่มี warning เลยใน namespace enforce=restricted เดียวกัน',
   },
   {
-    q: 'SecurityContext ระดับ container ควบคุมอะไรบ้างจริง ๆ',
+    q: 'namespace ตั้ง `pod-security.kubernetes.io/enforce: baseline` และ `pod-security.kubernetes.io/warn: restricted` Pod ตัวหนึ่งไม่ผ่านเช็คของ restricted แต่ผ่าน baseline จะเกิดอะไรขึ้น',
     options: [
-      'Pod ถูกสร้างใน namespace ไหน',
-      'Pod ถูก schedule ไปที่ Node ไหน',
-      'สิ่งต่าง ๆ อย่าง runAsNonRoot, readOnlyRootFilesystem, allowPrivilegeEscalation, และการ drop Linux capabilities',
-      'Service ไหน route traffic มาที่ Pod',
-    ],
-    answer: 2,
-  },
-  {
-    q: 'ทำไม Secret ที่ encode ด้วย base64 แล้วยังต้องมี etcd encryption at rest เพื่อความลับที่แท้จริง',
-    options: [
-      'การ encode แบบ base64 เป็น encryption ที่แข็งแรงอยู่แล้วในตัวเอง',
-      'base64 เป็นแค่ encoding ไม่ใช่ encryption ใครก็ตามที่มีสิทธิ์อ่าน Secret หรือเข้าถึงข้อมูลของ etcd สามารถ decode ออกมาได้ง่ายมากถ้าไม่มี etcd encryption at rest',
-      'ต้องมี etcd encryption at rest ก่อนถึงจะสร้าง Secret ได้เลย',
-      'ข้อมูลที่ encode ด้วย base64 เก็บใน etcd ไม่ได้ถ้าไม่มี encryption',
+      'Pod ถูก reject เพราะ warn เข้มกว่า enforce',
+      'Pod ถูกสร้าง และ kubectl พิมพ์การละเมิดของ restricted เป็น warning แบบไม่บล็อก',
+      'Pod ถูกสร้างแบบเงียบ ๆ ไม่มี output อะไรเลย',
+      'namespace ถูก reject เพราะ config ผิด',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: baseline-ok ถูก created แม้จะพิมพ์ warning ของ restricted เต็ม ๆ — warn/audit ไม่บล็อกเลยไม่ว่า enforce จะตั้งไว้ยังไง',
+  },
+  {
+    q: 'ValidatingAdmissionPolicy ให้คุณทำอะไรที่ Pod Security Admission ทำไม่ได้',
+    options: [
+      'ไม่มีเลย ทั้งสองบังคับกฎเดียวกันเป๊ะ',
+      'แสดงกฎ custom ใด ๆ ด้วย CEL เช่นบังคับให้ image ต้องมาจาก registry เฉพาะ — PSA มีแค่สามระดับ built-in ตายตัว',
+      'แทนที่ RBAC ได้ทั้งหมด',
+      'mutate Pod อัตโนมัติได้ (มีแค่ ValidatingAdmissionPolicy เท่านั้นที่ mutate ได้)',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบนด้วย CEL policy registry-allowlist จริงและข้อความ deny จริง — PSA ไม่มีทางแสดงกฎที่เจาะจงขนาดนั้นได้ ส่วน MutatingAdmissionPolicy ต่างหากที่ patch object ได้ ไม่ใช่ ValidatingAdmissionPolicy',
+  },
+  {
+    q: '```text\n$ kubectl patch configmap registry-allowlist-param -n sec-demo --type merge -p \'{"data":{"allowedRegistry":"docker.io/library/"}}\'\nconfigmap/registry-allowlist-param patched\n```\nหลัง patch ConfigMap แค่นี้ (ไม่แตะ policy หรือ binding เลย) จะเกิดอะไรขึ้นกับ ValidatingAdmissionPolicy ที่อ่าน ConfigMap นี้ผ่าน paramKind/paramRef',
+    options: [
+      'ไม่มีอะไรเปลี่ยนจนกว่าจะ apply policy object ใหม่',
+      'policy เริ่มประเมิน CEL expression กับข้อมูล ConfigMap ใหม่ทันทีตั้งแต่ request ถัดไป',
+      'ต้องลบและสร้าง binding ใหม่ถึงจะรับค่าที่เปลี่ยน',
+      'ConfigMap param ถูก cache ไว้ 24 ชั่วโมงโดย default',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: apply ครั้งถัดไปกับ Pod ถูกประเมินด้วยค่า registry ที่เพิ่ง patch สด ๆ โดยไม่แตะ ValidatingAdmissionPolicy หรือ Binding เลย — นี่คือประเด็นของ paramRef',
+  },
+  {
+    q: 'MutatingAdmissionPolicy stable (GA) มาตั้งแต่ version ไหน และบน cluster 1.37 ต้องเปิด feature gate ไหม',
+    options: [
+      'ยังเป็น alpha อยู่ ต้องใช้ --feature-gates=MutatingAdmissionPolicy=true',
+      'stable ตั้งแต่ v1.36 เปิดใช้เป็น default — บน 1.37 ไม่ต้องเปิด feature gate เลย',
+      'ยังไม่มีจนกว่าจะถึง 1.37',
+      'stable ตั้งแต่ v1.25 release เดียวกับ Pod Security Admission',
+    ],
+    answer: 1,
+    explain: 'ตามเอกสาร Kubernetes (kubernetes.io/docs/reference/access-authn-authz/mutating-admission-policy/) MutatingAdmissionPolicy stable ตั้งแต่ v1.36 และเปิดเป็น default ดังนั้น cluster 1.37 รันมันเป็น GA API ปกติไม่ต้องเปิด gate — พิสูจน์แล้วด้านบนด้วย label ที่ inject จริงบน Pod จริง',
+  },
+  {
+    q: 'ทำไม automountServiceAccountToken: false ถึงสำคัญสำหรับ container ที่ไม่เคยเรียก Kubernetes API เลย',
+    options: [
+      'ไม่มีผลอะไร token ยังถูก mount เสมอไม่ว่ายังไง',
+      'มันเอา volume และ mount kube-api-access-* ทั้งก้อนออกจาก Pod spec เลย ตัด credential ที่ไม่จำเป็นออกจากใน container',
+      'มันปิด ServiceAccount ไปเลย ทำให้ RBAC ทั้ง namespace พัง',
+      'มันมีผลแค่กับ Pod ใน namespace kube-system เท่านั้น',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์แล้วด้านบนด้วยการเทียบ spec.volumes ของสอง Pod: ตั้ง field นี้แล้ว spec.volumes ว่างเปล่า; ไม่ตั้ง จะมี volume kube-api-access-* แบบ projected พร้อม token อายุสั้นแบบ bound ถูก mount อัตโนมัติ',
   },
 ];
 

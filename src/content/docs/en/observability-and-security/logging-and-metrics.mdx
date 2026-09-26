@@ -1,6 +1,6 @@
 ---
 title: 'Logging and Metrics'
-description: 'What kubectl logs and metrics-server actually give you out of the box, and why real observability needs a dedicated logging stack plus Prometheus and Grafana.'
+description: 'What kubectl logs, kubectl debug, and metrics-server actually give you out of the box, and why real observability needs a dedicated logging stack plus Prometheus and Grafana.'
 sidebar:
   order: 2
 ---
@@ -9,10 +9,11 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
-Kubernetes gives you just enough logging and metrics out of the box to debug a single Pod right now, but nothing that aggregates or retains data across the cluster — that is a separate stack you have to add yourself.
+Kubernetes gives you just enough logging, live debugging, and metrics out of the box to investigate a single Pod right now, but nothing that aggregates or retains data across the cluster — that is a separate stack you have to add yourself.
 
 ## kubectl logs: a live window, not a history book
 
@@ -29,7 +30,54 @@ kubectl logs my-pod -c sidecar
 kubectl logs my-pod --previous
 ```
 
-`--previous` is the one people forget about and then need most: when a container crash-loops, the *current* container's logs start empty, but `--previous` shows you the logs from the instance that just crashed — usually exactly where the stack trace is.
+`--previous` is the one people forget about and then need most: when a container crash-loops, the *current* container's logs may already be past the interesting part, but `--previous` shows you the logs from the instance that just crashed. Proof, a container that prints one line and exits with a non-zero code:
+
+```yaml
+# k8s/logging-and-metrics/crasher.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: crasher
+  namespace: log-demo
+spec:
+  restartPolicy: Always
+  containers:
+    - name: c
+      image: busybox
+      command: ["sh", "-c", "echo 'boot message, crashing now'; sleep 2; exit 1"]
+```
+
+```text
+$ kubectl get pod crasher
+NAME      READY   STATUS   RESTARTS   AGE
+crasher   0/1     Error    1 (2s ago) 12s
+
+$ kubectl logs crasher --previous
+boot message, crashing now
+```
+
+The kubelet only keeps a limited number of terminated containers around before garbage-collecting their logs, so `--previous` has to be run reasonably soon after the crash — wait too long through several more restart cycles and even `--previous` reports `unable to retrieve container logs`, because the specific terminated container instance it would have read from is already gone.
+
+Selecting logs across many Pods at once, and trimming what you fetch:
+
+```text
+$ kubectl logs -l app=web -n log-demo --tail=2 --prefix
+[pod/web-57787d5f95-dwbnf/c] tick 2 from web-57787d5f95-dwbnf
+[pod/web-57787d5f95-dwbnf/c] tick 3 from web-57787d5f95-dwbnf
+[pod/web-57787d5f95-g6qrh/c] tick 2 from web-57787d5f95-g6qrh
+[pod/web-57787d5f95-g6qrh/c] tick 3 from web-57787d5f95-g6qrh
+[pod/web-57787d5f95-q9hkw/c] tick 1 from web-57787d5f95-q9hkw
+[pod/web-57787d5f95-q9hkw/c] tick 2 from web-57787d5f95-q9hkw
+
+$ kubectl logs -l app=web -n log-demo --since=5s --prefix
+[pod/web-57787d5f95-g6qrh/c] tick 2 from web-57787d5f95-g6qrh
+[pod/web-57787d5f95-g6qrh/c] tick 3 from web-57787d5f95-g6qrh
+[pod/web-57787d5f95-q9hkw/c] tick 2 from web-57787d5f95-q9hkw
+[pod/web-57787d5f95-dwbnf/c] tick 2 from web-57787d5f95-dwbnf
+[pod/web-57787d5f95-dwbnf/c] tick 3 from web-57787d5f95-dwbnf
+```
+
+`-l` (a label selector) plus `-f` streams every matching Pod at once, each line tagged with `--prefix` so you know which Pod it came from — the built-in equivalent of what a third-party tool like `stern` gives you with nicer coloring and cross-namespace selectors, for the common case of "tail everything matching this label right now."
 
 The important limitation: Kubernetes itself does **not** aggregate or persist these logs. If a Pod is deleted, its logs typically go with it. There is no built-in "search logs across every Pod in the cluster." That job belongs to a separate logging stack — commonly a node-level agent such as **Fluent Bit** (or Fluentd/Vector) that tails every container's log files and ships them to a backend like **Loki** or **Elasticsearch**, where they can be searched and retained long-term.
 
@@ -61,16 +109,87 @@ spec:
             path: /var/log
 ```
 
-## metrics-server: enough for kubectl top and autoscaling, nothing more
+## `kubectl exec` doesn't always work — ephemeral containers and `kubectl debug`
 
-**metrics-server** is a lightweight cluster add-on that collects CPU and memory usage from every kubelet and holds it **in memory only** — no history, no persistence, no alerting. It exists to power exactly two things:
+A minimal or **distroless** image (built `FROM scratch` or `gcr.io/distroless/static`, or a utility image like `registry.k8s.io/pause`) ships no shell and no coreutils at all — it is just the one static binary the container runs. `kubectl exec` needs *something* to run inside the container, so it fails with a real, specific error, not a Kubernetes-level permission problem:
 
-```bash
-kubectl top nodes
-kubectl top pods -n checkout
+```text
+$ kubectl exec distroless-app -n log-demo -- sh
+error: Internal error occurred: Internal error occurred: error executing command in container: failed to exec in container: failed to start exec "28673a297...": OCI runtime exec failed: exec failed: unable to start container process: exec: "sh": executable file not found in $PATH
 ```
 
-...and the **HorizontalPodAutoscaler**, which polls metrics-server to decide whether to scale a Deployment up or down:
+**Ephemeral containers** (GA/stable since Kubernetes **1.25**) solve this: `kubectl debug` attaches a brand-new, throwaway container to an *already-running* Pod, sharing the target's process namespace, without restarting or replacing anything already in the Pod spec:
+
+```text
+$ kubectl debug -it distroless-app -n log-demo --image=busybox --target=app -- ps aux
+Targeting container "app". If you don't see processes from this container it may be because the container runtime doesn't support this feature.
+Defaulting debug container name to debugger-988qv.
+PID   USER     TIME  COMMAND
+    1 65535     0:00 /pause
+   17 root      0:00 ps aux
+```
+
+`--target=app` is what makes this useful rather than just "a busybox Pod next to mine": the ephemeral container shares the **process namespace** of the named target container, so `ps aux` run *inside the debug container* sees PID 1 as `/pause` — the distroless target's own process — not just its own shell. Nothing about the original Pod spec changed; `kubectl get pod distroless-app -o yaml` still shows only the one original container plus a new `ephemeralContainers` entry.
+
+`kubectl debug` also reaches a whole **Node**, when the problem is with the node itself rather than one Pod on it — it schedules a privileged debug Pod that mounts the node's root filesystem at `/host`:
+
+```text
+$ kubectl debug node/observability-worker -it --image=busybox -- chroot /host cat /etc/os-release
+VERSION_ID="13"
+VERSION="13 (trixie)"
+ID=debian
+```
+
+## Events as a signal, not just a side note
+
+Every Warning event (`FailedScheduling`, `BackOff`, `Unhealthy`, and more) is queryable directly, filtered server-side:
+
+```text
+$ kubectl get events -n log-demo --field-selector type=Warning --sort-by=.lastTimestamp
+LAST SEEN   TYPE      REASON    OBJECT        MESSAGE
+37s         Warning   BackOff   pod/crasher   Back-off restarting failed container c in pod crasher_log-demo(607c53af-...)
+3s          Warning   BackOff   pod/crasher   Back-off restarting failed container c in pod crasher_log-demo(91d78655-...)
+
+$ kubectl get events -n log-demo --field-selector involvedObject.name=crasher
+LAST SEEN   TYPE     REASON      OBJECT        MESSAGE
+31s         Normal   Scheduled   pod/crasher   Successfully assigned log-demo/crasher to observability-worker
+29s         Normal   Pulled      pod/crasher   Successfully pulled image "busybox" in 1.59s ...
+5s          Normal   Started     pod/crasher   Container started
+3s          Warning  BackOff     pod/crasher   Back-off restarting failed container c in pod crasher_log-demo(...)
+```
+
+`--field-selector` narrows to exactly one object or one event type server-side (cheaper than piping through `grep`), and `kubectl get events --watch` streams new events live as the API server emits them — the same watch mechanism the rest of `kubectl`'s `-w`/`--watch` flags use. Events are also short-lived (the default retention is about an hour, `--event-ttl` on the API server), so they answer "what just happened" far better than "what happened yesterday" — another reason a real logging/metrics stack exists.
+
+## metrics-server: enough for kubectl top and autoscaling, nothing more
+
+**metrics-server** is a lightweight cluster add-on that collects CPU and memory usage from every kubelet and holds it **in memory only** — no history, no persistence, no alerting. It is not part of kind by default and needs one real patch to tolerate kind's self-signed kubelet certificates:
+
+```bash
+# scripts/install-metrics-server.sh
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+kubectl -n kube-system patch deployment metrics-server --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl -n kube-system rollout status deploy/metrics-server
+```
+
+It exists to power exactly two things, proven with real numbers from a live 1.37 kind cluster:
+
+```text
+$ kubectl top nodes
+NAME                          CPU(cores)   CPU(%)   MEMORY(bytes)   MEMORY(%)
+observability-control-plane   166m         1%       806Mi           9%
+observability-worker          41m          0%       222Mi           2%
+observability-worker2         43m          0%       244Mi           2%
+
+$ kubectl top pods -n log-demo
+NAME                   CPU(cores)   MEMORY(bytes)
+distroless-app         0m           0Mi
+web-57787d5f95-dwbnf   1m           0Mi
+web-57787d5f95-g6qrh   1m           0Mi
+web-57787d5f95-q9hkw   1m           0Mi
+```
+
+...and the **HorizontalPodAutoscaler**, which polls metrics-server to decide whether to scale a Deployment up or down (covered in depth in the Scheduling and Scaling module):
 
 ```yaml
 apiVersion: autoscaling/v2
@@ -124,9 +243,19 @@ curl http://checkout-pod:9090/metrics
 
 Prometheus stores this scraped data as a time series and evaluates alerting rules against it. **Grafana** then sits on top as the visualization layer, querying Prometheus to render dashboards — CPU/memory trends, request latency, error rates — and to drive alert notifications.
 
-<Mermaid title="Two parallel pipelines: logs to a log backend, metrics to kubectl top/HPA and to Prometheus/Grafana" code={observabilityDiagram} />
+## OpenTelemetry Collector: a vendor-neutral pipeline, not a Prometheus replacement
+
+The **[OpenTelemetry Collector](https://opentelemetry.io/docs/collector/)** is a vendor-agnostic pipeline that can receive, process, and export **logs, metrics, and traces** together, rather than requiring a separate agent per signal per vendor. In a Kubernetes cluster it typically runs as a DaemonSet (node-level collection, similar in shape to Fluent Bit above) or a sidecar, taking data in from applications and routing it to one or more backends — batching, retrying, and filtering along the way.
+
+Critically, the Collector **complements** Prometheus rather than replacing it: it can *receive* metrics in Prometheus's own scrape format and re-export them onward, letting a cluster standardize on one collection pipeline while still choosing (or changing) backends — Prometheus, a commercial APM vendor, or both — without re-instrumenting every application. This lesson covers it as an overview only; it is not installed here.
+
+<Mermaid title="Three parallel pipelines: live debugging tools, logs to a log backend, and metrics to kubectl top/HPA and to Prometheus/Grafana" code={observabilityDiagram} />
 
 export const observabilityDiagram = `flowchart LR
+  subgraph Debug
+    exec["kubectl exec"] -.->|"fails, no shell"| distroless["Distroless container"]
+    debug["kubectl debug --target"] --> distroless
+  end
   subgraph Logs
     stdout["Pod stdout/stderr"] --> agent["Node-level log agent\\n(Fluent Bit)"]
     agent --> backend["Log backend\\n(Loki / Elasticsearch)"]
@@ -138,8 +267,54 @@ export const observabilityDiagram = `flowchart LR
     prom --> grafana["Grafana dashboards"]
   end`;
 
+## Mental Model
+
+Everything in this lesson is Kubernetes giving you a *live window*, never a *history*. `kubectl logs`/`exec`/`debug`/`top`/`get events` all answer "what is true about this Pod or Node right now (or very recently)" — and every one of them loses its data the moment the Pod is deleted, the container is garbage-collected, or the event TTL expires. Real observability (Fluent Bit → Loki/Elasticsearch, Prometheus → Grafana, or an OpenTelemetry Collector pipeline feeding either) exists specifically to survive that — it copies the live signal out to somewhere with retention *before* Kubernetes discards it. Ephemeral containers fit the same story from a different angle: a distroless image intentionally has no live-window tooling built in at all, so `kubectl debug` brings its own temporary window rather than assuming one already exists inside the container.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| `kubectl logs`/`exec`/`debug`/`top` | Zero extra components, works the moment the cluster exists (proven above) | No retention, no history, no aggregation across Pods or time |
+| `kubectl debug --target` (ephemeral containers) | Debug a distroless/minimal container without rebuilding its image or restarting the Pod (proven above) | Requires the container runtime to support ephemeral containers/shared process namespaces; adds a visible extra container to the Pod while it runs |
+| Fluent Bit + Loki/Elasticsearch | Searchable, retained logs across every Pod and past deletions | Real infrastructure to run, size, and keep available |
+| metrics-server | Minimal footprint, exactly enough for `kubectl top`/HPA (proven above) | No history at all — cannot answer "what was it an hour ago" |
+| Prometheus + Grafana | Historical, queryable, alertable — the de facto standard | Another stateful service to operate (storage, retention, scrape config) |
+| OpenTelemetry Collector | One pipeline for logs+metrics+traces, vendor-neutral, can front Prometheus | Yet another moving part; does not remove the need for a backend (Prometheus, Loki, or a vendor) to actually store the data |
+
+## Common Misconceptions
+
+- **"`kubectl exec` should always work to get a shell in any container."** Proven above with a real, specific error: a distroless/minimal image has no shell binary at all, so `exec` fails with `executable file not found in $PATH` — the fix is `kubectl debug --target`, not assuming the container is broken.
+- **"Kubernetes stores logs somewhere durable by default."** Proven above: logs are read live from the node, and after enough restart cycles even `kubectl logs --previous` can no longer retrieve a terminated container's log — nothing is durable without a separate logging stack.
+- **"metrics-server is a lightweight Prometheus."** Proven above: it holds only the current snapshot, in memory, with zero history — it exists purely to answer `kubectl top` and feed the HPA, not to be queried or alerted on.
+- **"`kubectl debug --target` restarts or replaces the Pod's container."** Proven above: the original container (`/pause`, PID 1) kept running throughout; the ephemeral container is a separate, additional process visible in the same `ps aux` output, not a replacement.
+- **"OpenTelemetry Collector replaces Prometheus."** Per the OpenTelemetry docs, the Collector is a vendor-neutral pipeline that can *receive from and export to* Prometheus, among other backends — it is a routing/processing layer, not a storage backend that competes with Prometheus.
+
+## Reading AI-generated code
+
+When reviewing generated debugging instructions, log-viewing commands, or observability manifests, check for:
+
+- `kubectl exec -it <pod> -- /bin/sh` suggested as the first debugging step against a distroless or `FROM scratch` image — proven above, this fails immediately with a real "executable file not found" error; the correct tool is `kubectl debug --target`.
+- `kubectl logs <pod>` (no `--previous`) suggested to diagnose *why* a container just crashed — if the container already restarted, the current logs may start after the crash; `--previous` is what shows the dying instance's last output, proven above.
+- A troubleshooting doc that assumes logs are searchable across the whole cluster or across time out of the box — proven above, Kubernetes itself keeps no history at all; that capability only exists once a logging stack (Fluent Bit/Loki, etc.) is actually deployed.
+- `metrics-server` proposed as a substitute for "we need monitoring/alerting" — proven above, it has no history and cannot alert; that requires Prometheus (or an equivalent) plus Grafana or another alerting layer.
+- A `hostPath: /var/log` mount suggested as a quick way to "collect logs" from inside an application Pod itself, instead of a dedicated node-level DaemonSet agent — this couples the application to node-local paths and misses every other Pod's logs on that node; the standard pattern here is a DaemonSet like Fluent Bit, not per-application log collection code.
+
+<SpotTheBug code={`# k8s/logging-and-metrics/debug-attempt.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: distroless-app
+  namespace: log-demo
+spec:
+  containers:
+    - name: app
+      image: registry.k8s.io/pause:3.10`}>
+Nothing is wrong with this manifest itself — the bug is in how an AI assistant commonly suggests debugging it: `kubectl exec distroless-app -- sh`. Proven above, that fails immediately with `OCI runtime exec failed: ... exec: "sh": executable file not found in $PATH`, because `registry.k8s.io/pause` (like any distroless image) ships no shell. The correct move, also proven above, is `kubectl debug -it distroless-app --image=busybox --target=app -- ps aux`, which attaches a throwaway container sharing the target's process namespace instead of trying to run a shell that was never there.
+</SpotTheBug>
+
 <Callout title="The one-line takeaway">
-`kubectl logs` (with `-f`, `--previous`, and `-c`) gives you a live, per-Pod window into stdout/stderr, but Kubernetes does **not** aggregate or persist logs itself — that needs a node-level agent like **Fluent Bit** shipping to a backend such as **Loki** or **Elasticsearch**. **metrics-server** is a lightweight, in-memory-only collector that exists solely to power `kubectl top` and the **HorizontalPodAutoscaler** — it has no history and no alerting. Real observability comes from **Prometheus** scraping `/metrics` endpoints (plus **kube-state-metrics** for cluster object state) and **Grafana** for dashboards and alerting on top of that time-series data.
+`kubectl logs` (with `-f`, `--previous`, `-l`, `--since`, `--tail`), `kubectl top`, and `kubectl get events --field-selector`/`--watch` all give a **live, unpersisted window** into one Pod or the cluster's very recent history — none of it survives a Pod deletion, a container's log getting garbage-collected, or the events TTL. When `kubectl exec` fails on a distroless/minimal image (a real, specific "no shell" error, proven above), **ephemeral containers** (GA since **1.25**) via `kubectl debug --target=<container>` attach a throwaway container sharing the target's process namespace — proven above via `ps aux` showing the target's own PID 1 — and `kubectl debug node/<node>` does the same for a whole Node. **metrics-server** is a lightweight, in-memory-only collector that exists solely to power `kubectl top` and the **HorizontalPodAutoscaler** — no history, no alerting, proven with real cluster numbers above. Real observability comes from **Prometheus** scraping `/metrics` endpoints (plus **kube-state-metrics**) and **Grafana** for dashboards/alerting, or an **OpenTelemetry Collector** pipeline that complements (not replaces) Prometheus by unifying logs/metrics/traces collection.
 </Callout>
 
 export const quizLoggingMetrics = [
@@ -152,6 +327,18 @@ export const quizLoggingMetrics = [
       'Only for Pods in the kube-system namespace',
     ],
     answer: 1,
+    explain: 'Proven above: kubectl logs is a live read from the node; a real logging stack (Fluent Bit -> Loki/Elasticsearch) is required for retention and cross-cluster search.',
+  },
+  {
+    q: '```text\n$ kubectl exec distroless-app -- sh\nerror: ... OCI runtime exec failed: exec failed: unable to start container process: exec: "sh": executable file not found in $PATH\n```\nWhat is the correct next step to debug this container?',
+    options: [
+      'Add --force to kubectl exec',
+      'Rebuild the image with a shell added, even for a one-off debug session',
+      'kubectl debug -it distroless-app --image=busybox --target=<container> to attach a throwaway container sharing its process namespace',
+      'Restart the Pod and try exec again',
+    ],
+    answer: 2,
+    explain: 'Proven above: kubectl debug --target attached busybox and ps aux showed the distroless target\'s own PID 1 process, with no rebuild and no restart needed.',
   },
   {
     q: 'What is metrics-server best suited for?',
@@ -162,16 +349,29 @@ export const quizLoggingMetrics = [
       'Replacing Prometheus entirely in production clusters',
     ],
     answer: 1,
+    explain: 'Proven above with real kubectl top output -- metrics-server holds only the current snapshot in memory, with no history and no alerting.',
   },
   {
-    q: 'What flag shows the logs of a container that just crashed and was restarted?',
+    q: 'What flag shows the logs of a container that just crashed and was restarted, and why can it eventually stop working?',
     options: [
-      '--follow',
-      '--tail',
-      '--previous',
-      '--restart',
+      '--follow; it never stops working',
+      '--previous; it can fail once the kubelet garbage-collects that specific terminated container instance after enough further restarts',
+      '--tail; it always works no matter how many restarts have happened',
+      '--restart; this flag does not exist on kubectl logs',
     ],
-    answer: 2,
+    answer: 1,
+    explain: 'Proven above: --previous retrieved the crash message right after the first restart, but the kubelet only retains a limited number of terminated containers before their logs become unrecoverable.',
+  },
+  {
+    q: '```text\n$ kubectl debug -it distroless-app --image=busybox --target=app -- ps aux\nPID   USER     TIME  COMMAND\n    1 65535     0:00 /pause\n   17 root      0:00 ps aux\n```\nWhat does seeing PID 1 as /pause from inside the busybox debug container prove?',
+    options: [
+      'The debug container replaced the original /pause container',
+      'The debug container shares the target container\'s process namespace, so it can see the target\'s own processes',
+      'Kubernetes always shares process namespaces between every container in a Pod by default',
+      'The pause container crashed and was restarted as busybox',
+    ],
+    answer: 1,
+    explain: '--target requests process-namespace sharing specifically with that container; the original /pause process (PID 1) kept running the whole time, visible from the new ephemeral container.',
   },
   {
     q: 'How do Prometheus and Grafana relate to metrics-server?',
@@ -182,6 +382,18 @@ export const quizLoggingMetrics = [
       'Prometheus is required for kubectl top to work',
     ],
     answer: 1,
+    explain: 'metrics-server and Prometheus/Grafana solve different problems -- current-snapshot autoscaling input versus historical, alertable observability -- and both can run in the same cluster independently.',
+  },
+  {
+    q: 'How does the OpenTelemetry Collector relate to Prometheus?',
+    options: [
+      'It is a drop-in replacement that makes Prometheus unnecessary',
+      'It is a vendor-neutral pipeline that can receive metrics in Prometheus format and export to Prometheus or other backends, complementing rather than replacing it',
+      'It only handles traces, never logs or metrics',
+      'It requires Prometheus to be uninstalled first',
+    ],
+    answer: 1,
+    explain: 'Per the OpenTelemetry docs, the Collector unifies collection of logs/metrics/traces and can route Prometheus-format data onward -- it is a pipeline layer, not a storage backend competing with Prometheus.',
   },
 ];
 

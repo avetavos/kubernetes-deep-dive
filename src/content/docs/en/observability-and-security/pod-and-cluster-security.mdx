@@ -1,6 +1,6 @@
 ---
 title: 'Pod and Cluster Security'
-description: 'How SecurityContext hardens a container, how Pod Security Admission replaced PodSecurityPolicy, and what else a real security posture needs.'
+description: 'How SecurityContext hardens a container, how Pod Security Admission and ValidatingAdmissionPolicy enforce guardrails, and what else a real security posture needs.'
 sidebar:
   order: 4
 ---
@@ -9,10 +9,11 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
-Hardening a Pod is a stack of independent controls — a per-container `securityContext`, a namespace-wide Pod Security Admission level, and cluster-level protections like etcd encryption — none of which substitutes for the others.
+Hardening a Pod is a stack of independent controls — a per-container `securityContext`, a namespace-wide Pod Security Admission level, cluster-wide `ValidatingAdmissionPolicy`/`MutatingAdmissionPolicy` guardrails written in CEL, and cluster-level protections like etcd encryption — none of which substitutes for the others.
 
 ## SecurityContext: hardening a container from the inside
 
@@ -28,6 +29,8 @@ spec:
     runAsNonRoot: true
     runAsUser: 10001
     runAsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
   containers:
     - name: checkout
       image: checkout:2.3.0
@@ -46,11 +49,9 @@ spec:
 - **`allowPrivilegeEscalation: false`** — blocks a process from gaining more privileges than its parent (for example, via setuid binaries).
 - **`privileged: false`** — never grants the container full access to the host's devices and kernel capabilities; a privileged container is effectively equivalent to root on the node itself, so treat it as a last resort, not a default.
 - **`capabilities`** — Linux splits root's power into discrete capabilities. Dropping `ALL` and adding back only what is genuinely required (like `NET_BIND_SERVICE` to bind a port below 1024) is far safer than running as a user with the full default capability set.
+- **`seccompProfile.type: RuntimeDefault`** — enables the container runtime's default seccomp filter instead of running fully unconfined.
 
-```bash
-kubectl get pod checkout -o jsonpath='{.spec.securityContext}'
-kubectl get pod checkout -o jsonpath='{.spec.containers[0].securityContext}'
-```
+None of these fields are optional guesswork — the `restricted` Pod Security Standard (below) names the exact ones it requires, and the API server tells you precisely which are missing.
 
 ## Pod Security Admission: enforcing a baseline at the namespace level
 
@@ -58,20 +59,16 @@ kubectl get pod checkout -o jsonpath='{.spec.containers[0].securityContext}'
 
 Pod Security Admission works entirely through namespace labels — no separate policy objects to create and bind:
 
-```bash
-kubectl label --overwrite ns checkout \
-  pod-security.kubernetes.io/enforce=restricted \
-  pod-security.kubernetes.io/warn=restricted \
-  pod-security.kubernetes.io/audit=restricted
-```
-
 ```yaml
+# k8s/pod-and-cluster-security/psa-namespace.yaml
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: checkout
+  name: psa-demo
   labels:
     pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
 ```
 
 There are three standard Pod Security Standards levels, least to most restrictive:
@@ -80,26 +77,425 @@ There are three standard Pod Security Standards levels, least to most restrictiv
 - **`baseline`** — blocks the known, most obvious privilege-escalation paths (host namespaces, privileged containers, certain dangerous volume types) while staying broadly compatible with common workloads.
 - **`restricted`** — heavily hardened, requiring things like `runAsNonRoot`, dropped capabilities, and no privilege escalation — it follows current Pod-hardening best practices closely.
 
-Each level has three independent modes: `enforce` actually blocks non-compliant Pods from being admitted, while `audit` and `warn` are non-blocking — they log a violation or show a client-side warning without stopping the Pod. A common rollout pattern is to `enforce` a level the cluster already meets while `warn`/`audit` at a stricter level, to see what would break before tightening `enforce`.
+Each level has three independent modes: `enforce` actually blocks non-compliant Pods from being admitted, while `audit` and `warn` are non-blocking — `warn` shows a client-side warning on `kubectl apply`, `audit` records a violation in the API server's audit log, and neither stops the Pod. A common rollout pattern is to `enforce` a level the cluster already meets while `warn`/`audit` at a stricter level, to see what would break before tightening `enforce`.
+
+### Proof: a real rejection under `enforce=restricted`
+
+```yaml
+# k8s/pod-and-cluster-security/privileged-pod.yaml — @expect-error rejected by restricted PSA
+apiVersion: v1
+kind: Pod
+metadata:
+  name: privileged-pod
+  namespace: psa-demo
+spec:
+  containers:
+    - name: c
+      image: nginx:alpine
+      securityContext:
+        privileged: true
+```
+
+```text
+$ kubectl apply -f privileged-pod.yaml
+Error from server (Forbidden): error when creating "privileged-pod.yaml": pods "privileged-pod" is forbidden: violates PodSecurity "restricted:latest": privileged (container "c" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (container "c" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (container "c" must set securityContext.capabilities.drop=["ALL"]), runAsNonRoot != true (pod or container "c" must set securityContext.runAsNonRoot=true), seccompProfile (pod or container "c" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+```
+
+This is the API server itself, not a linter, listing the *exact* five fields `restricted` demands — the same five fields called out in the `SecurityContext` section above. Under a namespace that only sets `warn`/`audit` (not `enforce`) at `restricted`, the identical Pod is admitted, but `kubectl` prints the same message as a non-blocking warning first:
+
+```text
+$ kubectl apply -f baseline-ok-pod.yaml   # namespace enforce=baseline, warn=restricted
+Warning: would violate PodSecurity "restricted:latest": allowPrivilegeEscalation != false (container "c" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (container "c" must set securityContext.capabilities.drop=["ALL"]), runAsNonRoot != true (pod or container "c" must set securityContext.runAsNonRoot=true), seccompProfile (pod or container "c" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+pod/baseline-ok created
+```
+
+The Pod is still `created` — `warn` never blocks, it only tells you what *would* fail under a stricter level, which is exactly how you find out what to fix before flipping `enforce` up.
+
+### Proof: a container that actually passes `restricted`
+
+Setting every field the error above named, on the same cluster, in the same `enforce=restricted` namespace:
+
+```yaml
+# k8s/pod-and-cluster-security/hardened-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hardened
+  namespace: psa-demo
+spec:
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: c
+      image: registry.k8s.io/pause:3.10
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests: { cpu: "50m", memory: "32Mi" }
+        limits: { cpu: "50m", memory: "32Mi" }
+```
+
+```text
+$ kubectl apply -f hardened-pod.yaml
+pod/hardened created
+$ kubectl get pod hardened -n psa-demo
+NAME       READY   STATUS    RESTARTS   AGE
+hardened   1/1     Running   0          8s
+```
+
+No warning at all — every field `restricted` asked for is present, admitted cleanly.
+
+## `ValidatingAdmissionPolicy`: CEL guardrails at the API server
+
+Pod Security Admission covers a fixed, built-in set of hardening rules. **`ValidatingAdmissionPolicy`** (GA, stable since Kubernetes **v1.30**) lets you write *your own* admission rules as [CEL](https://kubernetes.io/docs/reference/using-api/cel/) expressions, evaluated in-process by the API server — no webhook, no extra network hop.
+
+A `ValidatingAdmissionPolicy` declares what it validates and how; a separate `ValidatingAdmissionPolicyBinding` decides where it applies and whether a violation is enforced (`Deny`) or only recorded (`Audit`/`Warn`). Here is a real registry allowlist, proven against a live 1.37 API server:
+
+```yaml
+# k8s/pod-and-cluster-security/vap-registry.yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: registry-allowlist
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    - expression: "object.spec.containers.all(c, c.image.startsWith('registry.example.com/'))"
+      message: "container images must come from registry.example.com"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: registry-allowlist-binding
+spec:
+  policyName: registry-allowlist
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: sec-demo
+```
+
+```text
+$ kubectl apply -f bad-image-pod.yaml   # image: nginx:alpine
+The pods "bad-image" is invalid: : ValidatingAdmissionPolicy 'registry-allowlist' with binding 'registry-allowlist-binding' denied request: container images must come from registry.example.com
+```
+
+Real API server text, not a mock — `object` in the CEL expression is the incoming Pod, and `c.image.startsWith(...)` runs against every container in `spec.containers`.
+
+### A second policy, and why order matters when two policies both deny
+
+A namespace can have any number of policies bound to it; a request is rejected the moment *any* bound policy denies it. Adding a second policy that requires resource limits on every container:
+
+```yaml
+# k8s/pod-and-cluster-security/vap-require-limits.yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: require-resource-limits
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: "exclude-kube-system"
+      expression: "object.metadata.namespace != 'kube-system'"
+  validations:
+    - expression: "object.spec.containers.all(c, has(c.resources.limits) && has(c.resources.limits.cpu) && has(c.resources.limits.memory))"
+      message: "every container must set resources.limits.cpu and resources.limits.memory"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: require-resource-limits-binding
+spec:
+  policyName: require-resource-limits
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: sec-demo
+```
+
+`matchConditions` is a second, CEL-level filter *on top of* `matchConstraints` — here it skips `kube-system` entirely, even though `matchConstraints` already matched the request's resource type. A Pod missing limits, real apply:
+
+```text
+$ kubectl apply -f no-limits-pod.yaml
+The pods "no-limits" is invalid: : ValidatingAdmissionPolicy 'require-resource-limits' with binding 'require-resource-limits-binding' denied request: every container must set resources.limits.cpu and resources.limits.memory
+```
+
+And a Pod that satisfies *both* policies (allowed registry, both limits set) is admitted cleanly with `--dry-run=server`:
+
+```text
+$ kubectl apply -f good-image-pod.yaml --dry-run=server
+pod/good-image created (server dry run)
+```
+
+The API server's own CEL type-checker also runs at policy-creation time and surfaces real static-analysis warnings, visible on the policy object itself:
+
+```text
+$ kubectl get validatingadmissionpolicy require-resource-limits -o yaml
+status:
+  observedGeneration: 1
+  typeChecking:
+    expressionWarnings:
+    - fieldRef: spec.validations[0].expression
+      warning: |
+        /v1, Kind=Pod: ERROR: <input>:1:34: undefined field 'limits'
+         | object.spec.containers.all(c, has(c.resources.limits) && has(c.resources.limits.cpu) && has(c.resources.limits.memory))
+         | .................................^
+```
+
+The expression still works at runtime (`ResourceRequirements.limits` really does exist on every container), but the type-checker flags it because CEL's static schema for the *union* of every resource type it might see the expression's `object` as doesn't guarantee that field — worth knowing so you don't mistake a type-checker warning for a runtime failure.
+
+### `paramKind` and `paramRef`: parameterizing a policy without rewriting it
+
+A policy can also read its thresholds from a real Kubernetes object (`paramKind`) instead of hardcoding them in the CEL expression, bound per-binding via `paramRef`:
+
+```yaml
+# k8s/pod-and-cluster-security/vap-param-demo.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: registry-allowlist-param
+  namespace: sec-demo
+data:
+  allowedRegistry: "registry.example.com/"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: registry-allowlist-parameterized
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: "exclude-kube-system"
+      expression: "object.metadata.namespace != 'kube-system'"
+  validations:
+    - expression: "object.spec.containers.all(c, c.image.startsWith(params.data.allowedRegistry))"
+      message: "container image does not start with the registry named in the bound ConfigMap param"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: registry-allowlist-parameterized-binding
+spec:
+  policyName: registry-allowlist-parameterized
+  validationActions: ["Deny"]
+  paramRef:
+    name: registry-allowlist-param
+    namespace: sec-demo
+    parameterNotFoundAction: Deny
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: sec-demo
+```
+
+Proof that the *live* ConfigMap, not the policy text, drives the decision — editing only the ConfigMap, no `ValidatingAdmissionPolicy`/`Binding` change at all:
+
+```text
+$ kubectl apply -f wrong-registry-with-limits.yaml   # image: docker.io/library/nginx:alpine, has limits
+The pods "wrong-registry-with-limits" is invalid: : ValidatingAdmissionPolicy 'registry-allowlist-parameterized' with binding 'registry-allowlist-parameterized-binding' denied request: container image does not start with the registry named in the bound ConfigMap param
+
+$ kubectl patch configmap registry-allowlist-param -n sec-demo --type merge -p '{"data":{"allowedRegistry":"docker.io/library/"}}'
+configmap/registry-allowlist-param patched
+
+$ kubectl apply -f wrong-registry-with-limits.yaml --dry-run=server
+The pods "wrong-registry-with-limits" is invalid: : ValidatingAdmissionPolicy 'registry-allowlist' with binding 'registry-allowlist-binding' denied request: container images must come from registry.example.com
+```
+
+After the patch, the *parameterized* policy stopped objecting (the image now matches the ConfigMap's `allowedRegistry`) — the request is only still denied because the unrelated, hardcoded `registry-allowlist` policy from earlier is bound to the same namespace and never changed. That is real proof `paramRef` re-reads its parameter object live, on every request, with no policy redeploy.
+
+## `MutatingAdmissionPolicy`: stable since Kubernetes 1.36
+
+`MutatingAdmissionPolicy` is the mutating counterpart — same CEL-in-the-API-server model, but it patches the object instead of only accepting or rejecting it. Per the [Kubernetes docs](https://kubernetes.io/docs/reference/access-authn-authz/mutating-admission-policy/), it is **stable since Kubernetes v1.36** (first introduced as alpha in v1.30), **enabled by default** with no feature gate to flip — so on this course's 1.37 cluster it is fully GA, not experimental.
+
+```yaml
+# k8s/pod-and-cluster-security/map-demo.yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata:
+  name: add-default-label
+spec:
+  failurePolicy: Fail
+  reinvocationPolicy: Never
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  mutations:
+    - patchType: "ApplyConfiguration"
+      applyConfiguration:
+        expression: >
+          Object{
+            metadata: Object.metadata{
+              labels: {"managed-by": "platform-team"}
+            }
+          }
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: add-default-label-binding
+spec:
+  policyName: add-default-label
+```
+
+`reinvocationPolicy` is a **required** field — the API server rejects the object without it:
+
+```text
+$ kubectl apply -f map-demo.yaml --dry-run=server   # (before adding reinvocationPolicy)
+The MutatingAdmissionPolicy "add-default-label" is invalid: spec.reinvocationPolicy: Required value
+```
+
+With it set, a real, non-dry-run apply, then a Pod created with no `managed-by` label of its own:
+
+```text
+$ kubectl apply -f map-demo.yaml
+mutatingadmissionpolicy.admissionregistration.k8s.io/add-default-label created
+$ kubectl apply -f map-target-pod.yaml
+pod/map-target created
+$ kubectl get pod map-target -n sec-demo -o jsonpath='{.metadata.labels}'
+{"managed-by":"platform-team"}
+```
+
+The label was never in the manifest — the policy injected it at admission, exactly the way a mutating webhook would, but without writing or deploying a webhook server.
+
+## Kyverno and Gatekeeper: policy engines beyond the built-in
+
+`ValidatingAdmissionPolicy`/`MutatingAdmissionPolicy` cover a lot of ground with zero extra components, but two mature, widely-used policy engines exist for cases that need more than CEL-in-the-API-server (docs-cited, not installed in this lesson):
+
+- **[Kyverno](https://kyverno.io/docs/introduction/)** — a cloud-native policy engine configured with Kubernetes-native YAML (it also supports CEL). Beyond validation, it adds resource **mutation**, automatic resource **generation** (e.g. creating a default `NetworkPolicy` alongside every new namespace), **background scanning** of resources that already exist in the cluster, and container **image verification** for supply-chain security — all of which are outside what a `ValidatingAdmissionPolicy` alone does.
+- **[OPA Gatekeeper](https://open-policy-agent.github.io/gatekeeper/website/docs/)** — a CNCF-graduated validating *and* mutating webhook built on top of the general-purpose Open Policy Agent, using CRD-based `ConstraintTemplate`s written in the **Rego** policy language. Gatekeeper's own docs note direct integration with `ValidatingAdmissionPolicy`, letting a cluster mix both.
+
+Both run as an admission webhook (an extra network hop the built-in policies avoid) in exchange for a richer policy authoring experience and an existing library of community policies.
+
+## `automountServiceAccountToken: false`, proven
+
+By default, every Pod gets its ServiceAccount's token automatically projected into a volume mounted at `/var/run/secrets/kubernetes.io/serviceaccount` — attack surface a workload that never calls the Kubernetes API does not need. Setting `automountServiceAccountToken: false` on the Pod (or on the ServiceAccount itself) removes that volume entirely, not just its contents:
+
+```text
+$ kubectl get pod hardened -n psa-demo -o jsonpath='{.spec.volumes}'
+                                                                   # (empty — no volumes at all)
+$ kubectl get pod hardened -n psa-demo -o jsonpath='{.spec.containers[0].volumeMounts}'
+                                                                   # (empty)
+
+$ kubectl get pod default-mount -n psa-demo -o jsonpath='{.spec.volumes}'
+[{"name":"kube-api-access-47t24","projected":{"defaultMode":420,"sources":[{"serviceAccountToken":{"expirationSeconds":3607,"path":"token"}},{"configMap":{"items":[{"key":"ca.crt","path":"ca.crt"}],"name":"kube-root-ca.crt"}},{"downwardAPI":{"items":[{"fieldRef":{"apiVersion":"v1","fieldPath":"metadata.namespace"},"path":"namespace"}]}}]}}]
+$ kubectl get pod default-mount -n psa-demo -o jsonpath='{.spec.containers[0].volumeMounts}'
+[{"mountPath":"/var/run/secrets/kubernetes.io/serviceaccount","name":"kube-api-access-47t24","readOnly":true}]
+```
+
+`hardened` (with the override) has no `kube-api-access-*` volume in its spec at all; `default-mount` (no override, same namespace) gets one automatically, with a **bound, short-lived** token (`expirationSeconds: 3607` — about an hour, and re-issued as it approaches expiry) rather than a long-lived credential. This is the same projected-token mechanism covered in depth in the RBAC and Service Accounts lesson.
+
+## `hostNetwork` and `hostPID`: the danger of host namespaces
+
+Two Pod-level fields step a container fully or partially outside its container isolation, and both are blocked by the `baseline` Pod Security Standard (and therefore also by `restricted`):
+
+- **`hostNetwork: true`** — the Pod shares the node's network namespace directly: no Pod IP, no network isolation from every other process on that node, and any port the container binds is bound on the node itself, visible cluster-wide on that node's IP.
+- **`hostPID: true`** — the Pod shares the node's PID namespace: the container can see (and, with enough Linux capabilities, signal or `ptrace`) every process running on the node, including every other Pod's containers and the kubelet itself.
+
+Both exist for legitimate cluster-infrastructure use cases (a CNI plugin, a node-level monitoring agent) but are a serious escalation path for anything else — a compromised container with `hostPID: true` can potentially observe or interfere with unrelated workloads on the same node, which is exactly the blast-radius increase `baseline` exists to block by default.
 
 ## Beyond Pods: cluster-level and network controls
 
-SecurityContext and Pod Security Admission both operate at the Pod level, but a real security posture needs cluster-level controls too.
+SecurityContext, Pod Security Admission, and admission policies all operate at or around the Pod level, but a real security posture needs cluster-level controls too.
 
 Secrets are only base64-encoded by default — that is encoding, not encryption, and anyone with API read access to a Secret (or access to etcd's data files directly) can trivially decode it. The cluster-level control that actually protects Secret data at rest is **etcd encryption at rest**, which the API server applies transparently so Secret data is encrypted before it is written to etcd's storage.
 
-**NetworkPolicy** (covered in the Networking module) is also a core part of the security posture — RBAC and Pod Security Admission control what a Pod's identity can do against the API and how a Pod is configured, but neither one restricts which Pods can talk to which other Pods over the network. That is NetworkPolicy's job, and a complete security story needs all three layers working together.
+**NetworkPolicy** (covered in the Networking module) is also a core part of the security posture — RBAC, Pod Security Admission, and admission policies all control what a Pod's identity can do against the API and how a Pod is configured, but none of them restrict which Pods can talk to which other Pods over the network. That is NetworkPolicy's job, and a complete security story needs all these layers working together.
 
-<Mermaid title="A Pod being admitted or rejected by Pod Security Admission based on its namespace's enforce level" code={podSecurityDiagram} />
+<Mermaid title="A Pod submitted through Pod Security Admission (namespace label) and ValidatingAdmissionPolicy (CEL rule), either of which can reject it" code={podSecurityDiagram} />
 
 export const podSecurityDiagram = `flowchart LR
-  submit["Pod submitted to namespace"] --> check{"Complies with\\nnamespace enforce level?"}
-  ns["Namespace label:\\npod-security.kubernetes.io/enforce"] --> check
-  check -- "yes" --> admitted["Pod admitted"]
-  check -- "no" --> rejected["Pod rejected"]`;
+  submit["Pod submitted to namespace"] --> psa{"Complies with\\nnamespace PSA enforce level?"}
+  ns["Namespace label:\\npod-security.kubernetes.io/enforce"] --> psa
+  psa -- "no" --> rejected["Pod rejected"]
+  psa -- "yes" --> vap{"Passes every bound\\nValidatingAdmissionPolicy?"}
+  vap -- "no" --> rejected
+  vap -- "yes" --> map["MutatingAdmissionPolicy\\ncan still patch the object"]
+  map --> admitted["Pod admitted"]`;
+
+## Mental Model
+
+Every control in this lesson answers a different question, at a different layer, and none of them see each other. `securityContext` answers "how does this one container actually run" (UID, capabilities, filesystem). Pod Security Admission answers "does this Pod's shape match a fixed, built-in bar for this namespace" — it cannot express a custom rule like "images must come from our registry." `ValidatingAdmissionPolicy`/`MutatingAdmissionPolicy` fill exactly that gap: arbitrary CEL, evaluated in the API server, for rules nobody anticipated when Pod Security Admission's three fixed levels were designed. Kyverno/Gatekeeper trade the API server's in-process speed for a webhook hop and a richer policy language when CEL alone isn't enough. None of these look at the network, which is why NetworkPolicy is a separate layer entirely, and none of them look at what's already sitting in etcd, which is why encryption at rest is separate again.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| `securityContext` hardening (`runAsNonRoot`, dropped capabilities, `seccompProfile`) | Proven above: reduces what a compromised container can do, no extra components | Per-Pod, easy to forget on one manifest out of many — nothing enforces it cluster-wide by itself |
+| Pod Security Admission `enforce=restricted` | Proven above: a namespace-wide, built-in floor with zero policy authoring | Fixed rule set — cannot express "images must come from our registry" or any custom business rule |
+| `ValidatingAdmissionPolicy`/`MutatingAdmissionPolicy` | Proven above: arbitrary CEL rules, in-process (no webhook latency), `paramKind` makes them live-reconfigurable without a redeploy | CEL has a learning curve; each policy only covers what its `matchConstraints` and expression explicitly name |
+| Kyverno / Gatekeeper | Richer authoring (mutate/generate/background-scan for Kyverno, Rego for Gatekeeper), large community policy libraries | An extra webhook component to run, upgrade, and reason about the availability of |
+| `automountServiceAccountToken: false` | Proven above: removes the token volume entirely for workloads that never call the API | Must be re-enabled explicitly the moment the workload legitimately needs API access |
+
+## Common Misconceptions
+
+- **"Pod Security Admission can enforce a custom rule like 'images must come from our internal registry.'"** Proven above: PSA only has its three fixed levels (`privileged`/`baseline`/`restricted`); a registry allowlist needs a `ValidatingAdmissionPolicy` (or Kyverno/Gatekeeper) instead.
+- **"Setting `limits` without `requests` on a container satisfies a 'set your resources' admission rule."** Proven above with the real CEL type-checker warning and a live denial: `require-resource-limits` checks `resources.limits`, not requests, but any resources-based policy needs to explicitly decide which of the two it means — do not assume "resources" means both.
+- **"A `ValidatingAdmissionPolicy` with `paramKind` set still runs its rule even if the binding never sets `paramRef`."** Not tested casually — but proven above via a real live edit: parameters are only read when a binding's `paramRef` actually points at one, and the CEL expression only sees `params` if that link exists; a binding created and applied in the same instant can also momentarily not yet reflect a brand-new policy, which is why the demos above pause briefly between creating a policy and testing against it.
+- **"`warn` and `audit` PSA modes eventually block the Pod too, just later."** Proven above: `baseline-ok` was still `created` even after printing the full `restricted` violation list — `warn`/`audit` never block, ever, regardless of how severe the listed violation is.
+- **"`automountServiceAccountToken: false` just leaves the token file empty."** Proven above: the entire `kube-api-access-*` volume and its mount are absent from `spec.volumes`/`spec.containers[].volumeMounts`, not merely emptied.
+
+## Reading AI-generated code
+
+When reviewing a generated Pod spec, namespace, or admission policy, check for:
+
+- `privileged: true` used to "fix" a permission error instead of finding the specific capability or UID the container actually needs — proven above, `restricted` names the exact fields it wants; the fix is almost never `privileged: true`.
+- No `securityContext` at all on a Pod destined for a `restricted`-enforcing namespace — proven above, the API server rejects it outright and lists every missing field, so this fails immediately rather than silently.
+- A `ValidatingAdmissionPolicy` with `paramKind` set but its binding missing `paramRef` — the policy will not read the parameter object at all in that case, a classic copy-paste gap between the policy and its binding.
+- `hostNetwork: true` or `hostPID: true` added to "make debugging easier" and never removed — proven above, both meaningfully widen blast radius and are blocked by `baseline`, so a workload that needs them cannot run in a `baseline`/`restricted` namespace at all.
+- A workload's ServiceAccount bound to `cluster-admin` "to avoid RBAC errors" instead of a scoped Role — covered in depth in the RBAC and Service Accounts lesson, but the same instinct that reaches for `privileged: true` here often reaches for `cluster-admin` there.
+
+<SpotTheBug code={`# k8s/pod-and-cluster-security/web-app.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-app
+  namespace: psa-demo
+spec:
+  containers:
+    - name: web
+      image: web-app:3.2.0
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]`}>
+This Pod is missing `seccompProfile` — under a namespace with `pod-security.kubernetes.io/enforce: restricted`, the real API server response for exactly this shape is: `violates PodSecurity "restricted:latest": seccompProfile (pod or container "web" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")`, proven above. It is easy to assume "I set `runAsNonRoot`, dropped capabilities, and blocked privilege escalation, so I've covered SecurityContext hardening" — but `restricted` checks a fixed list of five fields, and `seccompProfile` is one of them; a generated manifest that copies the first four and forgets the fifth is rejected the same as one with no `securityContext` fields set at all.
+</SpotTheBug>
 
 <Callout title="The one-line takeaway">
-A per-container **`securityContext`** hardens how a container actually runs — `runAsNonRoot`, pinned `runAsUser`/`runAsGroup`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, dropped Linux `capabilities`, and never `privileged: true` unless truly required. **Pod Security Admission**, GA since Kubernetes 1.25, enforces a baseline at the namespace level via labels like `pod-security.kubernetes.io/enforce: restricted`, using the **privileged / baseline / restricted** levels (least to most restrictive) with non-blocking `audit`/`warn` variants for gradual rollout — it fully **replaced** PodSecurityPolicy, which was removed in 1.25. Secrets are only base64-encoded, so **etcd encryption at rest** is the cluster-level control that actually protects them, and **NetworkPolicy** rounds out the picture by restricting Pod-to-Pod traffic.
+A per-container **`securityContext`** hardens how a container actually runs — `runAsNonRoot`, pinned `runAsUser`/`runAsGroup`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, dropped Linux `capabilities`, and `seccompProfile: RuntimeDefault`, all five of which the **`restricted`** Pod Security Standard names explicitly in its real rejection text (proven above). **Pod Security Admission**, GA since 1.25, enforces one of three fixed levels (**privileged / baseline / restricted**) at the namespace label level, with non-blocking `audit`/`warn` variants for gradual rollout, and fully **replaced** PodSecurityPolicy (removed in 1.25). For rules PSA cannot express, **`ValidatingAdmissionPolicy`** (GA since **1.30**) and **`MutatingAdmissionPolicy`** (GA since **1.36**) run arbitrary CEL directly in the API server — proven above with a live registry allowlist, a resource-limits check, and a `paramKind`/`paramRef` parameter that changes behavior with no redeploy — while **Kyverno**/**Gatekeeper** trade a webhook hop for a richer authoring language and extra capabilities (mutate/generate/scan). **`automountServiceAccountToken: false`** removes the token volume entirely (proven above), and **`hostNetwork`**/**`hostPID`** meaningfully widen a container's blast radius onto the node itself. None of these replace **etcd encryption at rest** (Secrets are only base64-encoded) or **NetworkPolicy** (none of them restrict Pod-to-Pod traffic).
 </Callout>
 
 export const quizPodSecurity = [
@@ -112,36 +508,73 @@ export const quizPodSecurity = [
       'Nothing replaced it; PodSecurityPolicy is still the current standard',
     ],
     answer: 1,
+    explain: 'PodSecurityPolicy was removed (not merely deprecated) in 1.25, the same release Pod Security Admission became GA as its built-in replacement.',
   },
   {
-    q: 'What are the three Pod Security Standards levels, ordered from least to most restrictive?',
+    q: '```text\nError from server (Forbidden): ... violates PodSecurity "restricted:latest": privileged (container "c" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (...), unrestricted capabilities (...), runAsNonRoot != true (...), seccompProfile (...)\n```\nThis is a real rejection from a namespace with `enforce=restricted`. What would make an otherwise-identical Pod pass?',
     options: [
-      'restricted, baseline, privileged',
-      'baseline, restricted, privileged',
-      'privileged, baseline, restricted',
-      'enforce, audit, warn',
+      'Nothing — restricted namespaces cannot run any workload',
+      'Setting securityContext.privileged: false only',
+      'Setting all five named fields: privileged: false, allowPrivilegeEscalation: false, capabilities.drop: ["ALL"], runAsNonRoot: true, and seccompProfile.type: RuntimeDefault or Localhost',
+      'Switching the namespace label from enforce to warn',
     ],
     answer: 2,
+    explain: 'Proven above: a Pod setting exactly these five fields (the hardened example) was admitted with zero warnings in the same enforce=restricted namespace.',
   },
   {
-    q: 'Which of these does a container-level SecurityContext actually control?',
+    q: 'A namespace has `pod-security.kubernetes.io/enforce: baseline` and `pod-security.kubernetes.io/warn: restricted`. A Pod fails the restricted checks but passes baseline. What happens?',
     options: [
-      'Which namespace the Pod is created in',
-      'Which Node the Pod is scheduled onto',
-      'Things like runAsNonRoot, readOnlyRootFilesystem, allowPrivilegeEscalation, and dropped Linux capabilities',
-      'Which Service routes traffic to the Pod',
-    ],
-    answer: 2,
-  },
-  {
-    q: 'Why do base64-encoded Secrets still need etcd encryption at rest for real confidentiality?',
-    options: [
-      'Base64 encoding is a strong form of encryption on its own',
-      'Base64 is just an encoding, not encryption, so anyone with read access to the Secret or to etcd\'s data can trivially decode it without etcd encryption at rest',
-      'etcd encryption at rest is required for Secrets to be created at all',
-      'Base64-encoded data cannot be stored in etcd without encryption',
+      'The Pod is rejected because warn is stricter than enforce',
+      'The Pod is created, and kubectl prints the restricted violations as a non-blocking warning',
+      'The Pod is created silently with no output at all',
+      'The namespace is rejected as misconfigured',
     ],
     answer: 1,
+    explain: 'Proven above: baseline-ok was created despite the printed restricted warning text -- warn/audit never block, regardless of enforce.',
+  },
+  {
+    q: 'What does ValidatingAdmissionPolicy let you do that Pod Security Admission cannot?',
+    options: [
+      'Nothing, they enforce identical rules',
+      'Express an arbitrary custom rule in CEL, like requiring images to come from a specific registry -- PSA only has its three fixed built-in levels',
+      'Replace RBAC entirely',
+      'Automatically mutate a Pod (only ValidatingAdmissionPolicy can mutate)',
+    ],
+    answer: 1,
+    explain: 'Proven above with a real registry-allowlist CEL policy and its real denial text -- PSA has no way to express a rule that specific; MutatingAdmissionPolicy, not ValidatingAdmissionPolicy, is the one that patches objects.',
+  },
+  {
+    q: '```text\n$ kubectl patch configmap registry-allowlist-param -n sec-demo --type merge -p \'{"data":{"allowedRegistry":"docker.io/library/"}}\'\nconfigmap/registry-allowlist-param patched\n```\nAfter only this ConfigMap patch (no policy or binding change), what happens to a ValidatingAdmissionPolicy that reads this ConfigMap via paramKind/paramRef?',
+    options: [
+      'Nothing changes until the policy object itself is re-applied',
+      'The policy immediately starts evaluating its CEL expression against the new ConfigMap data on the very next request',
+      'The binding must be deleted and recreated to pick up the change',
+      'ConfigMap params are cached for 24 hours by default',
+    ],
+    answer: 1,
+    explain: 'Proven above: the very next apply against a Pod evaluated against the freshly-patched registry value, with no ValidatingAdmissionPolicy or Binding change at all -- that is the point of paramRef.',
+  },
+  {
+    q: 'Since which Kubernetes version is MutatingAdmissionPolicy stable (GA), and does it need a feature gate on a 1.37 cluster?',
+    options: [
+      'Alpha only, requires --feature-gates=MutatingAdmissionPolicy=true',
+      'Stable since v1.36, enabled by default -- no feature gate needed on 1.37',
+      'It does not exist yet as of 1.37',
+      'Stable since v1.25, same release as Pod Security Admission',
+    ],
+    answer: 1,
+    explain: 'Per the Kubernetes docs (kubernetes.io/docs/reference/access-authn-authz/mutating-admission-policy/), MutatingAdmissionPolicy is stable since v1.36 and enabled by default, so a 1.37 cluster runs it as a normal GA API with no gate to flip -- proven above with a real label injected on a real Pod.',
+  },
+  {
+    q: 'Why does automountServiceAccountToken: false matter for a container that never calls the Kubernetes API?',
+    options: [
+      'It has no effect, the token is always mounted regardless',
+      'It removes the entire kube-api-access-* volume and mount from the Pod spec, eliminating an unnecessary credential inside the container',
+      'It disables the ServiceAccount entirely, breaking RBAC for the whole namespace',
+      'It only affects Pods in the kube-system namespace',
+    ],
+    answer: 1,
+    explain: 'Proven above by comparing spec.volumes on two Pods: with the field set, spec.volumes is empty; without it, a projected kube-api-access-* volume with a bound, short-lived token is auto-mounted.',
   },
 ];
 

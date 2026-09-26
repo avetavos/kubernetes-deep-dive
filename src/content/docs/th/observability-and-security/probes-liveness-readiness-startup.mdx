@@ -1,6 +1,6 @@
 ---
 title: 'Probe: Liveness, Readiness, และ Startup'
-description: 'liveness, readiness กับ startup probe ทำให้ Kubernetes ตรวจจับ container ที่พังและกันไม่ให้ traffic ไปหา container ที่ยังไม่พร้อมได้ยังไง'
+description: 'liveness, readiness, และ startup probe ให้ Kubernetes ตรวจจับ container ที่พังและกัน traffic ออกจากตัวที่ยังไม่พร้อมยังไง พิสูจน์ด้วย restart loop จริงจาก anti-pattern และวิธีแก้'
 sidebar:
   order: 1
 ---
@@ -9,18 +9,17 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
-probe สามแบบถามคำถามคนละแบบ คือยังทำงานอยู่ไหม พร้อมรับ traffic ตอนนี้ไหม กับ start เสร็จหรือยัง แล้ว Kubernetes ก็ตอบสนองต่อแต่ละคำตอบไม่เหมือนกัน
+probe สามแบบถามคำถามคนละข้อ — ยังมีชีวิตอยู่ไหม, พร้อมรับ traffic ไหม, และ start เสร็จหรือยัง — และ Kubernetes ตอบสนองต่างกันตามคำตอบแต่ละแบบ การตั้งผิดตรงนี้เป็นวิธีที่พบบ่อยที่สุดวิธีหนึ่งที่ application ที่แข็งแรงดีอยู่แล้วจบลงด้วย restart loop ไม่รู้จบ
 
-## Liveness vs Readiness: restart กับ remove-from-Service
+## Liveness vs Readiness: restart vs เอาออกจาก Service
 
-**Liveness probe** ตอบคำถามว่า "container ตัวนี้ยังทำงานอยู่ไหม" ถ้า fail ติดกันจนครบจำนวนที่กำหนด kubelet จะฆ่า container แล้วให้ `restartPolicy` เป็นตัวตัดสินว่าจะทำอะไรต่อ (ปกติคือ restart ให้ใหม่) probe แบบนี้เหมาะกับ container ที่ยังรันอยู่แต่ค้าง เช่น deadlock หรือขยับต่อไม่ได้ ซึ่ง restart คือทางแก้
+**liveness probe** ตอบว่า "container นี้ยังทำงานอยู่ไหม" ถ้ามันพังติดกันครบจำนวนที่กำหนด kubelet จะฆ่า container แล้วให้ `restartPolicy` ตัดสินว่าจะเกิดอะไรต่อ (ปกติคือ restart) นี่มีไว้สำหรับ container ที่ยังรันอยู่แต่ค้าง — deadlock, ติดขัด, ไปต่อไม่ได้ — ที่การ restart คือทางแก้
 
-**Readiness probe** ตอบคำถามคนละเรื่องเลย คือ "container ตัวนี้พร้อมรับ traffic *ตอนนี้* ไหม" ถ้า readiness probe fail จะ **ไม่** restart อะไรทั้งนั้น สิ่งที่เกิดขึ้นคือ Pod ถูกเอาออกจาก Endpoints/EndpointSlice ของ Service ทำให้ Service หยุดส่ง traffic มาที่ Pod นั้น container ยังรันต่อไปตามปกติ ไม่ถูกแตะต้อง แล้วพอ probe กลับมาผ่านอีกครั้ง Pod ก็ถูกเพิ่มกลับเข้าไปใหม่
-
-ความต่างตรงนี้แหละที่ทำให้ rolling update กับแอปที่ warm-up ช้าทำงานได้ถูกต้อง
+**readiness probe** ตอบคำถามคนละข้อเลย: "container นี้พร้อมรับ traffic *ตอนนี้เลย* ไหม" readiness probe ที่พังไม่ restart อะไรเลย แต่ Pod จะถูกเอาออกจาก Endpoints/EndpointSlice ของ Service ทำให้ Service หยุด route traffic มาให้มันเฉย ๆ container ยังรันต่อไปไม่ถูกแตะเลย และทันทีที่ probe กลับมาผ่าน Pod ก็ถูกเพิ่มกลับเข้าไป
 
 ```yaml
 apiVersion: v1
@@ -51,39 +50,107 @@ spec:
         failureThreshold: 1
 ```
 
-ความผิดพลาดที่เจอบ่อยในโลกจริงคือการไม่ใส่ readiness probe เลย พอไม่มี readiness probe Kubernetes จะถือว่า container พร้อมทันทีที่ start ขึ้นมา ทั้งที่ตัวแอปข้างในอาจจะยังโหลด config อยู่ warm cache อยู่ หรือกำลังเปิด connection กับ database ระหว่าง rollout แบบนี้ traffic จริงจะถูกส่งตรงเข้าไปยัง container ที่ยังรับมือไม่ไหว ที่เป็นสาเหตุที่พบบ่อยของ error ที่พุ่งขึ้นทันทีหลัง deploy ทุกครั้ง
+## พิสูจน์: endpoint เดียวกันสำหรับ liveness และ readiness ทำให้ server ที่ warm-up ช้าเข้าสู่ restart loop
 
-## Startup probe: ให้เวลา container ที่ start ช้า
-
-container บางตัว เช่นแอป JVM เก่า หรือตัวที่ทำ migration หนัก ๆ หรือ preload cache ตอน boot อาจใช้เวลาหลายนาทีกว่าจะตอบสนองได้ การตั้ง `initialDelaySeconds` สั้น ๆ บน liveness probe ไม่พอ แต่ถ้าตั้งยาวไปก็ทำให้ตรวจจับปัญหาค้างจริง ๆ หลัง app ขึ้นมาแล้วช้าตามไปด้วย
-
-**Startup probe** แก้ปัญหานี้ ตราบใดที่ startup probe ยังไม่ผ่าน liveness กับ readiness probe จะถูกปิดไปเลย container ที่ boot ช้าจึงไม่โดน liveness probe ที่ใจร้อนฆ่าทิ้งก่อนเวลา พอ startup probe ผ่านครั้งเดียว probe ตัวนี้ก็หยุดรันถาวร แล้วให้ liveness/readiness ทำงานแทนต่อไปตลอดอายุ container
+การตั้งค่าผิดที่พบบ่อยจริง ๆ คือชี้ทั้ง liveness และ readiness probe ไปที่ endpoint **เดียวกัน** โดยไม่มี startup probe บน container ที่ใช้เวลาจริงกว่าจะ responsive ได้ นี่คือ container ที่จงใจใช้เวลา 30 วินาทีกว่าจะเริ่ม listen
 
 ```yaml
-    startupProbe:
-      httpGet:
-        path: /healthz
-        port: 8080
-      failureThreshold: 30
-      periodSeconds: 10
+# k8s/probes-liveness-readiness-startup/slow-warmer-bad.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: slow-warmer-bad
+  namespace: probes-demo
+spec:
+  containers:
+    - name: c
+      image: busybox
+      command: ["sh", "-c", "sleep 30 && while true; do { printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nok'; } | nc -l -p 8080; done"]
+      ports:
+        - containerPort: 8080
+      livenessProbe:
+        httpGet: { path: /, port: 8080 }
+        periodSeconds: 5
+        failureThreshold: 3
+      readinessProbe:
+        httpGet: { path: /, port: 8080 }
+        periodSeconds: 5
+        failureThreshold: 3
 ```
 
-ด้วย `failureThreshold: 30` และ `periodSeconds: 10` container ตัวนี้มีเวลาสูงสุด 300 วินาทีให้กลายเป็น healthy ก่อนที่ kubelet จะยอมแพ้แล้ว restart container
+ด้วย `initialDelaySeconds: 0` ที่เป็น default liveness probe เริ่มเช็คทันที — นานก่อนที่ warm-up 30 วินาทีจะเสร็จเสียอีก และด้วย `failureThreshold: 3`/`periodSeconds: 5` มันยอมแพ้หลังแค่ 15 วินาที output จริงจาก cluster ที่รันอยู่จริง
 
-```bash
-# Watch probe-driven restarts and readiness state
-kubectl get pods -w
-kubectl describe pod web | grep -A5 -E 'Liveness|Readiness|Startup'
+```text
+$ kubectl get pod slow-warmer-bad
+NAME              READY   STATUS    RESTARTS      AGE
+slow-warmer-bad   0/1     Running   1 (15s ago)   60s
+...
+slow-warmer-bad   0/1     Running   2 (20s ago)   110s
+
+$ kubectl get events --field-selector involvedObject.name=slow-warmer-bad --sort-by=.lastTimestamp
+LAST SEEN   TYPE      REASON      OBJECT                MESSAGE
+45s         Normal    Killing     pod/slow-warmer-bad   Container c failed liveness probe, will be restarted
+5s          Warning   Unhealthy   pod/slow-warmer-bad   Liveness probe failed: Get "http://10.244.2.8:8080/": dial tcp 10.244.2.8:8080: connect: connection refused
+3s          Warning   Unhealthy   pod/slow-warmer-bad   Readiness probe failed: Get "http://10.244.2.8:8080/": dial tcp 10.244.2.8:8080: connect: connection refused
 ```
 
-## กลไกการเช็ค probe
+`RESTARTS` ไต่ขึ้นเรื่อย ๆ (1 แล้วก็ 2 ไปเรื่อย ๆ ไม่รู้จบ) — container ถูก liveness probe ของตัวเองฆ่าทุกครั้ง เสมอก่อนที่ warm-up 30 วินาทีจะเสร็จ เพราะการ restart รีเซ็ตนาฬิกากลับไปที่ศูนย์ container ไม่เคยมีโอกาส start ให้เสร็จเลย นี่คือ restart loop ที่ **เกิดจากตัวเอง** ไม่ใช่ bug ของ application จริง ๆ
 
-probe ทุกแบบ (liveness, readiness, startup) เลือกใช้กลไกการเช็คแบบใดแบบหนึ่งได้ดังนี้
+## `startupProbe`: ให้เวลา container ที่ start ช้าได้ boot จริง พิสูจน์แล้ว
 
-- **`httpGet`** ยิง HTTP GET ไป status code ตั้งแต่ 200 จนถึงก่อน 400 ถือว่าผ่าน
-- **`tcpSocket`** พยายามเปิด TCP connection ไปยัง port ที่กำหนด เชื่อมต่อสำเร็จถือว่าผ่าน
-- **`exec`** รันคำสั่งข้างใน container exit code `0` ถือว่าผ่าน
-- **`grpc`** เรียก gRPC health-checking service ของ container (container ต้อง implement gRPC health protocol มาตรฐานเอง)
+**startup probe** แก้ปัญหานี้ได้ตรง ๆ ตราบใดที่ startup probe ยังไม่ผ่าน liveness กับ readiness probe จะถูกปิดไปเลย — ดังนั้น container ที่ boot ช้าจะไม่ถูก liveness probe ที่ใจร้อนฆ่าได้ พอ startup probe ผ่านครั้งเดียวมันหยุดรันถาวร แล้ว liveness/readiness ก็เข้ามาดูแลตลอดชีวิตที่เหลือของ container
+
+สูตรคำนวณคือ `failureThreshold × periodSeconds` = งบเวลารวมก่อนที่ kubelet จะยอมแพ้และ restart container server ที่ warm-up 30 วินาทีตัวเดิม ตอนนี้ตั้ง startup probe budget เป็น `6 × 10 = 60` วินาที — มากกว่า 30 วินาทีที่มันต้องการจริง ๆ อย่างสบาย ๆ
+
+```yaml
+# k8s/probes-liveness-readiness-startup/slow-warmer-fixed.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: slow-warmer-fixed
+  namespace: probes-demo
+spec:
+  containers:
+    - name: c
+      image: busybox
+      command: ["sh", "-c", "sleep 30 && while true; do { printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nok'; } | nc -l -p 8080; done"]
+      ports:
+        - containerPort: 8080
+      startupProbe:
+        httpGet: { path: /, port: 8080 }
+        periodSeconds: 10
+        failureThreshold: 6
+      livenessProbe:
+        httpGet: { path: /, port: 8080 }
+        periodSeconds: 5
+        failureThreshold: 3
+      readinessProbe:
+        httpGet: { path: /, port: 8080 }
+        periodSeconds: 5
+        failureThreshold: 3
+```
+
+```text
+$ kubectl get pod slow-warmer-fixed
+NAME                READY   STATUS    RESTARTS   AGE
+slow-warmer-fixed   1/1     Running   0          50s
+
+$ kubectl get events --field-selector involvedObject.name=slow-warmer-fixed --sort-by=.lastTimestamp
+LAST SEEN   TYPE      REASON      OBJECT                  MESSAGE
+50s         Normal    Started     pod/slow-warmer-fixed   Container started
+20s         Warning   Unhealthy   pod/slow-warmer-fixed   Startup probe failed: Get "http://10.244.2.9:8080/": dial tcp 10.244.2.9:8080: connect: connection refused
+```
+
+`RESTARTS: 0` — container ตัวเดียวกันเป๊ะ ๆ warm-up 30 วินาทีเหมือนเดิม รอดครั้งนี้แบบสะอาด ๆ warning `Startup probe failed` ตัวเดียวที่ log ระหว่างทางเป็นเรื่องปกติและไม่เป็นอันตราย: มันยังอยู่ในงบ `6 × 10 = 60` วินาทีสบาย ๆ และไม่มี event `Killing`/liveness เกิดขึ้นเลย เพราะ liveness ยังไม่ได้เริ่มรันด้วยซ้ำตอนนั้น
+
+## กลไก probe
+
+probe ทุกแบบ (liveness, readiness, startup) ใช้กลไกเช็คแบบใดแบบหนึ่งได้
+
+- **`httpGet`** — ส่ง HTTP GET request; status code ตั้งแต่ 200 จนถึงก่อน 400 นับว่าสำเร็จ
+- **`tcpSocket`** — ลองเปิด TCP connection ไปที่ port; connect สำเร็จนับว่าสำเร็จ
+- **`exec`** — รันคำสั่งข้างใน container; exit code `0` นับว่าสำเร็จ
+- **`grpc`** — เรียก gRPC health-checking service ของ container (container ต้อง implement [gRPC health protocol มาตรฐาน](https://grpc.io/grpc/core/md_doc_health-checking.html)) ตาม [เอกสาร probe ของ Kubernetes](https://kubernetes.io/docs/concepts/workloads/pods/probes/) field `grpc` เป็น GA มาตั้งแต่ Kubernetes **1.27** (บทนี้พูดถึงแค่ภาพรวมเชิงเอกสาร — พิสูจน์แบบ live ต้องมี container ที่ implement gRPC health protocol ซึ่ง demo image เล็ก ๆ ของคอร์สนี้ไม่มีตัวไหนทำ):
 
 ```yaml
       readinessProbe:
@@ -91,63 +158,169 @@ probe ทุกแบบ (liveness, readiness, startup) เลือกใช้
           port: 5000
 ```
 
-field สำหรับปรับจูนใช้ได้กับทุกกลไก คือ `initialDelaySeconds` (รอก่อนเช็คครั้งแรก) `periodSeconds` (เช็คถี่แค่ไหน) `timeoutSeconds` (รอ response นานแค่ไหน) `failureThreshold` (fail ติดกันกี่ครั้งถึงจะสั่งการ) และ `successThreshold` (สำเร็จติดกันกี่ครั้งถึงจะกลับมา healthy ซึ่งของ liveness กับ startup ต้องเป็น `1` เท่านั้น)
+field การปรับแต่งใช้ได้กับทุกกลไก: `initialDelaySeconds` (รอก่อนเช็คครั้งแรก), `periodSeconds` (เช็คบ่อยแค่ไหน, default `10`), `timeoutSeconds` (รอ response นานแค่ไหน — **default แค่ `1` วินาที** ง่ายมากที่จะไม่พอสำหรับอะไรที่ทำงานจริงอย่าง query database หรือ TLS handshake ใน health check), `failureThreshold` (พังติดกันกี่ครั้งก่อนจะลงมือ), และ `successThreshold` (สำเร็จติดกันกี่ครั้งถึงจะกลับมาเป็น healthy — ต้องเป็น `1` สำหรับ liveness และ startup probe) demo `slow-warmer-bad` ด้านบนบังเอิญพังเพราะไม่มีเวลาพอจะ *start* แต่อีก gotcha ที่พบบ่อยพอ ๆ กันในโลกจริงคือ probe ที่ start ตรงเวลาแต่ยัง timeout อยู่ดี แค่เพราะ default 1 วินาทีสั้นกว่าที่การเช็คนั้นใช้เวลาจริง
 
-<Mermaid title="วงจรชีวิต container: startup probe กั้น liveness กับ readiness ก่อนที่จะรันต่อเนื่อง" code={probeLifecycleDiagram} />
+## restart ที่ probe สั่งยังเคารพ `terminationGracePeriodSeconds`
+
+restart ที่ liveness probe สั่งไม่ใช่การฆ่าทันที — มันผ่าน sequence เดียวกันเป๊ะ ๆ คือ SIGTERM → grace period → SIGKILL ที่พูดถึงลึกกว่านี้ใน [Pods: The Atomic Unit](/kubernetes/th/workloads/pods-the-atomic-unit/) รวมถึง `preStop` hook ใด ๆ ด้วย container ที่มี `terminationGracePeriodSeconds` ยาวและ request ที่กำลัง drain ช้า ใช้เวลาหยุดจริง ๆ หลังจาก liveness probe พังพอ ๆ กับหลัง `kubectl delete pod` ปกติเลย — probe แค่ตัดสินใจว่า *ควรจะ* restart ไหม ไม่ใช่กำหนดว่า container จะออกได้เร็วแค่ไหน
+
+## Readiness gate: ขยาย readiness ให้เกินกว่า probe ของ container เอง
+
+**`readinessGates`** ให้ controller ภายนอกร่วมตัดสินว่า Pod นับว่า `Ready` ไหม มากกว่าแค่ `readinessProbe` ของตัวมันเอง condition ที่ระบุชื่อไว้แต่ละตัวต้องเป็น `True` ใน `status.conditions` ของ Pod — ตั้งโดย controller อื่นที่กำลังจับตา Pod อยู่ — ก่อนที่ Pod จะนับว่า ready ได้ นอกเหนือจากทุก container ต้องผ่าน readiness probe ของตัวเองด้วย
+
+```yaml
+spec:
+  readinessGates:
+    - conditionType: "www.example.com/feature-1"
+```
+
+นี่คือวิธีที่ pattern อย่าง Gateway/load-balancer controller ยืนยันว่า Pod ถูก register และรับ traffic จริงในระดับ infrastructure (ไม่ใช่แค่ "probe ของฉันเองผ่าน") ถูกพับเข้าไปในสัญญาณ `Ready` เดียวกันที่ `kubectl get pods` และ rollout ใช้อยู่แล้ว — เป็นแค่ภาพรวมตรงนี้ ฝั่ง controller อยู่นอกขอบเขตของบทนี้
+
+```bash
+# Watch probe-driven restarts and readiness state
+kubectl get pods -w
+kubectl describe pod web | grep -A5 -E 'Liveness|Readiness|Startup'
+```
+
+<Mermaid title="วงจรชีวิตของ container: startup probe กั้น liveness กับ readiness ซึ่งจะรันต่อเนื่องหลังจากนั้น" code={probeLifecycleDiagram} />
 
 export const probeLifecycleDiagram = `flowchart LR
-  boot["Container starts"] --> sp{"startupProbe\\nsucceeded?"}
-  sp -- "no, keep trying" --> sp
-  sp -- "yes" --> live["livenessProbe\\nruns continuously"]
-  sp -- "yes" --> ready["readinessProbe\\nruns continuously"]
-  live -- "fails" --> restart["kubelet restarts container"]
-  ready -- "fails" --> remove["Pod removed from Service Endpoints"]
-  ready -- "succeeds again" --> add["Pod added back to Endpoints"]`;
+  boot["Container starts"] --> sp{"startupProbe\\nสำเร็จหรือยัง?"}
+  sp -- "ยัง ลองต่อ\\n(ไม่เกิน failureThreshold x periodSeconds)" --> sp
+  sp -- "สำเร็จ" --> live["livenessProbe\\nรันต่อเนื่อง"]
+  sp -- "สำเร็จ" --> ready["readinessProbe\\nรันต่อเนื่อง"]
+  live -- "พัง" --> restart["kubelet restart container\\n(SIGTERM -> grace -> SIGKILL)"]
+  ready -- "พัง" --> remove["Pod ถูกเอาออกจาก Service Endpoints"]
+  ready -- "สำเร็จอีกครั้ง" --> add["Pod ถูกเพิ่มกลับเข้า Endpoints"]`;
+
+## Mental Model
+
+probe ทั้งสามตัวตอบแค่คำถามแคบ ๆ ของตัวเองเท่านั้น และปฏิกิริยาของ kubelet ถูก hardwire ตาม probe ตัวไหนที่พัง — มันไม่เคยให้เหตุผลว่า *ทำไม* เลย การ restart (liveness) กับการดึง traffic ออก (readiness) เป็นเครื่องมือคนละแบบสำหรับรูปแบบความพังคนละแบบ: "ค้าง ต้องการ restart" กับ "ให้บริการไม่ได้ชั่วคราว อย่า restart แค่รอ" การชี้ทั้งสองไปที่ endpoint เดียวกันลบความแตกต่างนี้ไปเลย — พิสูจน์แล้วด้านบน มันหมายความว่า "กำลัง warm-up ชั่วคราว" ถูกปฏิบัติเหมือน "ค้างถาวร" เป๊ะ ๆ และ container ถูกฆ่าเพื่อเงื่อนไขที่ restart แก้ไม่ได้เลย เพราะการ restart แค่รีเซ็ตนาฬิกา warm-up กลับไปที่ศูนย์ startup probe มีไว้เพื่อซื้อเวลาให้ container ที่ boot ช้า *ก่อน* ที่ปฏิกิริยา hardwired นั้นจะเปิดใช้งานด้วยซ้ำ ซึ่งเป็นเหตุผลที่มันปิดอีกสองตัวแทนที่จะเป็นแค่ "ความเห็นที่สาม"
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ข้อดี | ต้นทุน |
+|---|---|---|
+| แยก endpoint liveness กับ readiness | warm-up ช้าหรือ dependency ที่ล่มชั่วคราวไม่ทำให้เกิด restart ที่ไม่จำเป็นเลย (พิสูจน์แล้วด้านบนกับ failure mode ตอนที่เป็น endpoint เดียวกัน) | ต้อง implement endpoint เพิ่มอีกตัวและทำให้มันต่างจากอีกตัวอย่างมีความหมายจริง |
+| endpoint เดียวกันทั้งคู่ | เขียนโค้ดน้อยกว่า | พิสูจน์แล้วด้านบน: restart-loop ทุก container ที่สถานะ readiness ของมันเป็น false ได้ด้วยเหตุผลที่ restart แก้ไม่ได้ |
+| เพิ่ม `startupProbe` | พิสูจน์แล้วด้านบน: ซับเวลา boot ที่ยาวแค่ไหนก็ได้แบบคาดเดาได้ด้วย `failureThreshold x periodSeconds` โดยไม่เสี่ยงต่อความไวของ liveness ตอน steady-state เลย | มี object เพิ่มอีกตัวที่ต้อง tune; ตั้งงบน้อยเกินไปก็แค่ย้าย restart-loop จาก "เสมอ" เป็น "บางครั้ง" ตอนโหลดสูง |
+| `timeoutSeconds` สั้น (default 1s) | ตรวจจับ process ที่ค้างจริงได้เร็ว | พิสูจน์เป็น gotcha ที่มีเอกสารรองรับด้านบน: การเช็คที่ช้าแต่ healthy จริง ๆ (DB ping, TLS handshake) อาจถูกอ่านผิดว่าพัง |
+| `readinessGates` | ให้ controller ภายนอก (Gateway, service mesh) veto readiness ได้เกินกว่า probe ของ container เอง | มีชิ้นส่วนเคลื่อนไหวเพิ่ม; controller ภายนอกที่ค้างอาจกัน Pod ที่ healthy จริงไม่ให้ Ready ได้ไม่รู้จบ |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"การใช้ endpoint สุขภาพเดียวกันสำหรับ liveness กับ readiness เป็นการลดความซับซ้อนที่ไม่เป็นอันตราย"** พิสูจน์แล้วด้านบนด้วย restart count และ event จริง: มัน restart-loop container ที่ปัญหาเดียวคือแค่ start ช้า เพราะ restart แก้ "ยังไม่ warm-up" ไม่ได้ แค่รีเซ็ตนาฬิกา
+- **"startup probe ก็แค่ initialDelaySeconds ที่ยาวขึ้นบน liveness probe"** พิสูจน์แล้วด้านบน: startup probe ปิด liveness/readiness เต็ม ๆ จนกว่ามันจะผ่าน พร้อมงบ `failureThreshold x periodSeconds` ของตัวเอง — `initialDelaySeconds` ที่ยาวอย่างเดียวยังทิ้ง delay คงที่เดิมไว้ให้ liveness check ทุกครั้งถัดไป และไม่หดตัวเองแม้ container จะ up แล้วจริง ๆ
+- **"container ที่พัง liveness probe ถูกฆ่าทันที"** พิสูจน์ผ่านการอ้างอิงกลับไปที่บท Pods: การ restart ที่ probe สั่งยังผ่าน `terminationGracePeriodSeconds` และ `preStop` hook — sequence การปิดตัวแบบเดียวกับการ terminate Pod แบบอื่นทุกประการ
+- **"`timeoutSeconds` default ก็นานพอสำหรับการเช็คส่วนใหญ่แล้ว"** default มันแค่ `1` วินาที — การเช็คที่ทำงานจริง (DB query, TLS handshake) เกินเวลานี้ได้ง่ายมากภายใต้โหลดใด ๆ ทำให้เกิด false failure ที่หน้าตาเหมือน container พังจริงเป๊ะ
+- **"readiness probe กับ readinessGates ทำหน้าที่เดียวกัน"** `readinessProbe` คือความเห็นของ container เอง `readinessGates` ให้ controller แยกต่างหากเพิ่ม condition ของตัวเองที่ต้องเป็น `True` ด้วย — Pod ผ่าน readiness probe ของตัวเองได้ แต่ยังถูก readiness gate กันไม่ให้ `Ready` อยู่ดี
+
+## อ่านโค้ดที่ AI เขียน
+
+ตอน review Pod spec หรือ Deployment ที่มี probe ซึ่ง AI สร้าง ให้เช็ค
+
+- `path`/`port` เดียวกันเป๊ะสำหรับทั้ง `livenessProbe` และ `readinessProbe` — พิสูจน์แล้วด้านบน มัน restart-loop container ที่มี warm-up จริง ควรเช็คคนละเรื่องกัน (หรืออย่างน้อย liveness ต้องอดทนกว่า readiness มาก)
+- container ที่ start ช้าไม่มี `startupProbe` เลย พึ่งแค่ `initialDelaySeconds` ใหญ่ ๆ บน liveness probe — พิสูจน์แล้วด้านบน `failureThreshold x periodSeconds` บน `startupProbe` เฉพาะคือกลไกที่ออกแบบมาสำหรับเรื่องนี้จริง ๆ และปิด liveness/readiness ไปเลยจนกว่า boot จะเสร็จ
+- ไม่ตั้ง `timeoutSeconds` บน probe ที่ทำงานจริง (DB ping, เรียก upstream) — default 1 วินาทีเกินได้ง่ายมาก ทำให้เกิด false failure ที่แยกไม่ออกจาก outage จริง
+- สมมติว่า probe ฆ่า container ทันที โดยไม่คิดถึง `terminationGracePeriodSeconds`/`preStop` ตอนคำนวณ capacity หรือ timing ของ rollout — พิสูจน์แล้วด้านบน restart ที่ probe สั่งผ่าน sequence graceful-shutdown เดียวกับการ terminate แบบอื่นทุกประการ
+- `readinessProbe` ที่ตั้ง `failureThreshold` ต่ำมาก (เช่น `1`) คู่กับการเช็ค dependency ที่ flaky หรือช้า — ปัญหาชั่วคราวครั้งเดียวดึง Pod ออกจาก Endpoints ทันที ซึ่งอาจจะรุนแรงเกินไปขึ้นอยู่กับว่า dependency นั้น flaky แค่ไหนจริง ๆ
+
+<SpotTheBug code={`# k8s/probes-liveness-readiness-startup/slow-app.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: slow-app
+spec:
+  containers:
+    - name: web
+      image: web-app:2.1.0
+      ports:
+        - containerPort: 8080
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        periodSeconds: 5
+        failureThreshold: 3
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        periodSeconds: 5
+        failureThreshold: 3`}>
+probe ทั้งสองชี้ไปที่ `/health` เหมือนกันเป๊ะ โดยไม่มี `startupProbe` เลย พิสูจน์แล้วด้านบนด้วยรูปร่างเดียวกันเป๊ะ (`slow-warmer-bad`): ถ้า container นี้ใช้เวลาจริงกว่าจะ warm-up liveness probe จะฆ่ามันก่อนที่มันจะ start เสร็จ event จริง `Liveness probe failed` ตามด้วย `Killing` และ `RESTARTS` ไต่ขึ้นไม่รู้จบเพราะทุก restart รีเซ็ตนาฬิกา warm-up กลับไปที่ศูนย์ วิธีแก้ พิสูจน์แล้วด้านบนเช่นกัน (`slow-warmer-fixed`): เพิ่ม `startupProbe` ที่ขนาดตรงกับเวลา boot จริง (`failureThreshold x periodSeconds` >= เวลา startup ที่แย่ที่สุด) และควรให้ `/health` กับ readiness มีความหมายต่างกันจริง ๆ แทนที่จะใช้ endpoint เดียวกันร่วมกัน
+</SpotTheBug>
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**Liveness probe** fail แล้ว container จะถูก **restart** **Readiness probe** fail แล้ว Pod จะถูก **เอาออกจาก Endpoints ของ Service** โดยไม่แตะ container เลย **Startup probe** กั้น liveness กับ readiness ไว้จนกว่า container ที่ boot ช้าจะ start เสร็จ probe เลือกใช้ **httpGet**, **tcpSocket**, **exec**, หรือ **grpc** ได้ ปรับจูนด้วย `initialDelaySeconds`, `periodSeconds`, `timeoutSeconds`, `failureThreshold`, และ `successThreshold` การไม่ใส่ readiness probe แปลว่า traffic จะเข้าถึง container ทันทีที่ start ซึ่งเป็นสาเหตุยอดฮิตของ error หลัง rollout
+**liveness probe** ที่พังทำให้ container ถูก **restart** (ผ่าน sequence `terminationGracePeriodSeconds`/`preStop` เดียวกับการ terminate แบบอื่น); **readiness probe** ที่พังทำให้ Pod ถูก **เอาออกจาก Endpoints ของ Service** โดยไม่แตะ container เลย; **startup probe** กั้นทั้ง liveness และ readiness ไว้ — ได้นานสุด `failureThreshold x periodSeconds` — จนกว่า container ที่ boot ช้าจะ start เสร็จ พิสูจน์แล้วด้านบนด้วย cluster จริง: การชี้ liveness กับ readiness ไปที่ endpoint เดียวกันโดยไม่มี startup probe ทำให้ container ที่แค่ต้องการเวลา warm-up เข้าสู่ restart loop (`RESTARTS` ไต่ขึ้น, event `Liveness probe failed` จริง) ในขณะที่การเพิ่ม `startupProbe` ที่ขนาดถูกต้องแก้ได้สะอาด ๆ (`RESTARTS: 0`) probe ใช้ **httpGet**, **tcpSocket**, **exec**, หรือ **grpc** (GA ตั้งแต่ **1.27**) ได้ ปรับด้วย `initialDelaySeconds`, `periodSeconds` (default `10`), `timeoutSeconds` (default แค่ `1`s — gotcha ที่พบบ่อย), `failureThreshold`, และ `successThreshold` **`readinessGates`** ขยาย readiness ด้วย condition ของ controller ภายนอก นอกเหนือจาก probe ของ container เอง
 </Callout>
 
 export const quizProbes = [
   {
-    q: 'เกิดอะไรขึ้นเมื่อ liveness probe fail ติดต่อกันจนเกิน failureThreshold',
+    q: 'จะเกิดอะไรขึ้นเมื่อ liveness probe พังติดกันเกิน failureThreshold',
     options: [
       'Pod ถูกเอาออกจาก Service Endpoints เท่านั้น',
-      'ไม่มีอะไรเกิดขึ้น liveness probe เป็นแค่ข้อมูลอ้างอิง',
-      'kubelet restart container โดยขึ้นอยู่กับ restartPolicy',
-      'ทั้ง Pod ถูกลบทิ้งและไม่ถูกสร้างขึ้นมาใหม่อีกเลย',
+      'ไม่มีอะไรเกิดขึ้น liveness probe เป็นแค่ข้อมูล',
+      'kubelet restart container ตาม restartPolicy และ terminationGracePeriodSeconds',
+      'Pod ทั้งตัวถูกลบและไม่ถูกสร้างใหม่อีกเลย',
     ],
     answer: 2,
+    explain: 'restart ที่ probe สั่งยังผ่าน sequence SIGTERM -> grace -> SIGKILL เดียวกับการ terminate container แบบอื่น พิสูจน์ผ่านการอ้างอิงกลับไปที่บท Pods',
   },
   {
-    q: 'เกิดอะไรขึ้นเมื่อ readiness probe fail',
+    q: '```text\n$ kubectl get pod slow-warmer-bad\nNAME              READY   STATUS    RESTARTS      AGE\nslow-warmer-bad   0/1     Running   2 (20s ago)   110s\n\nWarning  Unhealthy  Liveness probe failed: ... connection refused\n```\nPod นี้มี liveness กับ readiness probe เหมือนกันเป๊ะและไม่มี startupProbe บน container ที่ใช้เวลา 30 วินาทีกว่าจะเริ่ม listen ทำไม RESTARTS ถึงไต่ขึ้นเรื่อย ๆ',
     options: [
-      'container ถูก restart ทันที',
-      'Pod ถูกเอาออกจาก Endpoints หรือ EndpointSlice ของ Service ทำให้ traffic หยุดส่งมา แต่ container ยังรันต่อไป',
-      'Node ถูก cordon',
-      'startup probe ถูกเรียกให้ทำงานอีกครั้ง',
+      'container มี bug ของ application จริง ทำให้ crash ซ้ำ ๆ',
+      'liveness probe ฆ่า container ก่อนที่ warm-up 30 วินาทีจะเสร็จทุกครั้ง เพราะการ restart รีเซ็ตนาฬิกา warm-up กลับไปที่ศูนย์',
+      'Node ทรัพยากรไม่พอ',
+      'readiness probe ที่พังก็ trigger การ restart ด้วยเสมอ',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: นี่คือ restart loop ที่เกิดจากตัวเอง — container ยัง healthy และจะสำเร็จถ้าแค่ให้เวลาต่อเนื่องพอ ซึ่งเป็นสิ่งที่ startupProbe ให้ได้พอดี',
   },
   {
-    q: 'startup probe มีไว้เพื่ออะไร',
+    q: '```text\n$ kubectl get pod slow-warmer-fixed\nNAME                READY   STATUS    RESTARTS   AGE\nslow-warmer-fixed   1/1     Running   0          50s\n```\nนี่คือ container กับ warm-up 30 วินาทีเดียวกันเป๊ะกับ slow-warmer-bad แต่ตอนนี้เพิ่ม startupProbe periodSeconds: 10, failureThreshold: 6 เข้าไป ทำไมมันถึงรอดโดยไม่มี restart เลย',
     options: [
-      'มาแทนที่ readiness probe ไปเลย',
-      'ให้เวลา container ที่ start ช้าได้ boot จนเสร็จ ด้วยการปิด liveness กับ readiness ไว้จนกว่าจะผ่าน',
-      'เช็คพื้นที่ disk ก่อน container จะ start',
-      'restart container ตามตารางเวลาที่กำหนดไว้',
+      'image ของ container ถูกเปลี่ยนให้ start เร็วขึ้น',
+      'startupProbe ปิด liveness/readiness จนกว่ามันจะสำเร็จ ทำให้มีเวลาถึง 6 x 10 = 60 วินาที — มากกว่า 30 วินาทีที่ต้องการจริงสบาย ๆ ก่อนที่ liveness จะเริ่มเช็คด้วยซ้ำ',
+      'failureThreshold: 6 ทำให้ liveness probe เองอดทนขึ้น',
+      'readiness probe ไม่รันบน Pod ที่เพิ่งสร้างใหม่',
     ],
     answer: 1,
+    explain: 'พิสูจน์แล้วด้านบน: งบของ startupProbe (failureThreshold x periodSeconds) กั้น liveness กับ readiness เต็ม ๆ จนกว่ามันจะสำเร็จครั้งหนึ่ง',
   },
   {
-    q: 'ความเสี่ยงในทางปฏิบัติของการรัน Pod โดยไม่ใส่ readiness probe เลยคืออะไร',
+    q: 'ค่า default ของ timeoutSeconds สำหรับ probe ใด ๆ คือเท่าไหร่ และทำไมมันถึงเป็น gotcha ที่พบบ่อย',
     options: [
-      'Pod จะไม่มีวัน start ได้เลย',
-      'liveness probe จะถูกปิดไปโดยอัตโนมัติ',
-      'Kubernetes จะถือว่า container พร้อมทันทีที่ start ทำให้ traffic จริงเข้าถึง container ก่อนที่แอปข้างในจะพร้อมจริง โดยเฉพาะช่วง rollout',
-      'Pod จะถูก schedule ไปที่โหนดแบบสุ่ม',
+      '30 วินาที แทบไม่เคยเป็นปัญหา',
+      '1 วินาที — การเช็คที่ทำงานจริงอย่าง DB query หรือ TLS handshake เกินเวลานี้ได้ง่ายมาก ทำให้เกิด false failure',
+      '0 วินาที หมายความว่า probe ไม่มีวัน timeout',
+      '10 วินาที ตรงกับ default ของ periodSeconds',
     ],
-    answer: 2,
+    answer: 1,
+    explain: 'default 1 วินาทีน้อยเกินไปสำหรับอะไรที่เกินกว่า handler ธรรมดา ๆ และการ timeout ก็หน้าตาเหมือน failure จริงเป๊ะจากมุมมองของ kubelet',
+  },
+  {
+    q: 'field grpc probe เป็น GA ตั้งแต่ version ไหน ตามเอกสาร Kubernetes',
+    options: [
+      '1.18',
+      '1.27',
+      '1.30',
+      'ยังเป็น alpha อยู่ ณ 1.37',
+    ],
+    answer: 1,
+    explain: 'ตาม kubernetes.io/docs/concepts/workloads/pods/probes/ กลไก grpc probe stable/GA มาตั้งแต่ Kubernetes 1.27',
+  },
+  {
+    q: 'readinessGates เพิ่มอะไรให้เกินกว่า readinessProbe ของ container เอง',
+    options: [
+      'ไม่มีอะไรเลย มันเป็นชื่อเก่าที่ deprecated ของ readinessProbe',
+      'condition ที่ระบุชื่อไว้ ตั้งโดย controller ภายนอก ที่ต้องเป็น True ใน status.conditions ของ Pod ด้วย ก่อนที่ Pod จะนับว่า Ready',
+      'HTTP health check ที่สองซ้ำซ้อนกันบน port อื่น',
+      'ข้อบังคับว่าต้องตั้ง startupProbe ด้วยเสมอ',
+    ],
+    answer: 1,
+    explain: 'readinessGates ให้ controller ที่อยู่นอก container (เช่น Gateway หรือ mesh) veto หรือยืนยัน readiness ได้อย่างอิสระจากผลของ probe ของ container เอง',
   },
 ];
 
