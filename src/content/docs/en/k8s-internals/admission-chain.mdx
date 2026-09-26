@@ -1,0 +1,262 @@
+---
+title: 'Admission Chain'
+description: 'The real, source-proven order mutating webhooks, schema validation, validating webhooks, and ValidatingAdmissionPolicy actually run in -- straight from the API server''s own request handler and its compiled-in plugin order, with a real dry-run=server rejection.'
+sidebar:
+  order: 4
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## The idea in one sentence
+
+Admission is two separate, sequential phases -- **all mutating plugins run and finish completely**, then **schema/strategy validation** runs, then **all validating plugins run and finish completely** -- and within each phase, a fixed, compiled-in order (not registration order, not webhook-config order) decides which plugin runs before which.
+
+## The real per-request order, from `create.go`
+
+`staging/src/k8s.io/apiserver/pkg/endpoints/handlers/create.go` is the actual HTTP handler for a `CREATE` request (the same code path `kubectl apply` -- client-side or server-side -- ultimately goes through). Its real sequence, in the order the source executes it:
+
+```go
+// staging/src/k8s.io/apiserver/pkg/endpoints/handlers/create.go, v1.37.0
+obj, gvk, err := decoder.Decode(body, &defaultGVK, original)      // 1. decode the request body
+
+// ... later, inside FinishRequest:
+if mutatingAdmission, ok := admit.(admission.MutationInterface); ok && mutatingAdmission.Handles(admission.Create) {
+    if err := mutatingAdmission.Admit(ctx, admissionAttributes, scope); err != nil {  // 2. ALL mutating admission
+        return nil, err
+    }
+}
+result, err := requestFunc()   // 3. calls Store.Create -> BeforeCreate (schema/strategy validation)
+                                //    -> createValidatingAdmission callback (4. ALL validating admission)
+                                //    -> 5. write to etcd
+```
+
+Step 2's `mutatingAdmission` and step 4's validating callback are each a **`chainAdmissionHandler`** -- a plain `[]Interface` that runs every handler in the slice, in slice order, stopping on first error:
+
+```go
+// staging/src/k8s.io/apiserver/pkg/admission/chain.go, v1.37.0
+type chainAdmissionHandler []Interface
+
+func (admissionHandler chainAdmissionHandler) Admit(ctx context.Context, a Attributes, o ObjectInterfaces) error {
+	for _, handler := range admissionHandler {
+		if !handler.Handles(a.GetOperation()) {
+			continue
+		}
+		if mutator, ok := handler.(MutationInterface); ok {
+			if err := mutator.Admit(ctx, a, o); err != nil {
+				return err  // stops the whole chain on first error
+			}
+		}
+	}
+	return nil
+}
+// Validate() is the identical loop, calling ValidationInterface.Validate instead
+```
+
+The same generic chain type runs both the mutating slice and the validating slice -- the *phase separation* comes entirely from `create.go` calling `.Admit()` once (step 2) and the validating callback (step 4) at a later, distinct point, never from any difference in the chain mechanism itself.
+
+<Mermaid title="The real two-phase admission order for one CREATE request" code={admissionOrderDiagram} />
+
+export const admissionOrderDiagram = `flowchart TD
+  decode["1. Decode request body"] --> mutate["2. ALL mutating admission (chainAdmissionHandler.Admit)\\nin-tree plugins -> MutatingAdmissionPolicy -> MutatingAdmissionWebhook"]
+  mutate --> schema["3. Schema + strategy validation (BeforeCreate)"]
+  schema --> validate["4. ALL validating admission (chainAdmissionHandler.Validate)\\nin-tree plugins -> ValidatingAdmissionPolicy -> ValidatingAdmissionWebhook -> ResourceQuota"]
+  validate --> etcd["5. Write to etcd"]`;
+
+## What decides the order *within* each phase
+
+`pkg/kubeapiserver/options/plugins.go`'s `AllOrderedPlugins` is the real, compiled-in slice the API server builds its two chains from -- **this array's order is the order**, regardless of what order webhooks were registered in or what order `--enable-admission-plugins` lists them:
+
+```go
+// pkg/kubeapiserver/options/plugins.go, v1.37.0 -- tail of AllOrderedPlugins
+// ... ~30 in-tree plugins earlier (NamespaceLifecycle, LimitRanger, ServiceAccount,
+// NodeRestriction, PodSecurity, Priority, ResourceQuota is NOT here -- see below, ...)
+
+// new admission plugins should generally be inserted above here
+// webhook, resourcequota, and deny plugins must go at the end
+
+mutatingadmissionpolicy.PluginName,   // MutatingAdmissionPolicy
+mutatingwebhook.PluginName,           // MutatingAdmissionWebhook
+validatingadmissionpolicy.PluginName, // ValidatingAdmissionPolicy
+validatingwebhook.PluginName,         // ValidatingAdmissionWebhook
+resourcequota.PluginName,             // ResourceQuota
+deny.PluginName,                      // AlwaysDeny
+```
+
+The comment at that exact spot in the real source (`// webhook, resourcequota, and deny plugins must go at the end`) is the API server's own developers documenting this as deliberate: every in-tree plugin (`NamespaceLifecycle`, `PodSecurity`, `LimitRanger`, and the rest) runs *before* `MutatingAdmissionPolicy`, which runs before `MutatingAdmissionWebhook` -- and on the validating side, `ValidatingAdmissionPolicy` runs before `ValidatingAdmissionWebhook`, which runs before `ResourceQuota`. `chainAdmissionHandler` splits this one ordered array into whichever plugins implement `MutationInterface` (the mutating chain) and whichever implement `ValidationInterface` (the validating chain, run separately, later) -- some plugins, like `PodSecurity`, implement both and appear in both chains at the position `AllOrderedPlugins` gives them.
+
+The plugins actually active on this course's `kind` cluster, read directly from the live `kube-apiserver` Pod spec (everything else is the compiled-in default set; `kind`/`kubeadm` add exactly one flag on top of it):
+
+```text
+$ kubectl -n kube-system get pod -l component=kube-apiserver -o jsonpath='{.items[0].spec.containers[0].command}'
+["kube-apiserver", ..., "--enable-admission-plugins=NodeRestriction", ...]
+```
+
+`NodeRestriction` is off by default upstream (`DefaultOffAdmissionPlugins()` in the same file computes the off-set as `AllOrderedPlugins` minus a fixed default-on set that does **not** include `NodeRestriction`) -- `kind`, like `kubeadm`-based clusters generally, explicitly re-enables it for the real security reason the [docs](https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#noderestriction) state: without it, a compromised kubelet credential could modify Node objects and Pods on nodes it does not own.
+
+## `ValidatingAdmissionPolicy`: proven in-process, no webhook hop
+
+[Pod and Cluster Security](/kubernetes/en/observability-and-security/pod-and-cluster-security/) already proved a `ValidatingAdmissionPolicy` rejecting a request with a real, live API-server error -- that proof stands as this lesson's own `ValidatingAdmissionPolicy` evidence rather than re-deriving it:
+
+```text
+$ kubectl apply -f bad-image-pod.yaml   # image: nginx:alpine
+The pods "bad-image" is invalid: : ValidatingAdmissionPolicy 'registry-allowlist' with binding 'registry-allowlist-binding' denied request: container images must come from registry.example.com
+```
+
+The evaluation itself happens inside `staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/dispatcher.go`'s `Dispatch()` (line 72 in this course's pinned source) -- CEL runs directly against the decoded object in the API server's own process, under a real cost budget (`celconfig.RuntimeCELCostBudget`, referenced at line 221), which is exactly why the docs describe it as "no webhook, no extra network hop": there is no second process anywhere in this path, just one more entry executed inside the same `chainAdmissionHandler.Validate()` loop shown above.
+
+## `MutatingAdmissionPolicy`: same model, mutating phase
+
+Also already proven, in the same lesson -- `MutatingAdmissionPolicy` (stable since **v1.36**, enabled by default) sits in the *mutating* phase, before `MutatingAdmissionWebhook`, per `AllOrderedPlugins` above:
+
+```text
+$ kubectl apply -f map-demo.yaml
+mutatingadmissionpolicy.admissionregistration.k8s.io/add-default-label created
+$ kubectl apply -f map-target-pod.yaml
+pod/map-target created
+$ kubectl get pod map-target -n sec-demo -o jsonpath='{.metadata.labels}'
+{"managed-by":"platform-team"}
+```
+
+A label the manifest never set, injected purely by admission -- proof that `MutatingAdmissionPolicy` really does patch the object during the mutating phase, the same job a mutating webhook does, before schema validation or any validating plugin ever sees the object.
+
+## `--dry-run=server` runs the real, entire chain
+
+`--dry-run=server` (as opposed to `--dry-run=client`, which never contacts the API server at all) sends the real request through this exact pipeline -- decode, mutating admission, schema validation, validating admission -- and only skips the final etcd write:
+
+```text
+$ kubectl apply -f good-image-pod.yaml --dry-run=server
+pod/good-image created (server dry run)
+```
+
+That `(server dry run)` suffix on an otherwise ordinary success message is the tell: every admission plugin that would run for a real create already ran (and, in this case, already agreed the object was acceptable) -- this is exactly why `--dry-run=server` catches a `ValidatingAdmissionPolicy` rejection, a webhook rejection, or a schema error that `--dry-run=client` (pure local OpenAPI schema check, no admission at all) cannot.
+
+## Kyverno and Gatekeeper: webhooks, by design
+
+Both engines run as an actual admission **webhook** -- an HTTP call out of the API server process, registered as a `MutatingWebhookConfiguration`/`ValidatingWebhookConfiguration` object, which is why they sit at the `MutatingAdmissionWebhook`/`ValidatingAdmissionWebhook` position in `AllOrderedPlugins` above, strictly after any in-tree plugin and after `MutatingAdmissionPolicy`/`ValidatingAdmissionPolicy`:
+
+- **[Kyverno](https://kyverno.io/docs/introduction/)** -- Kubernetes-native YAML policies (with CEL support too), plus mutation, resource generation, background scanning, and image verification the built-in policies do not cover.
+- **[OPA Gatekeeper](https://open-policy-agent.github.io/gatekeeper/website/docs/)** -- CRD-based `ConstraintTemplate`s in Rego, and (per its own docs) able to integrate directly with `ValidatingAdmissionPolicy` rather than replace it.
+
+The concrete cost of "webhook, not in-process CEL" is exactly the network hop `ValidatingAdmissionPolicy`'s docs contrast themselves against -- a webhook call is a real HTTP request off-process, with its own timeout and its own `failurePolicy: Fail`/`Ignore` behavior on that call failing, not just on the policy itself failing.
+
+## Audit logging: every admission decision is a record
+
+The API server's audit log (configured via `--audit-policy-file` and `--audit-log-path`) records every stage a request passed through, including which admission plugin (if any) mutated or rejected it -- `publishValidationFailureAnnotations` (`vap-validator.go`-adjacent `dispatcher.go`, line 327) is the exact function that attaches a `ValidatingAdmissionPolicy` rejection's detail as an audit annotation on the request, so a denied request is not just an error returned to the caller, it is a durable, queryable record naming the exact policy and binding that denied it -- the same two names (`registry-allowlist`, `registry-allowlist-binding`) visible in the plain error text above.
+
+## Mental Model
+
+One request goes through admission exactly twice, never once and never interleaved: once as a **mutating pass** (every mutating-capable plugin from `AllOrderedPlugins`, in that fixed order, each one allowed to change the object the next one sees), then, after the object has already been schema-and-strategy-validated, once as a **validating pass** (every validating-capable plugin, same fixed order, none of which may change the object anymore, only accept or reject it). `ValidatingAdmissionPolicy`/`MutatingAdmissionPolicy` are not a third category bolted on beside webhooks -- they are ordinary entries in the exact same ordered array, evaluated in-process; Kyverno/Gatekeeper occupy the webhook slots in that same array, out-of-process. `--dry-run=server` is not a separate, lighter-weight validation mode -- it is this entire pipeline, for real, minus the final write.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| `ValidatingAdmissionPolicy`/`MutatingAdmissionPolicy` (CEL, in-process) | No network hop, no extra deployment, real cost-budgeted CEL (proven above) | CEL is less expressive than a general-purpose policy language; no external data lookups mid-evaluation |
+| Kyverno/Gatekeeper (webhook-based) | Richer policy authoring, mutation + generation + background scan (Kyverno), CRD-native constraints (Gatekeeper) | A real network hop per admission call, with its own `failurePolicy`/timeout to reason about, strictly after any in-tree or Policy-based check |
+| `--dry-run=server` before every apply | Catches admission rejections and schema errors before they happen for real (proven above) | Still a real round trip through the whole pipeline -- slower than `--dry-run=client`, and still needs cluster access |
+
+## Common Misconceptions
+
+- **"All webhooks and admission plugins run in one interleaved pool, in registration order."** Proven above from `create.go` and `AllOrderedPlugins`: two strictly separate phases (mutating, then validating), each in one fixed, compiled-in order that has nothing to do with when a webhook was registered.
+- **"`ValidatingAdmissionPolicy` is a webhook under the hood, just a managed one."** Proven above from `dispatcher.go`: CEL evaluates directly inside the API server process against the decoded object -- there is no HTTP call, no separate server, no network hop at all.
+- **"`--dry-run=server` only checks the OpenAPI schema, like `--dry-run=client` but against the live version."** Proven above: it runs the real, full admission chain -- mutating and validating -- and would surface the exact `ValidatingAdmissionPolicy`/webhook rejection a real apply would.
+- **"`MutatingAdmissionPolicy` is still alpha/experimental."** Per the [docs](https://kubernetes.io/docs/reference/access-authn-authz/mutating-admission-policy/) cited above and proven in the linked lesson: stable since v1.36, enabled by default with no feature gate to flip.
+
+## Reading AI-generated code
+
+When reviewing generated admission configuration, a script assuming a particular admission order, or a claim about `--dry-run`, check for:
+
+- An assumption that a mutating webhook can see or react to a validating webhook's rejection (or vice versa) -- proven above, the two phases are sequential and separate; nothing in the mutating phase ever observes the validating phase's outcome, because it hasn't run yet.
+- `--dry-run=client` used where the actual goal is "would this be rejected by our `ValidatingAdmissionPolicy`/webhook" -- proven above, only `--dry-run=server` actually runs admission at all.
+- A `ValidatingAdmissionPolicy`/`MutatingAdmissionPolicy` YAML with no `matchConstraints.resourceRules` or an overly broad one, assumed to be "scoped by the binding alone" -- the policy's own `matchConstraints` and the binding's `matchResources` are both real, independently-enforced filters (the finished lesson's own `matchConditions` example shows a second, CEL-level filter layered on top of both).
+- Code or a runbook claiming Kyverno/Gatekeeper decisions happen "before" in-tree admission plugins -- proven above from `AllOrderedPlugins`, webhook plugins are explicitly ordered last within their phase, by a comment in the API server's own source.
+- A generated `reinvocationPolicy`-less `MutatingAdmissionPolicy` -- the linked lesson already proved the API server rejects this outright (`spec.reinvocationPolicy: Required value`) rather than defaulting it silently.
+
+<SpotTheBug code={`# A comment a teammate added above a webhook config
+# "This webhook runs first, before any of our ValidatingAdmissionPolicy
+# checks, so it's the best place to reject requests early."
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: reject-early
+webhooks:
+  - name: reject-early.example.com
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]`}>
+The comment is backwards. Proven above straight from the real, compiled-in `AllOrderedPlugins` order: within the validating phase, `ValidatingAdmissionPolicy` is ordered **before** `ValidatingAdmissionWebhook` — the exact opposite of "runs first." A `ValidatingAdmissionPolicy` already bound in this namespace gets to reject a request before this webhook is ever called, not after. This matters in practice: a webhook written to "reject early" to save a policy evaluation is optimizing for something the real order does not grant it, and a request rejected by a `ValidatingAdmissionPolicy` first means this webhook's own logic (and any side effects it has, despite `sideEffects: None` here) simply never runs for that request at all.
+</SpotTheBug>
+
+<Callout title="The one-line takeaway">
+Admission is exactly two phases, proven above straight from `create.go`: **all** mutating admission runs and finishes (in the fixed order `AllOrderedPlugins` gives every in-tree plugin, then `MutatingAdmissionPolicy`, then `MutatingAdmissionWebhook`), then schema/strategy validation runs, then **all** validating admission runs and finishes (in-tree, then `ValidatingAdmissionPolicy`, then `ValidatingAdmissionWebhook`, then `ResourceQuota`) — never interleaved, never in webhook-registration order. `ValidatingAdmissionPolicy`/`MutatingAdmissionPolicy` evaluate CEL **in-process**, no network hop (proven above with a real rejection and a real injected label), while Kyverno/Gatekeeper occupy the webhook slots in that same fixed order, out-of-process. `--dry-run=server` (proven above with a real `(server dry run)` success and, in the linked lesson, a real rejection) runs this entire chain for real, only skipping the final etcd write — the one reliable way to know a manifest will pass every admission check before it actually does.
+</Callout>
+
+export const quizAdmissionChain = [
+  {
+    q: '```go\n// staging/src/k8s.io/apiserver/pkg/endpoints/handlers/create.go, v1.37.0\nif mutatingAdmission, ok := admit.(admission.MutationInterface); ok && mutatingAdmission.Handles(admission.Create) {\n  if err := mutatingAdmission.Admit(ctx, admissionAttributes, scope); err != nil {\n    return nil, err\n  }\n}\nresult, err := requestFunc() // BeforeCreate validation, then validating admission callback, then storage\n```\nWhat does this real source prove about the relationship between mutating and validating admission?',
+    options: [
+      'They run interleaved, one plugin at a time regardless of type',
+      'All mutating admission completes first; only afterward does schema/strategy validation run, followed by all validating admission',
+      'Validating admission always runs before mutating admission',
+      'Mutating admission only runs for UPDATE requests, never CREATE',
+    ],
+    answer: 1,
+    explain: 'Proven above: mutatingAdmission.Admit runs directly in createHandler; requestFunc() (called after) is what eventually triggers schema validation and then the validating admission callback -- two sequential, non-interleaved phases.',
+  },
+  {
+    q: '```go\n// pkg/kubeapiserver/options/plugins.go, v1.37.0\n// webhook, resourcequota, and deny plugins must go at the end\nmutatingadmissionpolicy.PluginName,   // MutatingAdmissionPolicy\nmutatingwebhook.PluginName,           // MutatingAdmissionWebhook\nvalidatingadmissionpolicy.PluginName, // ValidatingAdmissionPolicy\nvalidatingwebhook.PluginName,         // ValidatingAdmissionWebhook\nresourcequota.PluginName,             // ResourceQuota\n```\nWhat determines the order plugins run in within one admission phase?',
+    options: [
+      'The order webhooks were registered in the cluster',
+      'This fixed, compiled-in array, AllOrderedPlugins -- MutatingAdmissionPolicy always before MutatingAdmissionWebhook, ValidatingAdmissionPolicy always before ValidatingAdmissionWebhook',
+      'Alphabetical order of plugin names',
+      'Whichever plugin has the lowest resource usage runs first',
+    ],
+    answer: 1,
+    explain: 'Proven above: chainAdmissionHandler runs a plain slice in slice order, and AllOrderedPlugins is that slice -- a real comment in the source states webhook/resourcequota/deny plugins go at the end deliberately.',
+  },
+  {
+    q: '```text\n$ kubectl apply -f bad-image-pod.yaml   # image: nginx:alpine\nThe pods "bad-image" is invalid: : ValidatingAdmissionPolicy \'registry-allowlist\' with binding \'registry-allowlist-binding\' denied request: container images must come from registry.example.com\n```\nWhere does this CEL evaluation actually happen?',
+    options: [
+      'In a separate webhook process the API server calls over HTTP',
+      'Directly inside the API server\'s own process, via dispatcher.go\'s Dispatch(), under a real CEL cost budget -- no network hop',
+      'On the client side, inside kubectl itself, before the request is even sent',
+      'Inside etcd, as a stored procedure',
+    ],
+    answer: 1,
+    explain: 'Proven above from dispatcher.go: CEL runs in-process against the decoded object, which is exactly why the docs describe ValidatingAdmissionPolicy as having no webhook, no extra network hop.',
+  },
+  {
+    q: 'What does `kubectl apply --dry-run=server` actually run that `--dry-run=client` does not?',
+    options: [
+      'Nothing different; both only check the OpenAPI schema locally',
+      'The entire real admission chain -- mutating admission, schema/strategy validation, and validating admission -- skipping only the final etcd write',
+      'Only the validating admission phase, skipping mutating admission entirely',
+      'A completely separate, lightweight simulated pipeline that does not touch real plugins',
+    ],
+    answer: 1,
+    explain: 'Proven above: a real (server dry run) success message and, in the linked lesson, a real ValidatingAdmissionPolicy rejection under --dry-run=server -- the whole pipeline runs for real except the final write.',
+  },
+  {
+    q: 'Where do Kyverno and OPA Gatekeeper sit in the real, ordered admission chain?',
+    options: [
+      'Before all in-tree admission plugins, since they are third-party',
+      'At the MutatingAdmissionWebhook/ValidatingAdmissionWebhook position in AllOrderedPlugins -- after in-tree plugins and after MutatingAdmissionPolicy/ValidatingAdmissionPolicy in their respective phase',
+      'They replace the entire admission chain and run instead of it',
+      'Only during validating admission, never during mutation, regardless of what they are configured to do',
+    ],
+    answer: 1,
+    explain: 'Proven above: both run as an actual admission webhook, occupying the webhook plugin slot AllOrderedPlugins places strictly after in-tree plugins and after the Policy-based plugins in each phase.',
+  },
+];
+
+<Quiz client:visible id="k8s-internals/admission-chain" questions={quizAdmissionChain} />
+
+<ProgressTracker client:visible id="k8s-internals/admission-chain" />

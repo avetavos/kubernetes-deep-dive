@@ -1,0 +1,147 @@
+---
+title: 'Kubernetes ทำงานอย่างไร'
+description: 'เส้นทาง request ของ API server กับ etcd watch, pattern informer/workqueue ของ client-go, scheduler framework, admission chain และภายในของ Server-Side Apply — กลไกที่ทำให้คุณตัดสินโค้ด Kubernetes หรือ controller ที่ไม่คุ้นเคย (รวมถึงที่ AI เขียน) ได้จริง ไม่ใช่แค่ apply manifest เป็น'
+sidebar:
+  order: 0
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## โมดูลนี้มีไว้ทำอะไร
+
+ทุก module ก่อนหน้าในคอร์สนี้สอนให้คุณ **ใช้** Kubernetes เป็น เขียน manifest, `apply` ด้วย `kubectl`, อ่าน status กลับมา, scale, scheduling, security, storage และ ship ด้วย Helm/GitOps ไม่มีตอนไหนต้องรู้ว่า API server ทำอะไรกับ request จริง ๆ ระหว่างตอนที่คุณพิมพ์ `kubectl apply` กับตอนที่ object มีอยู่จริง, controller รู้ได้อย่างไรว่ามีอะไรเปลี่ยน, `kube-scheduler` plugin ที่คุณเห็นชื่อ extension point มาแล้วคืออะไรกันแน่ในเชิงโค้ด, mutating webhook กับ `ValidatingAdmissionPolicy` รันตามลำดับไหนจริง ๆ หรือ `managedFields` เก็บอะไรจริง ๆ เวลาสอง tool apply object เดียวกัน
+
+ช่องว่างนั้นแหละคือจุดที่โค้ด/tooling Kubernetes ที่ AI เขียนพังแบบดูผิวเผินแล้วเหมือนถูก เช่น controller ที่เขียนด้วย `List` ใน `for`-loop แทนที่จะใช้ shared informer แล้ว poll เงียบ ๆ พลาด event ระหว่างรอบ, reconcile function ที่ไม่มี rate limiting จน hot-loop ซ้ำ ๆ บน error ถาวร, สมมติว่า webhook รัน "ก่อน validation เสมอ" ทั้งที่ chain จริงสลับ mutating/validating คนละแบบ, หรือ script ที่ "แก้" conflict ของ `managedFields` ด้วยการ force เอา field ทุกอันมาเป็นของตัวเองแทนที่จะอ่านว่า field ไหนขัดกันจริง ๆ ไม่มีข้อไหนเป็น syntax error ไม่มีข้อไหนถูกจับด้วย `kubectl apply --dry-run=client` ทุกข้อคือข้อเท็จจริงเรื่อง runtime ที่ module นี้พิสูจน์ให้ดูได้
+
+Module นี้มีหน้าที่เดียว ให้ความรู้เรื่อง runtime ห้าเรื่องที่ทำให้คุณดู **โค้ดหรือ YAML ของ Kubernetes ที่คนอื่นเขียน** — controller, webhook config, scheduler profile, script เต็มไปด้วย `kubectl apply --server-side` — แล้วตอบได้ว่า
+
+1. **เกิดอะไรขึ้นจริงกับ request ข้างใน API server และ watch ทำงานจริงอย่างไร?** (API server กับ etcd — `resourceVersion`, watch, bookmark, `410 Gone` และ etcd ในฐานะที่เดียวที่ state อยู่จริง)
+2. **controller รู้ได้อย่างไรว่า "มีอะไรเปลี่ยน" โดยไม่ poll?** (controller, informer และ workqueue — Reflector → DeltaFIFO → Indexer/Lister → workqueue → reconcile ตรงจาก `client-go`)
+3. **scheduler "plugin" คืออะไรจริง ๆ และรันตามลำดับไหน?** (scheduler framework — extension-point interface จริง และชื่อ plugin จริงจาก `pkg/scheduler`)
+4. **mutating webhook, schema validation, validating webhook และ `ValidatingAdmissionPolicy` รันลำดับไหนจริง ๆ?** (admission chain — พิสูจน์ด้วย chain จริง, dry-run จริง และ source ที่กำหนดลำดับนี้ตรง ๆ)
+5. **`managedFields` เก็บอะไรจริง ๆ และ "conflict" หมายความว่าอะไรจริง ๆ?** (Server-Side Apply internals — marker `f:`/`k:`/`v:`, `x-kubernetes-list-type` และ library `structured-merge-diff` ที่ทำให้มันทำงานได้)
+
+ทุกข้ออ้างใน module นี้อ้างอิงจากสามอย่าง source จริงของ Kubernetes ที่ [github.com/kubernetes/kubernetes](https://github.com/kubernetes/kubernetes) tag **v1.37.0** (เวอร์ชันที่คอร์สนี้ pin ไว้) อ้างเป็นไฟล์และบรรทัดจริง, docs ทางการที่ [kubernetes.io/docs](https://kubernetes.io/docs/) หรือการรันจริงบน `kind` cluster 3 node จริง (`kind create cluster --name internals`, control-plane 1 + worker 2, Kubernetes 1.37.0) — `kubectl -v=8` trace จริง, `etcdctl get` จริง, log ของ scheduler จริง, error จริงจาก API server — วางไว้ใต้ข้ออ้างนั้นเสมอ ไม่ใช่การเดา internals
+
+<Callout title="สรุปหนึ่งบรรทัด">
+Module นี้ไม่ได้เพิ่ม API ใหม่ให้ Kubernetes — แต่อธิบายกลไกห้าอย่างที่ manifest, controller และ script ทุกอันวิ่งผ่านจริง **API server** (HTTP layer แบบ stateless คลุมอยู่บน **etcd** ที่เดียวที่ cluster state อยู่จริง — การอ่านคือ list-แล้ว-watch ที่ stamp ด้วย `resourceVersion` ไม่ใช่ poll ดิบ ๆ), **pattern informer** (Reflector → DeltaFIFO → Indexer/Lister → workqueue → reconcile ของ `client-go` ซึ่งเป็นรูปร่างเดียวกับที่ controller chain ของ Deployment/ReplicaSet ในคอร์สนี้ และ custom controller ทุกตัวที่คุณจะเขียนมีจริง ๆ), **scheduler framework** (pipeline ของ plugin ที่มีชื่อจริงบน extension point ตายตัว — `PreFilter`/`Filter`/`PostFilter`/`PreScore`/`Score`/`Reserve`/`Permit`/`PreBind`/`Bind`/`PostBind` — ไม่ใช่กล่องดำก้อนเดียว), **admission chain** (mutating admission ก่อน แล้ว schema/strategy validation แล้ว validating admission — แต่ละ phase เป็น chain ที่มีลำดับของ in-tree plugin, `MutatingAdmissionPolicy`/`ValidatingAdmissionPolicy` และ webhook เอง ลำดับถูกกำหนดตายตัวจาก source ของ API server เอง) และ **Server-Side Apply** (field ownership ต่อ manager เก็บใน `managedFields` คำนวณโดย library `structured-merge-diff` เทียบกับ marker `x-kubernetes-list-type`/`x-kubernetes-map-type` ของ OpenAPI schema จริง) ทั้งห้าอย่างอยู่บน kubernetes.io/docs หรืออ่านได้ตรง ๆ ใน `kubernetes/kubernetes` — แค่ไม่คุ้นเคย ไม่ใช่ไม่มีเอกสาร
+</Callout>
+
+## สิ่งที่ module นี้ครอบคลุม
+
+| บทเรียน | ตอบคำถามอะไร |
+|---|---|
+| [API Server and etcd Watch](/kubernetes/th/k8s-internals/api-server-and-etcd-watch/) | เส้นทาง request จริงผ่าน API server คืออะไร และ watch รักษาความสอดคล้องด้วย `resourceVersion` ได้อย่างไร? |
+| [Controllers, Informers, and Workqueues](/kubernetes/th/k8s-internals/controllers-informers-and-workqueues/) | controller ทำอะไรจริง ๆ ในเชิงกลไก ตั้งแต่ watch event มาถึงจนถึง reconcile? |
+| [Scheduler Framework](/kubernetes/th/k8s-internals/scheduler-framework/) | extension point และ plugin จริงที่ scheduler รันคืออะไร และเปลี่ยนตัวไหน active ได้อย่างไร? |
+| [Admission Chain](/kubernetes/th/k8s-internals/admission-chain/) | mutating webhook, validation, validating webhook และ VAP/MAP รันตามลำดับไหนจริง ๆ ที่พิสูจน์ได้จาก source? |
+| [Server-Side Apply Internals](/kubernetes/th/k8s-internals/server-side-apply-internals/) | `managedFields` เก็บอะไรจริง ๆ และอะไรตัดสินว่าสอง manager ขัดกัน? |
+
+Module Foundations แนะนำ `kubectl apply --server-side` และ error conflict ของ field manager จริงไปแล้วจากมุมมองภายนอก module นี้ไปไกลกว่านั้นเข้าไปดู request path จริง, watch จริง, scheduler plugin จริง, ลำดับ admission จริง และ merge algorithm จริง
+
+<Mermaid title="Pod หนึ่งตัว ตั้งแต่ kubectl apply จนถึง container รันอยู่" code={bigDiagram} />
+
+export const bigDiagram = `flowchart TD
+  kubectl["kubectl apply -f pod.yaml"] --> authn["Authentication"]
+  authn --> authz["Authorization (RBAC)"]
+  authz --> mutate["Mutating admission chain\\n(in-tree -> MutatingAdmissionPolicy -> MutatingAdmissionWebhook)\\n(Admission Chain)"]
+  mutate --> schema["Schema + strategy validation\\n(OpenAPI, x-kubernetes-list-type)\\n(Server-Side Apply Internals)"]
+  schema --> validate["Validating admission chain\\n(in-tree -> ValidatingAdmissionPolicy -> ValidatingAdmissionWebhook)\\n(Admission Chain)"]
+  validate --> etcd["etcd: ที่เดียวที่ state อยู่จริง\\n(API Server and etcd Watch)"]
+  etcd --> watch["Watch stream เรียงตาม resourceVersion"]
+  watch --> reflector["client-go Reflector -> DeltaFIFO -> Indexer/Lister\\n(Controllers, Informers, and Workqueues)"]
+  reflector --> queue["workqueue (rate-limited, level-triggered)"]
+  queue --> reconcile["Controller reconcile\\n(เช่น ReplicaSet controller สร้าง Pod)"]
+  reconcile --> sched["kube-scheduler: Filter -> Score -> Bind\\n(Scheduler Framework)"]
+  sched --> kubelet["kubelet สั่งรัน container"]`;
+
+## Mental Model
+
+ทุกอย่างใน module นี้คือเรื่องเดียวกัน เล่าจากห้าจุดบน loop เดียวกัน **คุณส่ง mutation หนึ่งครั้ง API server รันมันผ่าน pipeline ตายตัว (auth, admission, validation, storage) แล้วเขียน truth เพียงชุดเดียวลง etcd ทุก component อื่น — controller, scheduler, `kubectl get -w` — รู้เรื่อง write นั้นด้วยวิธีเดียวกันคือ watch stream ที่เรียงด้วย `resourceVersion` จาก API server ตัวเดียวกันนั้น ไม่เคย poll ไม่เคยคุยกับ etcd ตรง ๆ** controller ก็แค่ "watch, queue, reconcile" ที่ต่อสายผ่านกลไก informer ของ `client-go` scheduler ก็แค่ consumer อีกตัวของ watch stream เดียวกัน ที่รัน pipeline ของ plugin ที่มีชื่อก่อนเขียนผลตัดสินใจกลับผ่าน API server ตัวเดียวกัน admission กับ Server-Side Apply ก็แค่โครงสร้างเพิ่มเติมที่ API server ใส่ลงใน write path เอง ก่อนอะไรจะไปถึง etcd พอวางข้อเท็จจริงข้อไหนใน module นี้ลงบน loop เดียวกันนี้ได้ "Kubernetes ทำงานอย่างไร" ก็เลิกเป็นเรื่องห้าเรื่องที่ต้องท่องแยกกัน
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"controller poll API server เป็นช่วง ๆ เพื่อเช็คว่ามีอะไรเปลี่ยน"** [Controllers, Informers, and Workqueues](/kubernetes/th/k8s-internals/controllers-informers-and-workqueues/) พิสูจน์ตรงข้ามด้วย informer จริงที่รันอยู่ มัน list ครั้งเดียวแล้วเปิด HTTP watch connection ค้างไว้นาน ๆ แล้วตอบสนองต่อ event `ADDED`/`MODIFIED`/`DELETED` ทีละตัว ส่วน full `List` เป็นช่วง ๆ ที่คุณอาจเคยได้ยินคือ **resync** ที่เป็น safety net ไม่ใช่กลไกหลัก
+- **"admission webhook ทั้งหมดรันในกลุ่มเดียวไม่แยกกัน ตามลำดับ registration"** [Admission Chain](/kubernetes/th/k8s-internals/admission-chain/) พิสูจน์ลำดับจริงตรงจาก `pkg/kubeapiserver/options/plugins.go` mutating admission (in-tree plugin แล้ว `MutatingAdmissionPolicy` แล้ว `MutatingAdmissionWebhook`) จบทั้งหมดก่อน แล้ว schema/strategy validation ถึงรัน แล้ว validating admission (in-tree, `ValidatingAdmissionPolicy`, `ValidatingAdmissionWebhook`) ถึงรัน — สอง phase ที่แยกกันจริง ไม่ใช่กลุ่มเดียว
+- **"scheduler เป็นกล่องดำที่แค่เลือก node"** [Scheduler Framework](/kubernetes/th/k8s-internals/scheduler-framework/) พิสูจน์ว่ามันคือ pipeline ของ plugin ที่มีชื่อแยกกัน สลับได้แยกกัน ชื่อจริงตรงจาก `pkg/scheduler/framework/plugins/names` บน extension point ตายตัวที่นิยามใน `k8s.io/kube-scheduler/framework`
+- **"`managedFields` คือ idea เดียวกับ annotation `last-applied-configuration` เก่า แค่ย้ายไปทำฝั่ง server"** [Server-Side Apply Internals](/kubernetes/th/k8s-internals/server-side-apply-internals/) พิสูจน์ว่าโครงสร้างต่างกันจริง `managedFields` คือ map ownership ต่อ manager ต่อ field คีย์ด้วย marker จริงของ OpenAPI schema (`x-kubernetes-list-type: map` เทียบกับ `atomic`) คำนวณด้วย library `structured-merge-diff` — ไม่ใช่ blob ก้อนเดียวของ "ครั้งที่แล้วฉัน apply อะไรไป"
+
+## อ่านโค้ดที่ AI เขียน
+
+จุดประสงค์ทั้งหมดของ module นี้คือ section นี้ ห้าครั้ง หนึ่งครั้งต่อบท ตัวอย่างระดับภาพรวมไว้ก่อน โค้ดที่ดูเหมือน controller ที่ถูกต้อง แต่ขาดสิ่งเดียวที่ทำให้มันเป็น controller จริง ๆ ไม่ใช่แค่ตัว poll
+
+<SpotTheBug code={`// A "controller" a teammate wrote to react to Pod changes
+setInterval(async () => {
+  const pods = await api.listNamespacedPod('default');
+  for (const pod of pods.body.items) {
+    reconcile(pod);
+  }
+}, 5000);`}>
+โค้ดนี้รัน `reconcile` กับทุก Pod ทุก 5 วินาที ตลอดไป ไม่ว่าอะไรจะเปลี่ยนหรือไม่ก็ตาม — [Controllers, Informers, and Workqueues](/kubernetes/th/k8s-internals/controllers-informers-and-workqueues/) พิสูจน์ว่าผิด controller จริงใช้ **watch** ส่ง event `ADDED`/`MODIFIED`/`DELETED` ทีละตัวผ่าน Reflector เข้า DeltaFIFO แล้ว reconcile เฉพาะ object ที่ key ถูก enqueue จริง เวอร์ชัน `setInterval` นี้ reconcile ทุก object ทุก tick โดยไม่สนว่าเปลี่ยนหรือเปล่า (ภาระ API server เพิ่มตามขนาด cluster ไม่ใช่ตามอัตราการเปลี่ยน) และที่แย่กว่านั้นมัน**พลาด**การเปลี่ยนแปลงได้เลยถ้า object ถูกสร้างแล้วลบภายในช่วง 5 วินาทีเดียวกัน เพราะ poll ไม่มีอะไรรับประกันว่าจะเห็นทุก state ระหว่างทางเหมือน watch stream ที่เรียงลำดับ
+</SpotTheBug>
+
+export const quizK8sInternalsIndex = [
+  {
+    q: 'controller ทุกตัว, scheduler และ `kubectl get -w` มีอะไรร่วมกันในการรู้ว่ามีอะไรเปลี่ยน?',
+    options: [
+      'ทั้งหมด poll API server เป็นช่วงเวลาคงที่',
+      'ทั้งหมด watch stream ที่เรียงด้วย resourceVersion จาก API server แทนที่จะคุยกับ etcd ตรง ๆ หรือ poll',
+      'ทั้งหมดอ่าน etcd ตรง ๆ เพื่อความเร็ว',
+      'ทั้งหมดใช้ gRPC streaming เพื่อข้าม API server',
+    ],
+    answer: 1,
+    explain: 'API server เป็น single source of truth คลุมบน etcd ทุก consumer -- informer ของ controller, scheduler, kubectl -- รู้เรื่องการเปลี่ยนแปลงด้วยวิธีเดียวกัน คือ watch stream ที่เรียงด้วย resourceVersion จาก API server',
+  },
+  {
+    q: '```go\n// pkg/kubeapiserver/options/plugins.go, v1.37.0 -- ท้ายของ AllOrderedPlugins\nmutatingadmissionpolicy.PluginName,   // MutatingAdmissionPolicy\nmutatingwebhook.PluginName,           // MutatingAdmissionWebhook\nvalidatingadmissionpolicy.PluginName, // ValidatingAdmissionPolicy\nvalidatingwebhook.PluginName,         // ValidatingAdmissionWebhook\nresourcequota.PluginName,             // ResourceQuota\n```\nนี่คือ list plugin จริงตามลำดับที่ API server compile ไว้ พิสูจน์อะไรเกี่ยวกับ MutatingAdmissionPolicy กับ MutatingAdmissionWebhook?',
+    options: [
+      'ทั้งสองรันในกลุ่มเดียวไม่มีลำดับ',
+      'MutatingAdmissionPolicy รันก่อน MutatingAdmissionWebhook และทั้งสองยังอยู่ใน phase มutating ก่อนที่ plugin phase validating ตัวไหนจะรัน',
+      'MutatingAdmissionWebhook รันก่อน in-tree plugin เสมอ',
+      'ResourceQuota รันก่อน admission จะเริ่มด้วยซ้ำ',
+    ],
+    answer: 1,
+    explain: 'Admission Chain พิสูจน์จาก slice จริงของ AllOrderedPlugins นี้เลย MutatingAdmissionPolicy เรียงก่อน MutatingAdmissionWebhook ทันที และ ResourceQuota (plugin phase validating) อยู่หลังทั้ง validating admission policy และ webhook -- ลำดับถูกกำหนดตายตัวจาก array เดียวนี้ ไม่ใช่จากเวลา register หรือ webhook config',
+  },
+  {
+    q: '```go\n// staging/src/k8s.io/kube-scheduler/framework/interface.go, v1.37.0\ntype PreFilterPlugin interface { ... }\ntype FilterPlugin interface { ... }\ntype PostFilterPlugin interface { ... }\ntype PreScorePlugin interface { ... }\ntype ScorePlugin interface { ... }\ntype ReservePlugin interface { ... }\ntype PreBindPlugin interface { ... }\ntype PermitPlugin interface { ... }\ntype BindPlugin interface { ... }\ntype PostBindPlugin interface { ... }\n```\n`kube-scheduler` "plugin" ใน source จริงนี้คืออะไร?',
+    options: [
+      'binary ภายนอกที่ scheduler เรียกใช้ทุก Pod',
+      'การ implement interface ของ extension point เหล่านี้ใน Go ตัวใดตัวหนึ่งหรือหลายตัว ลงทะเบียนด้วยชื่อจริงจาก pkg/scheduler/framework/plugins/names',
+      'CRD instance ที่ scheduler watch แล้ว reconcile',
+      'webhook endpoint ที่ scheduler เรียกผ่าน HTTP ทุก Pod',
+    ],
+    answer: 1,
+    explain: 'Scheduler Framework พิสูจน์ตรงจากไฟล์ interface จริงนี้และ pkg/scheduler/framework/plugins/names -- plugin ที่มีชื่อจริง implement Go interface จริงบน extension point ตายตัว รันใน process เดียวกับ kube-scheduler ไม่ใช่ process ภายนอกหรือ webhook',
+  },
+  {
+    q: '`managedFields` เก็บอะไรที่ annotation `kubectl.kubernetes.io/last-applied-configuration` เก่าไม่ได้เก็บ?',
+    options: [
+      'ไม่มีอะไรต่าง เก็บข้อมูลเดียวกันแค่ย้ายที่',
+      'ownership ต่อ manager ต่อ field คำนวณเทียบกับ marker ประเภท list/map ของ OpenAPI schema จริง โดย library structured-merge-diff',
+      'เก็บแค่ timestamp ของการเปลี่ยนแปลงล่าสุด',
+      'ประวัติทุกเวอร์ชันในอดีตของ object แบบเต็ม',
+    ],
+    answer: 1,
+    explain: 'Server-Side Apply Internals พิสูจน์ว่า managedFields เป็น map ownership ต่อ field ที่โครงสร้างต่างจริง -- ไม่ใช่ blob ก้อนเดียว -- และพฤติกรรม merge ของมันขึ้นกับ marker จริงของ OpenAPI schema เช่น x-kubernetes-list-type',
+  },
+  {
+    q: '"controller" ที่ถูก generate มาใช้ setInterval เพื่อ re-list แล้ว reconcile ทุก object ทุก 5 วินาที ปัญหาจริงคืออะไร ที่พิสูจน์ได้ใน module นี้?',
+    options: [
+      'จริง ๆ แล้วเป็น pattern ที่ถูกต้องและแนะนำ',
+      'เปลืองภาระ API server ตามขนาด cluster ไม่ใช่ตามอัตราการเปลี่ยน และยังพลาด state ระหว่างทางได้ (เช่น สร้างแล้วลบ) ภายในช่วง poll เดียว',
+      'ไม่มีปัญหาตราบใดที่ interval ต่ำกว่า 1 วินาที',
+      'จะพังก็ต่อเมื่อ cluster มี webhook ติดตั้งอยู่เท่านั้น',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ในตัวอย่างของ module นี้ การ poll มีต้นทุนตามจำนวน object ทั้งหมดทุก tick และต่างจาก watch stream ที่เรียงลำดับ มันไม่รับประกันว่าจะเห็นทุก state ที่ create-then-delete เร็ว ๆ ผ่านไป',
+  },
+];
+
+<Quiz client:visible id="k8s-internals/index" questions={quizK8sInternalsIndex} />
+
+<ProgressTracker client:visible id="k8s-internals/index" />

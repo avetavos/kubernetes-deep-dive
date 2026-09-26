@@ -1,0 +1,288 @@
+---
+title: 'API Server and etcd Watch'
+description: 'เส้นทาง request จริงผ่าน kube-apiserver -- auth, authz, admission, validation, storage -- และ watch รักษาความสอดคล้องกับ resourceVersion, bookmark และ 410 Gone จริงได้อย่างไร พิสูจน์บน cluster 3 node จริง โดยมี etcd เป็นที่เดียวที่ state อยู่จริง'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## ไอเดียหลักในหนึ่งประโยค
+
+`kube-apiserver` คือ HTTP layer แบบ stateless ที่รันทุก request ผ่าน pipeline ตายตัวเดียวกัน แล้วเขียน state ที่เป็น truth เพียงชุดเดียวของ cluster ลง **etcd** component อื่นทุกตัวรู้เรื่องการเปลี่ยนแปลงด้วยวิธีเดียวกัน คือ watch stream ที่เรียงด้วย `resourceVersion` จาก API server ไม่เคย poll และไม่เคยคุยกับ etcd ตรง ๆ
+
+## เส้นทาง request จริง
+
+ทุก request — `kubectl get`, `kubectl apply`, watch ของ controller, การ bind ของ scheduler — วิ่งผ่าน pipeline ที่เรียงลำดับเดียวกันข้างใน `kube-apiserver`
+
+<Mermaid title="เส้นทาง request จริงผ่าน kube-apiserver" code={requestPathDiagram} />
+
+export const requestPathDiagram = `flowchart LR
+  client["Client (kubectl / client-go / scheduler)"] --> authn["Authentication"]
+  authn --> authz["Authorization (RBAC)"]
+  authz --> mutate["Mutating admission\\n(Admission Chain)"]
+  mutate --> validate2["Schema + strategy validation"]
+  validate2 --> validate["Validating admission\\n(Admission Chain)"]
+  validate --> storage["Storage: etcd ผ่าน watch cache"]
+  storage --> watch["Watch stream เรียงด้วย resourceVersion"]`;
+
+Authentication ตัดสินว่า *ใคร* กำลังส่ง request (client certificate, bearer token, ServiceAccount token) authorization (RBAC ในคอร์สนี้ `--authorization-mode=Node,RBAC` บน `kube-apiserver` จริงของ cluster นี้) ตัดสินว่า identity นั้น *ได้รับอนุญาต* ให้ทำ verb นี้กับ resource นี้ไหม admission — ครอบคลุมเต็ม ๆ พิสูจน์จาก source ใน [Admission Chain](/kubernetes/th/k8s-internals/admission-chain/) — รันสอง phase คร่อม schema validation ที่เหลือ เมื่อผ่านทั้งหมดแล้วคือ storage เขียนลง etcd และ watch event ที่ client ทุกตัวที่ต่ออยู่จะเห็น
+
+`-v=9` trace จริงแสดงฝั่ง client ของสิ่งนี้ตรง ๆ HTTP request จริงและ response จริง
+
+```text
+$ kubectl get pods -n internals-demo -v=9
+curl -v -XGET -H "Accept: application/json;as=Table;v=v1;g=meta.k8s.io,application/json;as=Table;v=v1beta1;g=meta.k8s.io,application/json" -H "User-Agent: kubectl/v1.36.1 (darwin/arm64) kubernetes/7569396" 'https://127.0.0.1:58297/api/v1/namespaces/internals-demo/pods?limit=500'
+I0926 18:30:18.563973 round_trippers.go:562] "HTTP Trace: Dial succeed" network="tcp" address="127.0.0.1:58297"
+I0926 18:30:18.772778 round_trippers.go:632] "Response" verb="GET" url="https://127.0.0.1:58297/api/v1/namespaces/internals-demo/pods?limit=500" status="200 OK" headers=<
+I0926 18:30:18.772881 helper.go:113] "Response Body" body=<
+```
+
+ไม่มีอะไรตรงนี้ที่ special-case ให้ `kubectl` เลย นี่คือ HTTPS request ธรรมดาเดียวกับที่ informer ของ `client-go` ตัวไหน, `curl` หรือ HTTP client ที่เขียนเองก็ส่งได้ `kubectl` แค่บังเอิญเป็น client ที่คอร์สนี้ใช้แสดงมัน
+
+## `resourceVersion`: primitive การเรียงลำดับเบื้องหลังทุกอย่าง
+
+ทุก object และทุก list response มี `resourceVersion` — marker ที่ opaque เพิ่มขึ้นตายตัวเสมอ (อิง revision number ของ etcd เอง) ที่ตอบคำถามเดียวเป๊ะ "การอ่านนี้ทันสมัยแค่ไหน เทียบกับทุกอย่างอื่น" list ธรรมดา อ่านจริงบน cluster ของบทนี้
+
+```text
+$ kubectl -n internals-demo get pods -o json | jq -r '.metadata.resourceVersion'
+1994
+```
+
+`1994` นั้นไม่ใช่จำนวน pod ใน namespace หรืออะไรที่มีความหมายกับมนุษย์ มันคือ logical clock ของ etcd เอง ณ ตอนที่ list นี้ถูกคำนวณ และมันคือเลขที่ทุก request `watch=1&resourceVersion=1994` ในภายหลังใช้เพื่อหมายถึง "เริ่ม stream การเปลี่ยนแปลงจากตรงนี้เป๊ะไปข้างหน้า อย่า replay สิ่งที่มีอยู่แล้ว และอย่าข้ามอะไรไปด้วย"
+
+## watch จริง `--output-watch-events` และ event `MODIFIED` จริง
+
+`--output-watch-events` ห่อ object ทุกตัวที่ watch ส่งมาด้วย envelope ที่เอ่ยชื่อ event type ของมัน watch Pod ของ namespace นี้แล้ว label ตัวหนึ่งจาก terminal ที่สอง output จริง
+
+```text
+$ kubectl -n internals-demo get pods --watch --output-watch-events -o json
+ADDED Pod rv=1151 name=gc-demo4-54cd5f4cd9-7jhlq
+ADDED Pod rv=1150 name=gc-demo4-54cd5f4cd9-lddmh
+ADDED Pod rv=1535 name=ssa-atomic-demo-864644447-lg556
+ADDED Pod rv=963 name=ssa-demo
+ADDED Pod rv=1491 name=ssa-merge-demo-78fd5b47c4-9pk7t
+ADDED Pod rv=745 name=web-86d8686cfb-84dk9
+
+$ kubectl -n internals-demo label pod ssa-demo demo-round=one --overwrite   # รันจาก terminal ที่สอง
+pod/ssa-demo labeled
+```
+
+```text
+MODIFIED Pod rv=2075 name=ssa-demo
+```
+
+event `ADDED` ทั้งหกตัวข้างบนไม่ใช่การแจ้งเตือน "มีคนเพิ่ง create Pod" หกครั้งแยกกัน `watch=1` ธรรมดาที่ไม่มี `resourceVersion` เริ่มต้น (สิ่งที่ `kubectl get --watch` ทำโดย default) เริ่มด้วยการ replay ทุก object ที่มีอยู่ตอนนี้เป็น `ADDED` สังเคราะห์ ทรงเดียวเป๊ะกับที่ Reflector ของ `client-go` ทำตอน `list()` เริ่มต้น (พิสูจน์ใน [Controllers, Informers, and Workqueues](/kubernetes/th/k8s-internals/controllers-informers-and-workqueues/)) event `MODIFIED` จริงข้างล่างคือการเปลี่ยน label จริง สดจริง ส่งผ่าน connection เดิมที่ค้างเปิดอยู่ ไม่มีการ poll คั่นกลางเลย
+
+## Bookmark: heartbeat ที่มี `resourceVersion` จริง ไม่มี object แนบ
+
+`allowWatchBookmarks=true` ขอให้ API server ส่ง event `BOOKMARK` เป็นช่วง ๆ — object ที่ไม่มีเนื้อหาจริง มีแค่ `resourceVersion` ที่ทันสมัย — เพื่อให้ client ที่ถือ watch ค้างไว้นาน ๆ เลื่อน marker "resume จากตรงนี้" ได้โดยไม่ต้องรอการเปลี่ยนแปลงจริง output ดิบจริงจาก cluster นี้
+
+```text
+$ kubectl get --raw "/api/v1/namespaces/internals-demo/pods?watch=1&resourceVersion=&timeoutSeconds=6&allowWatchBookmarks=true"
+{"type":"ADDED","object":{"kind":"Pod","metadata":{"name":"gc-demo4-54cd5f4cd9-7jhlq","resourceVersion":"1151",...}}}
+{"type":"ADDED","object":{"kind":"Pod","metadata":{"name":"ssa-demo","resourceVersion":"963",...}}}
+... (ADDED อีกสี่ตัวสำหรับ Pod อื่น ๆ ของ namespace นี้) ...
+{"type":"BOOKMARK","object":{"kind":"Pod","metadata":{"resourceVersion":"1994"}}}
+```
+
+`BOOKMARK` ตัวสุดท้ายนั้นมี `resourceVersion: "1994"` และไม่มีอะไรอื่นเลย ไม่มีชื่อ ไม่มี spec ไม่มี status client ที่เก็บค่านี้ไว้แล้วต่อใหม่ด้วย `resourceVersion=1994` จะรับต่อจากตรงที่หยุดไว้เป๊ะ โดยไม่ต้องเห็น object เปลี่ยนจริงเพื่อจะรู้ว่า view ของตัวเองทันสมัยแค่ไหน
+
+## `410 Gone`: พิสูจน์แล้ว พร้อมข้อความจริง
+
+etcd ไม่เก็บทุก revision ในอดีตตลอดไป มัน **compact** เป็นช่วง ๆ ทิ้ง revision เก่าที่พ้น retention window ไปแล้ว request watch ที่เอ่ยชื่อ `resourceVersion` เก่ากว่าที่ etcd เก็บไว้ไม่สามารถ resume ต่อได้อย่างสอดคล้อง และ API server บอกตรง ๆ แทนที่จะคืนข้อมูลไม่ครบแบบเงียบ ๆ
+
+```text
+$ kubectl get --raw "/api/v1/namespaces/internals-demo/pods?watch=1&resourceVersion=1&timeoutSeconds=6"
+{"type":"ERROR","object":{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"too old resource version: 1 (999)","reason":"Expired","code":410}}
+```
+
+`"too old resource version: 1 (999)"` เอ่ยชื่อทั้งสองเลข `resourceVersion` ที่ขอ (`1`) และในวงเล็บ เลขเก่าสุดที่ server ยังให้บริการได้อย่างสอดคล้อง (`999` บน cluster นี้ ณ ตอนนั้น) `code: 410` คือเหตุผลเชิงกลไกจริงที่ Reflector ของ `client-go` ไม่สามารถ "watch ต่อจากตรงที่ค้างไว้" ได้ตลอดไป — พิสูจน์ใน [Controllers, Informers, and Workqueues](/kubernetes/th/k8s-internals/controllers-informers-and-workqueues/) นี่คือกรณีที่ delta `Replaced` มีอยู่เพื่อรับมือเป๊ะ Reflector จับ error นี้ fallback ไป `list()` ใหม่ แล้ว watch ต่อจาก `resourceVersion` ของ list ใหม่
+
+## etcd: ที่เดียวที่ state อยู่จริง
+
+ไม่มีอะไรของ Kubernetes object อยู่ที่ไหนนอกจาก etcd — **watch cache** ในหน่วยความจำของ API server (`staging/src/k8s.io/apiserver/pkg/storage/cacher`) serve การอ่านได้เร็ว แต่ทุกการเขียนวิ่งผ่าน `staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go` ไปที่ etcd เอง และ `kind` cluster ของคอร์สนี้รัน etcd เป็น static Pod ธรรมดา เข้าถึงได้ตรง ๆ
+
+```text
+$ kubectl -n kube-system get pods | grep etcd
+etcd-internals-control-plane   1/1   Running   0   <age>
+
+$ kubectl -n kube-system exec etcd-internals-control-plane -- etcdctl version
+etcdctl version: 3.7.0
+API version: 3.7
+```
+
+อ่าน byte ดิบจริงที่เก็บของ Pod ตัวหนึ่งตรงออกจาก etcd — ไม่ผ่าน API server เลย
+
+```text
+$ kubectl -n kube-system exec etcd-internals-control-plane -- etcdctl \
+    --endpoints=https://127.0.0.1:2379 \
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --cert=/etc/kubernetes/pki/etcd/server.crt \
+    --key=/etc/kubernetes/pki/etcd/server.key \
+    get /registry/pods/internals-demo/ssa-demo
+/registry/pods/internals-demo/ssa-demo
+k8s\x00
+	
+v1PodM-^P
+[...binary protobuf...]
+ssa-demo[...]internals-demo[...]
+manager-a[...]Apply[...]
+FieldsV1:{"f:spec":{"f:containers":{"k:{"name":"main"}":{".":{},"f:image":{},"f:name":{}}}}}
+[...]
+```
+
+ข้อเท็จจริงจริงสามข้อตกออกมาจากการอ่านดิบครั้งเดียวนี้ storage key เป็น path ธรรมดาที่คาดเดาได้ (`/registry/<resource>/<namespace>/<name>`) ค่าเริ่มด้วย prefix `k8s\0` ตรงตัวตามด้วย version marker แล้วเป็น object ที่ encode ด้วย **protobuf** ไม่ใช่ JSON หรือ YAML (นี่คือเหตุผลที่คุณ `cat` object ออกจาก etcd แล้วอ่านตรง ๆ แบบที่ทำกับ ConfigMap ไม่ได้) และ byte ดิบมีโครงสร้าง `managedFields` เดียวกันเป๊ะ (`"f:spec":{"f:containers":{"k:{\"name\":\"main\"}"...`) ที่ [Server-Side Apply Internals](/kubernetes/th/k8s-internals/server-side-apply-internals/) แสดงให้คุณดูแบบจัด format แล้ว เพราะ `managedFields` ไม่ใช่ค่าที่ derive คำนวณตอนอ่าน มันถูกเก็บ เป๊ะตัวอักษร เป็นส่วนหนึ่งของ object เอง
+
+## API aggregation เทียบกับ CRD: สองวิธีที่ต่างกันในการเพิ่ม API group
+
+`kubectl get --raw /apis` แสดง API group ทุกกลุ่มที่ cluster นี้ serve output จริงรวม `apiregistration.k8s.io` (aggregation layer เอง) และ `apiextensions.k8s.io` (กลไกของ CRD)
+
+```text
+$ kubectl get --raw /apis | jq -r '.groups[].name'
+apiregistration.k8s.io
+apps
+events.k8s.io
+authentication.k8s.io
+authorization.k8s.io
+autoscaling
+batch
+certificates.k8s.io
+networking.k8s.io
+policy
+rbac.authorization.k8s.io
+storage.k8s.io
+admissionregistration.k8s.io
+apiextensions.k8s.io
+scheduling.k8s.io
+```
+
+ทั้งสองกลุ่มมีอยู่ยืนยันว่า cluster นี้รองรับกลไก extension *ทั้งสอง* แม้ cluster ของบทนี้จะไม่มี CRD ติดตั้งให้แสดงตัวอย่างตรง ๆ (`kubectl get crd` ไม่คืนอะไรเลย) — ความต่างระหว่างสองอย่างนี้ ตาม [docs ทางการ](https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/apiserver-aggregation/) เป็นเรื่องจริงที่ควรพูดให้แม่นยำ **CRD** (`apiextensions.k8s.io`) เก็บอยู่ใน etcd ของ *cluster นี้เอง* serve โดย `kube-apiserver` เองด้วย implementation แบบ generic ที่ขับด้วย schema ไม่มี process แยก **API aggregation** (`apiregistration.k8s.io`, object `APIService`) proxy ทั้ง API group ไปยัง server process *อื่น* ทั้งหมด (จะอยู่ใน cluster หรือไม่ก็ได้) ที่เป็นเจ้าของ storage ของตัวเองแยกอิสระจาก etcd ของ cluster นี้เลย `metrics.k8s.io` (serve โดย Deployment metrics-server ไม่ได้เก็บใน etcd ของ cluster นี้เลย) คือตัวอย่างจริงที่พบบ่อยที่สุดของ aggregation custom resource ของ operator ที่ใช้ CRD คือตัวอย่างที่พบบ่อยของอีกแบบ
+
+## OpenAPI: schema ที่ admission และ `kubectl explain` ทุกครั้งอ่าน
+
+[kubectl and Declarative YAML](/kubernetes/th/foundations/kubectl-and-declarative-yaml/) แสดง `kubectl explain` อ่าน schema นี้ทีละ field ไปแล้ว schema เดียวกันนี้ serve เต็มทั้งก้อน output จริงจาก discovery endpoint ของ cluster นี้
+
+```text
+$ kubectl get --raw /openapi/v3 | jq -r '.paths | keys | .[0:6]'
+[
+  ".well-known/openid-configuration",
+  "api",
+  "api/v1",
+  "apis",
+  "apis/admissionregistration.k8s.io",
+  "apis/admissionregistration.k8s.io/v1"
+]
+```
+
+ทุก path เหล่านี้ serve เอกสาร OpenAPI v3 เต็มสำหรับ API group/version นั้น — เอกสารเดียวกันเป๊ะที่ [Server-Side Apply Internals](/kubernetes/th/k8s-internals/server-side-apply-internals/) อ่าน marker `x-kubernetes-list-type` ออกมา และเอกสารเดียวกันที่ schema/strategy validation เช็ค object ที่ decode แล้วบน request path ข้างบน
+
+## Mental Model
+
+ทุกอย่างในบทนี้คือข้อเท็จจริงเดียว มองจากมุมต่างกัน **API server คือประตูหน้าเดียวสู่ store ที่มี authoritative เดียว และการอ่านทุกครั้งผ่านประตูนั้นคือ "ให้ state ปัจจุบันมา" (list, stamp ด้วย `resourceVersion`) หรือ "บอกฉันว่าอะไรเปลี่ยนจากตรงนี้ไปข้างหน้า" (watch เรียงด้วย `resourceVersion` เดียวกัน)** ไม่มีวิธีที่สามที่ถูกต้องในการสังเกต cluster state เลย ไม่ใช่ poll ไม่ใช่อ่าน etcd ตรง ๆ (พิสูจน์ข้างบน protobuf ดิบ ไม่ได้ตั้งใจให้อ่านด้วยมือ) ไม่ใช่การเดา `BOOKMARK` กับ `410 Gone` เป็นเรื่อง primitive เดียวกันเป๊ะ client ที่หลุด connection หรือ idle มานาน resume stream ที่เรียงลำดับอย่างถูกต้องได้อย่างไร โดยไม่ replay ข้อมูลที่มีอยู่แล้ว หรือพลาดข้อมูลที่ยังไม่มีแบบเงียบ ๆ
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ข้อดี | ข้อเสีย |
+|---|---|---|
+| Watch พร้อม `resourceVersion` ที่จำไว้ | resume ต่อจากที่ client หยุดไว้เป๊ะ ไม่มีช่องว่าง ไม่ replay | ต้องจัดการ `410 Gone` (พิสูจน์ข้างบน) ด้วยการ fallback ไป list ใหม่ |
+| `allowWatchBookmarks=true` | เลื่อน resume point ของ client ระหว่างช่วง idle นาน ๆ โดยไม่มีการเปลี่ยนแปลงจริง | event เพิ่มที่ไม่มีเนื้อหาให้ consumer ที่ไม่ระวังต้องกรองออก ไม่ใช่มองว่าเป็นการเปลี่ยนแปลงจริง |
+| API aggregation (`APIService`) | extension เป็นเจ้าของ storage และการ scale ของตัวเองแยกอิสระจาก etcd ของ cluster นี้เต็มที่ | network hop และ process เพิ่มที่ต้องดูแลให้พร้อมใช้งาน etcd ของ cluster นี้โตขึ้นไม่กระทบมันเลย |
+| CRD (`apiextensions.k8s.io`) | ไม่มี process เพิ่ม เก็บและ serve โดย API server กับ etcd ของ cluster นี้เอง | ผูกกับขนาด/ประสิทธิภาพของ etcd ของ cluster นี้เอง CRD ที่ไหลไม่หยุดกระทบ storage ของ cluster นี้เองได้ |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"watch ก็แค่ long poll ข้างในลึก ๆ"** พิสูจน์ข้างบน มันคือ HTTP connection ที่ค้างเปิดตัวเดียว รับ stream ของ event `ADDED`/`MODIFIED`/`DELETED` (และ `BOOKMARK`) ที่เรียงลำดับจริง ไม่ใช่ request ซ้ำ ๆ
+- **"อ่าน state ปัจจุบันของ object ได้เร็วกว่าถ้าไปที่ etcd ตรง ๆ"** พิสูจน์ข้างบน ค่าคือ protobuf หลัง header `k8s\0` ไม่ได้ตั้งใจให้อ่านตรง ๆ และการทำแบบนั้นข้าม watch cache, RBAC และ admission ไปทั้งหมด นี่คือเหตุผลเป๊ะที่ไม่มีอะไรในคอร์สนี้ (หรือ cluster จริงไหน) ทำแบบนี้นอกจากแบบฝึกหัด debug แบบนี้
+- **"`410 Gone` แปลว่ามีอะไรพัง"** พิสูจน์ข้างบน มันคือ API server ปฏิเสธอย่างถูกต้องที่จะส่งข้อมูล watch ไม่ครบแบบเงียบ ๆ ที่มัน resume ต่อไม่ได้อย่างสอดคล้อง เป็น response ที่ออกแบบไว้ ไม่ใช่ error state
+- **"CRD กับ API aggregation คือชื่อสองชื่อของกลไกเดียวกัน"** พิสูจน์ข้างบนจาก group discovery จริงบวก docs CRD เก็บใน etcd ของ cluster นี้เองและ serve แบบ generic โดย `kube-apiserver` `APIService` แบบ aggregated proxy ไปยัง server แยกทั้งหมดที่มี storage อิสระของตัวเอง
+
+## อ่านโค้ดที่ AI เขียน
+
+เวลา review โค้ดหรือ script ที่ generate มาที่คุยกับ API server ตรง ๆ เช็คสิ่งเหล่านี้
+
+- "controller" ที่เรียก `list()` ซ้ำ ๆ บน timer แทนที่จะ watch จริง — พิสูจน์ข้างบน watch คือ connection เดียวที่ส่ง stream เรียงลำดับ การ poll implement สิ่งนี้ใหม่แบบแย่และพลาดทุกอย่างที่ Reflector ที่รู้จัก `410 Gone` จัดการให้ฟรี ๆ
+- โค้ดที่สมมติว่า watch เมื่อเริ่มแล้วไม่ต้องจัดการ restart อีก — พิสูจน์ข้างบนด้วย `410 Gone` จริง watch ที่มีอายุยาวจะต้อง re-list ในที่สุดเสมอ และโค้ดที่มองว่า watch connection ถาวรจะหยุดรับ update แบบเงียบ ๆ ทันทีที่มันหลุดไม่ว่าเพราะอะไร
+- script หรือ tool ที่อ่านหรือเขียน etcd ตรง ๆ เพื่อ "เร็วขึ้น" หรือ "ข้าม API" — พิสูจน์ข้างบน มันข้าม RBAC และ admission ไปทั้งหมด และข้อมูลเองคือ protobuf ไม่ใช่ format ที่ตั้งใจให้แก้ไขตรง ๆ
+- สับสน aggregated API แบบ `metrics.k8s.io` กับ CRD ตอนคิดว่าข้อมูลมันอยู่ที่ไหน หรือจะเกิดอะไรถ้า etcd ของ cluster นี้ถูก restore จาก backup — พิสูจน์ข้างบน ข้อมูลของ aggregated API ไม่ได้อยู่ใน etcd ของ cluster นี้เลย ดังนั้น restore etcd ของ cluster นี้ไม่ได้ restore มันด้วย
+
+<SpotTheBug code={`// A "faster" health-check script someone wrote
+async function waitForPodReady(name: string) {
+  while (true) {
+    const pod = await readEtcdDirectly(\`/registry/pods/default/\${name}\`);
+    if (pod.status.phase === 'Running') return;
+    await sleep(500);
+  }
+}`}>
+มีปัญหาจริงสองข้อ ทั้งคู่พิสูจน์ข้างบน ข้อแรก `readEtcdDirectly` อ่าน protobuf ดิบหลัง header `k8s\0` ไม่มี `pod.status.phase` ที่สะดวกแบบนี้ให้อ่านได้โดยไม่เขียน protobuf decoder เต็มก่อน และการทำแบบนี้ข้าม RBAC กับ admission check ที่มีอยู่ด้วยเหตุผล ข้อสอง แม้จะแก้ให้คุยกับ API server จริงแล้ว นี่ก็ยังเป็น poll เช็คทุก 500ms ไม่ว่าอะไรจะเปลี่ยนหรือเปล่า pattern ที่ถูกต้องและพิสูจน์แล้ว (ตัวอย่าง `--watch`/`--output-watch-events` ของบทนี้เอง และ Reflector ของ [Controllers, Informers, and Workqueues](/kubernetes/th/k8s-internals/controllers-informers-and-workqueues/)) คือ watch ที่ส่งมาตรงจังหวะที่ `status.phase` กลายเป็น `Running` เป็น event `MODIFIED` จริง ไม่มี interval ให้ tune และไม่มีความเสี่ยงพลาดการเปลี่ยนแปลงที่เกิดระหว่างรอบ poll
+</SpotTheBug>
+
+<Callout title="สรุปหนึ่งบรรทัด">
+`kube-apiserver` รันทุก request ผ่าน pipeline ตายตัวเดียว — auth, authz, admission (สอง phase พิสูจน์ใน [Admission Chain](/kubernetes/th/k8s-internals/admission-chain/)) แล้ว storage — และ etcd คือที่เดียวที่ state อยู่จริง พิสูจน์ข้างบนด้วยการอ่าน byte ดิบที่ encode ด้วย protobuf ของ Pod ตรงออกจากมัน การอ่านทุกครั้งคือ list ที่ stamp ด้วย `resourceVersion` หรือ watch ที่เรียงด้วย `resourceVersion` เดียวกัน `BOOKMARK` เลื่อน marker นั้นโดยไม่มีการเปลี่ยนแปลงจริง และ `410 Gone` จริง (พิสูจน์ข้างบนด้วยข้อความเป๊ะ `"too old resource version: 1 (999)"`) คือ response ที่ถูกต้อง ออกแบบไว้ เมื่อ watch resume ต่อไม่ได้อย่างสอดคล้องอีกแล้ว — ตรงกับกรณีที่ delta `Replaced` ของ `client-go` มีไว้เพื่อรับมือเป๊ะ CRD (เก็บใน etcd ของ cluster นี้เอง) กับ API aggregation (proxy ไปยัง server อิสระที่มี storage อิสระ) คือสองวิธีที่ต่างกันในเชิงโครงสร้างเพื่อเพิ่ม API group ทั้งคู่เห็นได้จริงใน group discovery จริงข้างบน
+</Callout>
+
+export const quizApiServerEtcd = [
+  {
+    q: '```text\n$ kubectl get --raw "/api/v1/namespaces/internals-demo/pods?watch=1&resourceVersion=1&timeoutSeconds=6"\n{"type":"ERROR","object":{"kind":"Status", ..., "message":"too old resource version: 1 (999)","reason":"Expired","code":410}}\n```\noutput จริงนี้พิสูจน์อะไร และ watch client ควรทำอะไรต่อ?',
+    options: [
+      'cluster พังต้อง restart',
+      'etcd compact พ้น resourceVersion 1 ไปแล้ว client ควร fallback ไป list() ใหม่แล้ว resume watch จาก resourceVersion ของ list ใหม่ -- ตรงกับที่ delta Replaced ของ Reflector จัดการเป๊ะ',
+      'Pod ที่ระบุใน request ไม่มีอยู่แล้ว',
+      'สิทธิ์ RBAC ของ client ถูกถอนไปแล้ว',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบน 410 Gone/Expired คือ response ที่ถูกต้อง ออกแบบไว้ สำหรับการเอ่ยชื่อ resourceVersion เก่ากว่า retention window ของ etcd -- Reflector ของ client-go จัดการกรณีนี้เป๊ะด้วยการ relist',
+  },
+  {
+    q: 'resourceVersion แทนอะไรจริง ๆ?',
+    options: [
+      'จำนวน object ใน namespace',
+      'marker opaque ที่เพิ่มขึ้นตายตัว (อิง revision ของ etcd เอง) ใช้เรียงลำดับ watch stream และ resume มันได้อย่างสอดคล้อง',
+      'เวอร์ชันของ Kubernetes API (เช่น v1, v1beta1)',
+      'timestamp ของการเขียนล่าสุด',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบน ค่า resourceVersion จริง (963, 1151, 1994, ...) เพิ่มขึ้นตายตัวตามการเขียนทั้ง cluster และถูกใช้ตรง ๆ เพื่อ resume watch จากจุดที่แน่นอน',
+  },
+  {
+    q: '```text\n$ kubectl -n internals-demo get pods --watch --output-watch-events -o json\nADDED Pod rv=1151 name=gc-demo4-...\n... (ADDED อื่น ๆ ของ Pod ที่มีอยู่แล้ว) ...\nMODIFIED Pod rv=2075 name=ssa-demo\n```\nทำไม event ADDED ถึงโผล่มาสำหรับ Pod ที่มีอยู่แล้วก่อน watch จะเริ่มด้วยซ้ำ?',
+    options: [
+      'บั๊กของ kubectl',
+      'watch ที่ไม่มี resourceVersion เริ่มต้นเริ่มด้วยการ replay ทุก object ที่มีอยู่ตอนนี้เป็น event ADDED สังเคราะห์ ทรงเดียวกับ list() เริ่มต้นของ Reflector',
+      'Pod เหล่านั้นถูกสร้างใหม่จริง ๆ',
+      'ADDED แปลว่า object ใหม่กับ cluster เสมอ ไม่มีข้อยกเว้น',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบน นี่สะท้อนสิ่งที่ Reflector ของ client-go ทำเป๊ะตอน ListAndWatch -- list state ปัจจุบัน (ส่งเป็น ADDED) แล้ว watch ต่อไปข้างหน้าสำหรับการเปลี่ยนแปลงจริง (event MODIFIED จริงที่ตามมา)',
+  },
+  {
+    q: 'ทำไมคุณ cat ข้อมูล Pod ออกจาก etcd แล้วอ่านเหมือน ConfigMap ตรง ๆ ไม่ได้?',
+    options: [
+      'etcd เข้ารหัสทุกอย่างโดย default',
+      'ค่าถูกเก็บเป็น protobuf หลัง header k8s\\0 ตรงตัว ไม่ใช่ plain text -- พิสูจน์ข้างบนด้วยการอ่านดิบจริง',
+      'etcd ไม่อนุญาตการอ่านตรง ๆ เลย',
+      'Pod เฉพาะถูกเก็บต่างจาก resource อื่นทุกตัว',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบนด้วย etcdctl get จริง ค่าดิบเริ่มด้วย prefix k8s\\0 กับ version marker แล้วเป็น byte ที่ encode ด้วย protobuf ไม่ใช่ JSON หรือ YAML',
+  },
+  {
+    q: 'ความต่างเชิงโครงสร้างจริงระหว่าง CRD กับ APIService แบบ aggregated คืออะไร?',
+    options: [
+      'ไม่มีความต่างจริง เป็นชื่อสองชื่อของสิ่งเดียวกัน',
+      'CRD เก็บใน etcd ของ cluster นี้เองและ serve แบบ generic โดย kube-apiserver ส่วน APIService แบบ aggregated proxy ไปยัง server process แยกที่มี storage อิสระของตัวเอง',
+      'CRD เร็วกว่า aggregated API เสมอ',
+      'aggregated API มี custom field ของตัวเองไม่ได้ มีแค่ CRD เท่านั้นที่ทำได้',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบนจาก group discovery จริง (apiextensions.k8s.io เทียบกับ apiregistration.k8s.io) และ docs ทางการ -- aggregated API จริงอย่าง metrics.k8s.io เก็บข้อมูลไว้นอก etcd ของ cluster นี้ทั้งหมด',
+  },
+];
+
+<Quiz client:visible id="k8s-internals/api-server-and-etcd-watch" questions={quizApiServerEtcd} />
+
+<ProgressTracker client:visible id="k8s-internals/api-server-and-etcd-watch" />

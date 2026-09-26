@@ -1,0 +1,363 @@
+---
+title: 'Server-Side Apply Internals'
+description: 'The real managedFields structure -- f:/k:/v: markers, x-kubernetes-list-type merge vs atomic proven with two real field managers, and the structured-merge-diff library that computes it all -- going past the field-manager conflict Foundations already showed you.'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## The idea in one sentence
+
+`managedFields` is not a flat list of "who touched this object" -- it is a per-manager tree of exactly which fields, keyed how, each manager owns, computed by the `structured-merge-diff` library against the live OpenAPI schema's `x-kubernetes-list-type` markers, which is why two managers can co-own different elements of one list with zero conflict while a third manager touching a *different kind* of list conflicts on the very first attempt.
+
+[kubectl and Declarative YAML](/kubernetes/en/foundations/kubectl-and-declarative-yaml/) already showed you `--server-side`, a real `managedFields` block, and a real field-manager conflict error. This lesson proves what decides whether two managers conflict at all.
+
+## `managedFields`, read as a tree: `f:`, `k:`, `v:`
+
+Every entry in `metadata.managedFields` is a `fieldsV1` tree using three marker prefixes: `f:<name>` for an ordinary struct field, `k:<key>` for one element of a list keyed by identity (not index), and (less commonly) `v:<value>` for one element of a set keyed by its own value. Two managers, each SSA-applying a `Deployment` and each setting a *different* container environment variable by name:
+
+```yaml
+# k8s/server-side-apply-internals/ssa-env-a.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ssa-merge-demo
+  namespace: internals-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ssa-merge-demo }
+  template:
+    metadata:
+      labels: { app: ssa-merge-demo }
+    spec:
+      containers:
+        - name: c
+          image: registry.k8s.io/pause:3.10
+          env:
+            - name: FROM_MANAGER_A
+              value: "a"
+```
+
+```yaml
+# k8s/server-side-apply-internals/ssa-env-b.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ssa-merge-demo
+  namespace: internals-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ssa-merge-demo }
+  template:
+    metadata:
+      labels: { app: ssa-merge-demo }
+    spec:
+      containers:
+        - name: c
+          image: registry.k8s.io/pause:3.10
+          env:
+            - name: FROM_MANAGER_B
+              value: "b"
+```
+
+Applied by two different field managers, both real, no conflict at all:
+
+```text
+$ kubectl apply --server-side --field-manager=manager-a -f ssa-env-a.yaml
+deployment.apps/ssa-merge-demo serverside-applied
+$ kubectl apply --server-side --field-manager=manager-b -f ssa-env-b.yaml
+deployment.apps/ssa-merge-demo serverside-applied
+
+$ kubectl -n internals-demo get deployment ssa-merge-demo -o jsonpath='{.spec.template.spec.containers[0].env}'
+[{"name":"FROM_MANAGER_A","value":"a"},{"name":"FROM_MANAGER_B","value":"b"}]
+```
+
+Both environment variables survive -- neither manager overwrote the other. The real `managedFields`, read back, shows exactly why:
+
+```text
+$ kubectl -n internals-demo get deployment ssa-merge-demo -o yaml --show-managed-fields
+  managedFields:
+  - manager: manager-a
+    operation: Apply
+    fieldsV1:
+      f:spec:
+        f:template:
+          f:spec:
+            f:containers:
+              k:{"name":"c"}:
+                f:env:
+                  k:{"name":"FROM_MANAGER_A"}:
+                    .: {}
+                    f:name: {}
+                    f:value: {}
+                f:image: {}
+                f:name: {}
+  - manager: manager-b
+    operation: Apply
+    fieldsV1:
+      f:spec:
+        f:template:
+          f:spec:
+            f:containers:
+              k:{"name":"c"}:
+                f:env:
+                  k:{"name":"FROM_MANAGER_B"}:
+                    .: {}
+                    f:name: {}
+                    f:value: {}
+                f:image: {}
+                f:name: {}
+```
+
+Read this literally: `k:{"name":"c"}` means "the list element in `containers` whose identity key `name` equals `c`" -- not "index 0." Nested one level deeper, `k:{"name":"FROM_MANAGER_A"}` means the exact same thing for the `env` list, one level down. `manager-a` owns `env[name=FROM_MANAGER_A]`; `manager-b` owns `env[name=FROM_MANAGER_B]`. They are, structurally, disjoint field paths -- there is nothing to conflict over, because SSA never treated `env` as one field to own, it treated each keyed element as its own field.
+
+## The schema markers that make this possible
+
+The `k:` addressing above only works because the live OpenAPI schema tells the API server `env` is a **map-type list** keyed by `name` -- read directly from a running 1.37 cluster:
+
+```text
+$ kubectl get --raw /openapi/v3/api/v1 | jq '.components.schemas."io.k8s.api.core.v1.Container".properties.env'
+{
+  "type": "array",
+  "items": { "$ref": "#/components/schemas/io.k8s.api.core.v1.EnvVar" },
+  "x-kubernetes-list-map-keys": ["name"],
+  "x-kubernetes-list-type": "map",
+  "x-kubernetes-patch-merge-key": "name",
+  "x-kubernetes-patch-strategy": "merge"
+}
+```
+
+Compare that to `args`, real output from the same live schema, one property over:
+
+```text
+$ kubectl get --raw /openapi/v3/api/v1 | jq '.components.schemas."io.k8s.api.core.v1.Container".properties.args'
+{
+  "type": "array",
+  "items": { "type": "string" },
+  "x-kubernetes-list-type": "atomic"
+}
+```
+
+`x-kubernetes-list-type: atomic` means exactly what it says: the *entire list* is one field, owned as a single unit, with no per-element keying at all -- there is no identity to key by (`args` is a plain string array; nothing distinguishes one element from another the way `name` does for `env`).
+
+## Atomic lists, proven: the whole array conflicts, not one element
+
+The same two-manager experiment, this time on `args`:
+
+```yaml
+# k8s/server-side-apply-internals/ssa-args-a.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ssa-atomic-demo
+  namespace: internals-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ssa-atomic-demo }
+  template:
+    metadata:
+      labels: { app: ssa-atomic-demo }
+    spec:
+      containers:
+        - name: c
+          image: registry.k8s.io/pause:3.10
+          args: ["--flag-a"]
+```
+
+```text
+$ kubectl apply --server-side --field-manager=manager-a -f ssa-args-a.yaml
+deployment.apps/ssa-atomic-demo serverside-applied
+
+$ kubectl apply --server-side --field-manager=manager-b -f ssa-args-b.yaml   # args: ["--flag-b"]
+error: Apply failed with 1 conflict: conflict with "manager-a": .spec.template.spec.containers[name="c"].args
+Please review the fields above--they currently have other managers. Here
+are the ways you can resolve this warning:
+* If you intend to manage all of these fields, please re-run the apply
+  command with the `--force-conflicts` flag.
+...
+```
+
+The conflicted field path is `.args`, the whole array, not `.args[0]` -- `manager-b` never gets to own "just its own element" the way it did with `env`, because there is no per-element identity for `args` to key ownership by. `manager-a`'s real `managedFields` for this object confirms it holds the field as one opaque unit:
+
+```text
+$ kubectl -n internals-demo get deployment ssa-atomic-demo -o yaml --show-managed-fields
+  managedFields:
+  - manager: manager-a
+    fieldsV1:
+      f:spec:
+        f:template:
+          f:spec:
+            f:containers:
+              k:{"name":"c"}:
+                f:args: {}    # one opaque field -- no k:/v: children, unlike env above
+                f:image: {}
+                f:name: {}
+```
+
+`f:args: {}` with no nested keys at all, versus `f:env` with a `k:{"name":...}` child per element above -- this is the field-ownership tree directly reflecting the schema's `map` vs `atomic` marker, not a coincidence of these two particular examples.
+
+## A schema marker does not override a hardcoded immutability rule
+
+One more real, easy-to-get-wrong result: `containers` itself is *also* `x-kubernetes-list-type: map` (keyed by `name`, same as `env`) --
+
+```text
+$ kubectl get --raw /openapi/v3/api/v1 | jq '.components.schemas."io.k8s.api.core.v1.PodSpec".properties.containers'
+{
+  "description": "List of containers belonging to the pod. Containers cannot currently be added or removed. ... Cannot be updated.",
+  "type": "array",
+  "x-kubernetes-list-map-keys": ["name"],
+  "x-kubernetes-list-type": "map",
+  ...
+}
+```
+
+-- which looks like it should let a second manager add a whole new container the same way `env` let a second manager add a new variable. It does not, on a bare Pod, because of a separate, hardcoded strategy-level validation rule (not anything SSA or the schema's list-type controls):
+
+```text
+$ kubectl apply --server-side --field-manager=manager-b -f add-sidecar.yaml
+The Pod "ssa-demo" is invalid: spec.containers: Forbidden: pod updates may not add or remove containers
+```
+
+The schema's own description field says so directly -- *"Containers cannot currently be added or removed... Cannot be updated"* -- this is Kubernetes choosing to forbid a mutation entirely at the update-validation layer, independent of whatever the merge algorithm would otherwise permit. `list-type: map` describes *how a merge combines two managers' values if the update is allowed at all*; it says nothing about whether the update is allowed. (A Deployment's `spec.template.spec.containers`, by contrast, is a template inside a different, fully-mutable object -- exactly why the `env`/`args` experiments above used a Deployment, not a bare Pod.)
+
+## `structured-merge-diff`: the library that actually computes this
+
+None of the merging above is bespoke Kubernetes code -- it is `sigs.k8s.io/structured-merge-diff` (pinned at **v6.4.2** in this course's `go.mod`), a general-purpose library for computing field ownership over a typed schema, vendored into `k8s.io/apimachinery`. The API server's own `managedfields` package (`staging/src/k8s.io/apimachinery/pkg/util/managedfields/internal/manager.go`) wraps it behind one real interface:
+
+```go
+// staging/src/k8s.io/apimachinery/pkg/util/managedfields/internal/manager.go, v1.37.0
+type Manager interface {
+	Apply(liveObj, appliedObj runtime.Object, managed Managed, fieldManager string, force bool) (runtime.Object, Managed, error)
+	// ...
+}
+```
+
+Every `--server-side` apply the API server processes is a call into this same `Apply()`, which is also exactly the function `fieldmanager.NewManagedFieldsValidatingAdmissionController` (seen in [Admission Chain](/kubernetes/en/k8s-internals/admission-chain/)'s real `create.go` excerpt) wraps as part of admission -- field-ownership computation is not a side effect bolted onto the request path, it is one more admission-adjacent step every create/update goes through.
+
+## How controllers use SSA: Apply Configurations in `client-go`
+
+Hand-written controllers get the same conflict-safe merge behavior through generated **Apply Configuration** types -- `DeploymentApplyConfiguration` and friends (`staging/src/k8s.io/client-go/applyconfigurations/apps/v1/deployment.go`), built specifically to express "the subset of fields I own" rather than a full object:
+
+```go
+// staging/src/k8s.io/client-go/applyconfigurations/apps/v1/deployment.go, v1.37.0
+func Deployment(name, namespace string) *DeploymentApplyConfiguration { /* ... */ }
+func ExtractDeployment(deployment *appsv1.Deployment, fieldManager string) (*DeploymentApplyConfiguration, error) { /* ... */ }
+```
+
+`ExtractDeployment` is the read half of the same idea: it pulls back out of a live object only the fields a given `fieldManager` currently owns, so a controller can build its next apply from "what I actually own now" instead of assuming it still owns everything it applied last time -- the controller-side mirror of reading `managedFields` back yourself, proven throughout this lesson.
+
+<Mermaid title="Two field managers, one list, two outcomes" code={ssaDiagram} />
+
+export const ssaDiagram = `flowchart TD
+  schema["Live OpenAPI schema: x-kubernetes-list-type"] -->|map, keyed by name| mapPath["env: manager-a owns env[name=A]\\nmanager-b owns env[name=B]\\nNO CONFLICT (proven above)"]
+  schema -->|atomic| atomicPath["args: manager-a owns the WHOLE array\\nmanager-b's apply CONFLICTS (proven above)"]
+  mapPath --> smd["structured-merge-diff computes field ownership\\n(sigs.k8s.io/structured-merge-diff v6.4.2)"]
+  atomicPath --> smd
+  smd --> managedFields["metadata.managedFields: f:/k:/v: tree per manager"]`;
+
+## Mental Model
+
+`managedFields` is not "a log of who applied last" -- it is the *current* field-ownership tree, and every question about whether two managers will conflict reduces to one question: does the schema give this field's list elements an identity to key ownership by? `x-kubernetes-list-type: map` (or `set`) says yes, so `structured-merge-diff` can grant disjoint ownership over disjoint elements -- proven above, zero conflict on `env`. `x-kubernetes-list-type: atomic` says no, so the entire list is one field with one owner at a time -- proven above, an immediate, real conflict on `args`. A hardcoded immutability rule (Pod `containers`) is a third, independent axis entirely -- it can forbid the update outright regardless of what the merge algorithm would have computed.
+
+## Trade-offs
+
+| List type | Benefit | Cost |
+|---|---|---|
+| `map` (keyed, e.g. `env`, `ports`, `containers`) | Multiple managers can safely co-own different elements with zero conflict (proven above) | Requires a real identity key in the schema; not every list has one |
+| `atomic` (e.g. `args`, `command`) | Simple, unambiguous ownership -- exactly one manager per whole field | A second manager touching *any* element forces a real conflict, even to add one harmless-looking value |
+| Hardcoded immutability (Pod `containers` add/remove) | Prevents a whole class of "silently reshape a running Pod" mistakes | Overrides what the list-type marker alone would suggest is possible -- proven above, easy to assume incorrectly |
+
+## Common Misconceptions
+
+- **"`managedFields` is basically the server-side version of `last-applied-configuration`."** Proven above: it is a per-manager, per-field-path tree keyed by real schema markers, not one stashed blob -- two managers can co-own one list with zero conflict, something the old annotation-based mechanism had no concept of at all.
+- **"If a field is a list, two managers touching different elements never conflict."** Proven above to be true only for `map`/`set` list types -- the identical experiment on an `atomic` list (`args`) produces a real, immediate conflict on the whole array.
+- **"A `map`-type list means any change to it is always allowed."** Proven above with Pod `containers`: the schema's own `list-type: map` marker coexists with a separate, hardcoded rule forbidding adding or removing elements at all on that particular object.
+- **"`managedFields` is Kubernetes-specific bespoke logic."** Proven above: the actual computation is `sigs.k8s.io/structured-merge-diff`, a general-purpose library, wrapped by one real `Manager.Apply()` interface in `k8s.io/apimachinery`.
+
+## Reading AI-generated code
+
+When reviewing generated SSA usage, a claimed conflict resolution, or a controller's apply logic, check for:
+
+- `--force-conflicts` reached for immediately on any conflict error, without reading which field path it names -- proven above, the field path (`.args` vs `.env[name=...]`) tells you exactly whether you are about to steal a whole atomic field from another manager or just claim one disjoint map key.
+- Code assuming any list field supports "just add your own element safely" -- proven above, that guarantee only holds for `map`/`set` list types; check the live schema (`kubectl get --raw /openapi/v3/...`) before assuming, not after a conflict shows up in production.
+- A controller building its next apply from what it applied last time, rather than `Extract*` (e.g. `ExtractDeployment`) against the live object -- proven above, `Extract*` gives you what you actually own *now*, which can differ if another manager took over a field you stopped setting.
+- An assumption that `x-kubernetes-list-type: map` alone guarantees an update is allowed at all -- proven above with Pod `containers`, a hardcoded immutability rule can forbid the update entirely, independent of the merge type.
+
+<SpotTheBug code={`# A teammate's fix for a recurring SSA conflict on a Deployment's args
+kubectl apply --server-side --force-conflicts --field-manager=my-controller -f patch.yaml`}>
+This reaches for `--force-conflicts` without ever reading which field the conflict named. Proven above: on an `atomic`-type list like `args`, the conflicted field path is the *entire array* (`.spec.template.spec.containers[name="c"].args`) -- forcing it silently discards whatever the other manager's `args` value was, not just "adds mine alongside theirs" the way it would for a `map`-type list like `env`. The correct response, proven throughout this lesson, is to read the conflict's exact field path first: if it is an atomic list, `--force-conflicts` is a real, deliberate overwrite of someone else's entire value, not a safe merge -- that decision should be made by a human reading the specific field, not baked into a script that fires on every conflict regardless of which field it is.
+</SpotTheBug>
+
+<Callout title="The one-line takeaway">
+`managedFields` is a per-manager tree of `f:`/`k:`/`v:` markers, not a flat log -- `k:{"name":"..."}` addresses one list element by identity, proven above with two managers cleanly co-owning different `env` entries on the same Deployment with zero conflict. Whether that's possible at all depends on the live OpenAPI schema's `x-kubernetes-list-type`: **`map`** (keyed, e.g. `env`, `ports`) lets disjoint elements have disjoint owners; **`atomic`** (e.g. `args`) makes the whole list one field, one owner, proven above with a real, immediate conflict naming the entire array. A hardcoded strategy rule (Pod `containers` forbidding add/remove) can still override what a `map`-type marker alone would suggest is safe. All of this runs through one real library, `structured-merge-diff` (`sigs.k8s.io/structured-merge-diff` v6.4.2), wrapped by one `Manager.Apply()` interface every `--server-side` request goes through -- and controllers get the same safety through generated `Extract*`/Apply Configuration types in `client-go`, not by hand-rolling field tracking themselves.
+</Callout>
+
+export const quizSSAInternals = [
+  {
+    q: '```text\nk:{"name":"c"}:\n  f:env:\n    k:{"name":"FROM_MANAGER_A"}:\n      .: {}\n```\nWhat does the k: prefix mean in this real managedFields output?',
+    options: [
+      'The array index of this element (position 0, 1, 2...)',
+      'This list element is addressed by an identity key (here, name), not by its position in the array',
+      'The field is a Kubernetes-specific keyword unrelated to list addressing',
+      'The manager only has read access to this field',
+    ],
+    answer: 1,
+    explain: 'Proven above: k:{"name":"c"} means "the element whose name key equals c" -- ownership is tracked per identity, which is exactly why two managers touching different keys never collide.',
+  },
+  {
+    q: '```text\n$ kubectl apply --server-side --field-manager=manager-b -f ssa-args-b.yaml\nerror: Apply failed with 1 conflict: conflict with "manager-a": .spec.template.spec.containers[name="c"].args\n```\nWhy does the whole args field conflict, rather than just the one new value manager-b tried to add?',
+    options: [
+      'args happens to be misconfigured on this specific cluster only',
+      'args is an atomic-type list in the schema (x-kubernetes-list-type: atomic) -- with no per-element identity key, the entire array is tracked and owned as a single field',
+      'manager-b made a typo in its YAML',
+      'Only string arrays can ever be map-type; args is a string array so it must be atomic',
+    ],
+    answer: 1,
+    explain: 'Proven above from the live schema: args has x-kubernetes-list-type: atomic with no list-map-keys at all -- there is no identity to key ownership by, so the whole list is one field.',
+  },
+  {
+    q: '```text\n$ kubectl get --raw /openapi/v3/api/v1 | jq \'...PodSpec.properties.containers\'\n{"x-kubernetes-list-type": "map", "description": "...Containers cannot currently be added or removed...Cannot be updated."}\n```\nGiven this real schema, why did a second manager still fail to add a new container to a Pod via SSA?',
+    options: [
+      'The schema is wrong and list-type should say atomic',
+      'A separate, hardcoded strategy-level validation rule forbids adding/removing Pod containers entirely, independent of what the list-type marker alone would otherwise allow for merging',
+      'SSA never supports adding new elements to any map-type list',
+      'Only Deployments support map-type list merging, never bare Pods',
+    ],
+    answer: 1,
+    explain: 'Proven above: the schema\'s own description states containers cannot be added or removed -- this is enforced separately from list-type merge semantics, which is why the same env field on a Deployment template DOES allow a second manager to add a new element.',
+  },
+  {
+    q: 'What library actually computes Kubernetes field ownership and merge behavior for Server-Side Apply?',
+    options: [
+      'A bespoke algorithm hand-written specifically for the Kubernetes API server',
+      'sigs.k8s.io/structured-merge-diff, a general-purpose library (pinned v6.4.2), wrapped by a single Manager.Apply() interface in k8s.io/apimachinery',
+      'The same OpenAPI validation library used for kubectl explain',
+      'etcd\'s own internal conflict resolution for concurrent writes',
+    ],
+    answer: 1,
+    explain: 'Proven above from go.mod and manager.go -- structured-merge-diff is a separate, general-purpose library, not bespoke API-server logic.',
+  },
+  {
+    q: 'How should a hand-written controller build its next Server-Side Apply request, according to the real client-go pattern?',
+    options: [
+      'Always resend the exact same object it applied last time, unconditionally',
+      'Use a generated Extract* function (e.g. ExtractDeployment) against the live object to read back only the fields it currently owns, then build the next apply from that',
+      'Read metadata.resourceVersion and increment it manually',
+      'Always pass --force-conflicts to guarantee the apply succeeds',
+    ],
+    answer: 1,
+    explain: 'Proven above from client-go\'s applyconfigurations package: Extract* mirrors reading managedFields yourself -- it reflects current real ownership, which can have changed since the last apply if another manager took over a field.',
+  },
+];
+
+<Quiz client:visible id="k8s-internals/server-side-apply-internals" questions={quizSSAInternals} />
+
+<ProgressTracker client:visible id="k8s-internals/server-side-apply-internals" />

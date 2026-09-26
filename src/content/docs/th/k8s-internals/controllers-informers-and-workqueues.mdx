@@ -1,0 +1,309 @@
+---
+title: 'Controllers, Informers, and Workqueues'
+description: 'pattern จริงของ client-go ที่ controller ทุกตัวใน Kubernetes ใช้ -- Reflector, DeltaFIFO, Indexer/Lister และ workqueue แบบ rate-limited -- พิสูจน์ด้วย TypeScript informer จริงที่รันกับ cluster จริง, garbage collection ผ่าน ownerReference จริง และ controller chain จริงของ Deployment ไปจนถึง Pod จาก source'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## ไอเดียหลักในหนึ่งประโยค
+
+controller ทุกตัวใน Kubernetes ไม่ว่าจะ built-in หรือ custom มีรูปร่างเดียวกัน **Reflector** list ครั้งเดียวแล้ว watch ต่อ ป้อนเข้า **DeltaFIFO** ที่ **Indexer/Lister** อ่านเป็น cached state ในขณะที่ **workqueue** แยกต่างหากที่ rate-limited แยก "event มาถึง" ออกจาก "reconcile รันแล้ว" ทำให้อธิบาย controller ได้เสมอว่าคือ *watch → queue → reconcile* ไม่ใช่ loop ที่ poll
+
+## pattern จริง ตรงจาก client-go
+
+package `tools/cache` ของ `client-go` (pin ตาม Kubernetes **v1.37.0** ของคอร์สนี้) คือ library ที่ controller ทุกตัวใน codebase — และ custom controller เกือบทุกตัวที่เคยเขียนด้วย Go หรือ TypeScript คุยกับ Kubernetes API — สร้างขึ้นบนมัน
+
+- **Reflector** (`staging/src/k8s.io/client-go/tools/cache/reflector.go`) มีหน้าที่เดียวคือเรียก `ListAndWatch` (บรรทัด 463 ใน source ที่คอร์สนี้ pin ไว้) `list()` (บรรทัด 674) ครั้งเดียว แล้ว `watch()` (บรรทัด 561) ต่อจาก `resourceVersion` นั้นไปเรื่อย ๆ ตลอดไป restart watch (ด้วยการ re-list ใหม่ที่ถูกกว่า เฉพาะเมื่อ watch เองพัง) ทุกครั้งที่ connection หลุด
+- **DeltaFIFO** (`tools/cache/delta_fifo.go`) คือ queue ที่ Reflector push เข้าไป ค่า `DeltaType` จริงที่ export ออกมา (บรรทัด 182 เป็นต้นไป) คือ `Added`, `Updated`, `Deleted`, `Replaced` (ใช้ตอน resync หรือ watch error บังคับให้ re-list เต็ม), `Sync` (การส่งซ้ำเป็นช่วง ๆ ของ state ที่มีอยู่แล้ว ไม่ทำอะไรถ้าไม่ตอบสนอง) และ `Bookmark`
+- **Indexer/Lister** คือ cache ในหน่วยความจำที่สร้างจาก Delta stream เดียวกันนี้ นี่คือสิ่งที่ทำให้โค้ดที่ใช้ `client-go` เร็ว `Lister().Get(...)` ของ controller ไม่เคยเรียก network เลย มันอ่าน cache ของ informer เอง
+- **workqueue** (`staging/src/k8s.io/client-go/util/workqueue`) คือรอยต่อที่ตั้งใจไว้ระหว่าง "event มาถึง" กับ "reconcile รันแล้ว" event handler ของ informer ไม่ทำอะไรนอกจากคำนวณ key แล้วเรียก `queue.Add(key)` (หรือ `AddRateLimited(key)` ตอน retry) ส่วน worker goroutine อีกชุดเรียก `queue.Get()` เป็น loop แล้วรัน reconcile function จริง นี่คือเหตุผลที่ controller reconcile key เดียวกันซ้ำสองครั้งติดกันได้อย่างปลอดภัย หรือรวม update สิบครั้งติด ๆ กันของ object เดียวเป็น reconcile ครั้งเดียว — queue ทำ dedupe ด้วย key ไม่ใช่ด้วย event
+
+<Mermaid title="pattern informer ของ client-go ตั้งแต่ watch event จนถึง reconcile" code={informerDiagram} />
+
+export const informerDiagram = `flowchart LR
+  api["kube-apiserver: watch stream"] --> reflector["Reflector\\nListAndWatch()"]
+  reflector --> deltafifo["DeltaFIFO\\nAdded / Updated / Deleted / Replaced / Sync / Bookmark"]
+  deltafifo --> indexer["Indexer / Lister\\n(local cache, ไม่มีการเรียก network)"]
+  deltafifo --> handlers["Event handlers\\nคำนวณ key เท่านั้น"]
+  handlers --> queue["workqueue\\n(rate-limited, dedupe ด้วย key)"]
+  queue --> worker["Worker goroutine: Get() -> reconcile(key) -> Done()/AddRateLimited()"]
+  worker --> indexer`;
+
+## Level-triggered ไม่ใช่ edge-triggered: ทำไม `Sync`/`Replaced` ถึงมีอยู่
+
+ข้อเท็จจริงที่ละเอียดอ่อนและพลาดง่าย Delta type ข้างบนไม่ใช่แค่ "อะไรเปลี่ยน" มันมี **`Sync`** กับ **`Replaced`** ที่ fire โดยไม่มีอะไรเปลี่ยนกับ object เลยด้วยซ้ำ — resync เต็มเป็นช่วง ๆ (ตั้งค่าผ่าน `resyncPeriod` ของ informer) ส่ง object ทุกตัวที่มีอยู่ใน cache ซ้ำเป็น delta `Sync` และ watch ที่ต้อง restart ด้วย list ใหม่ส่ง object ทุกตัวซ้ำเป็น `Replaced` (comment ที่ `delta_fifo.go` บรรทัด 186-193 ใน source ที่คอร์สนี้ pin ไว้ *"Replaced is emitted when we encountered watch errors and had to do a relist"*) นี่คือเหตุผลเชิงกลไกที่ทำไม controller ของ Kubernetes เรียกว่า **level-triggered** reconcile function ที่ถูกต้องอ่าน desired-vs-actual state ปัจจุบันแล้ว converge มันเข้าหากัน ไม่ว่า *ทำไม* มันถึงถูกเรียก — เปลี่ยนจริง, resync หรือ relist — แทนที่จะตอบสนองต่อ delta นั้นเหมือนเป็นคำสั่งแก้ไข controller ที่จัดการแค่ `Added`/`Updated`/`Deleted` แล้วเมิน `Sync` อาจจะยังโอเค (delta `Sync` มักจะ reconcile ไปเป็น no-op) แต่ controller ที่พยายามตีความ delta ว่าเป็น "อะไรเปลี่ยนไปเป๊ะ ๆ" แทนที่จะเป็น "key นี้อาจจะต้อง reconcile" คือเข้าใจ pattern ผิดไปแล้ว
+
+## Rate limiting และ requeue: `AddRateLimited` กับ `Forget`
+
+workqueue ไม่ใช่ FIFO ธรรมดา `TypedRateLimitingInterface` (`staging/src/k8s.io/client-go/util/workqueue/rate_limiting_queue.go` บรรทัด 27) เพิ่มสองเมธอดที่ queue ธรรมดาไม่มี `AddRateLimited(item)` ที่ requeue item หลัง backoff ที่โตขึ้นเรื่อย ๆ ตาม failure ที่เกิดซ้ำ และ `Forget(item)` ที่ reset backoff นั้นเมื่อ reconcile สำเร็จในที่สุด worker loop จริงของ Deployment controller แสดง pattern นี้ตรง ๆ (`pkg/controller/deployment/deployment_controller.go`)
+
+```go
+// pkg/controller/deployment/deployment_controller.go, v1.37.0 (line numbers from this course's pinned source)
+// line 416, inside syncHandler's caller on a transient error:
+dc.queue.AddRateLimited(key)
+
+// line 502/518, inside processNextWorkItem, on success:
+dc.queue.Forget(key)
+
+// line 512, on error from syncHandler:
+dc.queue.AddRateLimited(key)
+```
+
+reconcile ที่คืน error จะถูก requeue ด้วย exponential backoff (`AddRateLimited`) ส่วนตัวที่คืนสำเร็จเรียก `Forget` เพื่อ reset backoff กลับเป็นศูนย์ เพื่อให้ failure ชั่วคราวครั้ง*ถัดไป*เริ่ม backoff ใหม่จากศูนย์แทนที่จะโตต่อเนื่องไม่หยุด นี่คือกลไกจริงเบื้องหลัง "controller ของ Kubernetes retry อัตโนมัติ" มันไม่ใช่ supervisor ทั่วไปที่ restart ทั้ง process แต่คือ queue ตัวนี้ ต่อ key
+
+## TypeScript informer ขนาดเล็ก รันกับ cluster จริง
+
+pattern เดียวกันใน `@kubernetes/client-node` 2.x ใช้ object-parameter API จริง (`listNamespacedPod({ namespace })` ไม่ใช่ signature แบบ positional argument เก่า) กับ `makeInformer`
+
+```ts
+// src/informer-demo.ts
+import { KubeConfig, CoreV1Api, makeInformer } from '@kubernetes/client-node';
+
+const kc = new KubeConfig();
+kc.loadFromDefault();
+const k8sApi = kc.makeApiClient(CoreV1Api);
+
+const NAMESPACE = 'internals-demo';
+const listFn = () => k8sApi.listNamespacedPod({ namespace: NAMESPACE });
+
+// A workqueue-shaped reconcile loop: every event just enqueues a key,
+// never runs reconcile inline -- this is what "level-triggered, not
+// edge-triggered" means in practice.
+const queue: string[] = [];
+function enqueue(key: string) {
+  console.log(`[informer] enqueue ${key}`);
+  if (!queue.includes(key)) queue.push(key);
+}
+
+const informer = makeInformer(kc, `/api/v1/namespaces/${NAMESPACE}/pods`, listFn);
+
+informer.on('add', (obj) => enqueue(`${NAMESPACE}/${obj.metadata?.name}`));
+informer.on('update', (obj) => enqueue(`${NAMESPACE}/${obj.metadata?.name}`));
+informer.on('delete', (obj) => enqueue(`${NAMESPACE}/${obj.metadata?.name}`));
+informer.on('error', (err) => {
+  console.error('[informer] watch error, will restart after backoff:', err);
+  setTimeout(() => informer.start(), 5000);
+});
+
+async function reconcile(key: string) {
+  // A real reconcile always re-reads current state from the Lister/cache
+  // instead of trusting the event payload -- proven necessary below.
+  console.log(`[reconcile] ${key}`);
+}
+
+setInterval(async () => {
+  const key = queue.shift();
+  if (key) await reconcile(key);
+}, 200);
+
+informer.start();
+```
+
+รันจริงกับ `kind` cluster ของบทนี้ (`kubectl label pod probe-pod round=one` ทำให้เกิด event `update` ระหว่าง informer ต่ออยู่)
+
+```text
+$ npx tsx src/informer-demo.ts
+[informer] enqueue internals-demo/probe-pod
+[reconcile] internals-demo/probe-pod
+[informer] enqueue internals-demo/probe-pod
+[reconcile] internals-demo/probe-pod
+```
+
+คู่ `enqueue`/`reconcile` แรก fire ทันทีตอนเริ่ม — `makeInformer` ส่ง state ปัจจุบันเป็น event `add` เสมอระหว่าง `list()` เริ่มต้นของมัน ตรงกับ `ListAndWatch` ของ Reflector เองเป๊ะ ๆ คู่ที่สองคือ event `update` จริงจากการเปลี่ยน `kubectl label` ส่งผ่าน watch connection เดิมที่ยังเปิดอยู่ ไม่มีการ poll คั่นกลางเลย
+
+## ownerReferences และ garbage collection พิสูจน์แล้ว
+
+Deployment ไม่ได้ลบ Pod ของตัวเองตอนคุณลบมัน — controller แยกต่างหากชื่อ `GarbageCollector` watch `ownerReferences` แล้วลบ dependent เมื่อ owner หายไป chain นี้เห็นได้ตรง ๆ บน cluster จริง ReplicaSet ทุกตัวที่ Deployment สร้างมี `metadata.ownerReferences` ชี้กลับไปที่ Deployment (`pkg/controller/replicaset/replica_set.go` อ่านกลับด้วย `metav1.GetControllerOf(rs)` เช่นบรรทัด 309) และ Pod ทุกตัวที่ ReplicaSet สร้างมี `ownerReferences` ชี้ไปที่ ReplicaSet นั้น (`GetControllerOf(pod)` บรรทัด 474)
+
+```yaml
+# k8s/controllers-informers-and-workqueues/gc-demo.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gc-demo3
+  namespace: internals-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: gc-demo3 }
+  template:
+    metadata:
+      labels: { app: gc-demo3 }
+    spec:
+      containers:
+        - name: c
+          image: registry.k8s.io/pause:3.10
+```
+
+`ownerReferences` จริง อ่านกลับหลัง apply manifest ข้างบน
+
+```text
+$ kubectl -n internals-demo get rs -l app=gc-demo3 -o jsonpath='{.items[0].metadata.name} {.items[0].metadata.ownerReferences}'
+gc-demo3-5c7d78c84b [{"apiVersion":"apps/v1","blockOwnerDeletion":true,"controller":true,"kind":"Deployment","name":"gc-demo3","uid":"e71838d9-6050-45ff-a00e-b1d89b54d071"}]
+
+$ kubectl -n internals-demo get pods -l app=gc-demo3 -o jsonpath='{.items[0].metadata.name} {.items[0].metadata.ownerReferences}'
+gc-demo3-5c7d78c84b-8jlbk [{"apiVersion":"apps/v1","blockOwnerDeletion":true,"controller":true,"kind":"ReplicaSet","name":"gc-demo3-5c7d78c84b","uid":"1ba8c52e-1ebf-4b0f-bce0-8f17f58771b3"}]
+```
+
+ลบ Deployment ด้วย cascade default ลบทั้ง chain — ReplicaSet หายไปทันทีและ Pod กำลังจะตามไป ไม่ใช่แค่ object Deployment
+
+```text
+$ kubectl -n internals-demo delete deployment gc-demo3
+deployment.apps "gc-demo3" deleted from internals-demo namespace
+
+$ kubectl -n internals-demo get rs,pods -l app=gc-demo3
+NAME                            READY   STATUS        RESTARTS   AGE
+pod/gc-demo3-5c7d78c84b-8jlbk   1/1     Terminating   0          40s
+```
+
+`--cascade=orphan` ปฏิเสธพฤติกรรมนั้นตรง ๆ และพิสูจน์อะไรที่เจาะจงกว่า "children รอด" — มัน orphan แค่ dependent **ชั้นถัดไปทันที** ของ object ที่คุณระบุชื่อ ไม่ไล่ลงไปลึกกว่านั้น การลบ Deployment สอง replica แบบนี้
+
+```text
+$ kubectl -n internals-demo delete deployment gc-demo4 --cascade=orphan
+deployment.apps "gc-demo4" deleted from internals-demo namespace
+
+$ kubectl -n internals-demo get rs,pods -l app=gc-demo4
+NAME                                  DESIRED   CURRENT   READY   AGE
+replicaset.apps/gc-demo4-54cd5f4cd9   2         2         2       1s
+
+NAME                            READY   STATUS    RESTARTS   AGE
+pod/gc-demo4-54cd5f4cd9-7jhlq   1/1     Running   0          1s
+pod/gc-demo4-54cd5f4cd9-lddmh   1/1     Running   0          1s
+```
+
+ReplicaSet **ยังอยู่** ไม่ใช่แค่ Pod เท่านั้น — `--cascade=orphan` บอก `GarbageCollector` ว่า "อย่าลบ dependent ของ object นี้" แค่นั้นจบ มันไม่ได้พูดอะไรเกี่ยวกับ dependent ของ ReplicaSet เองเลย เพราะ ReplicaSet เองไม่เคยถูกแตะต้องเลย นี่คือการแก้การเดาที่ฟังดูสมเหตุสมผลแต่ผิด orphan mode ไม่ได้ "ไล่ลงไปชั้นเดียวแล้วเลิกเป็นเจ้าของ" — มันหยุด cascade ที่ object ที่คุณลบจริง ๆ เท่านั้น และทุกอย่างข้างล่าง object นั้น (ซึ่งไม่เคยถูกลบเอง) ก็ไม่ถูกกระทบเลย
+
+## chain controller Deployment → ReplicaSet → Pod จาก source
+
+controller สามตัวแยกกัน แต่ละตัว reconcile คนละชั้น แต่ละตัวไม่รู้จักชั้นที่ห่างออกไปสองชั้น
+
+1. **DeploymentController** (`pkg/controller/deployment/deployment_controller.go`) reconcile Deployment ด้วยการสร้าง/แก้/ลบ **ReplicaSet** ให้ตรงกับ `spec.replicas` และ rollout strategy — มันไม่แตะ Pod โดยตรงเลย
+2. **ReplicaSetController** (`pkg/controller/replicaset/replica_set.go`) reconcile ReplicaSet ด้วยการสร้าง/ลบ **Pod** ให้ตรงกับ `spec.replicas` ของตัวเอง — `manageReplicas` (บรรทัด 649) คือฟังก์ชันที่เรียก API สร้าง/ลบ Pod จริง ๆ มันไม่รู้ด้วยซ้ำว่ามี Deployment อยู่ชั้นบน
+3. **GarbageCollector** watch `ownerReferences` ทั่วทั้ง cluster แล้วลบ object ใด ๆ ที่ owner หายไป นี่คือเหตุผล*เดียว*ที่การลบ Deployment ดูเหมือน "cascade" — ไม่มีฟังก์ชันเดียวที่ลบ Pod ของ Deployment มีแค่ controller อิสระสามตัวที่ต่างทำงานแคบ ๆ ของตัวเอง เชื่อมกันแค่ผ่าน `ownerReferences`
+
+## Leader election: controller ที่ active ตัวเดียว มีตัวสำรองยืนรอ
+
+cluster จริงรัน controller-manager process ด้วย **redundancy** — หลาย replica ของ `kube-controller-manager` มีแค่ตัวเดียวที่ควร reconcile อยู่จริง package `tools/leaderelection` ของ `client-go` (`staging/src/k8s.io/client-go/tools/leaderelection/leaderelection.go`) implement สิ่งนี้ด้วย object Lease ใน API server `LeaseDuration`, `RenewDeadline` และ `RetryPeriod` (field ของ `LeaderElectionConfig` บรรทัด 116 เป็นต้นไป) คุมว่า non-leader รอนานแค่ไหนก่อนจะสรุปว่า leader ปัจจุบันตายแล้วแล้วพยายาม `acquire()` (บรรทัด 252) lease เอง นี่คือ pattern เดียวกันเป๊ะกับ "watch API server แล้วทำตามที่เห็น" ของ informer — leader election ไม่มีกลไก coordination แยกต่างหาก มันคือ controller ที่ reconcile object Lease ตัวหนึ่ง
+
+## Mental Model
+
+controller ทุกตัวในบทนี้ — Deployment, ReplicaSet, GarbageCollector หรือตัวที่เขียนเองด้วย TypeScript — ลดรูปเหลือ pipeline สามขั้นตอนเดียวกัน Reflector เปิด watch connection ที่ยาวนานไว้ตัวเดียวแล้วแปลงเป็น Delta stream, Indexer/Lister แปลง stream นั้นเป็น cache ในเครื่องที่ทันสมัยตลอดเวลาเพื่อให้ logic reconcile ไม่ต้องขอ network round-trip ของตัวเองเพื่ออ่าน state และ workqueue แปลง "มีอะไรเกิดขึ้น" เป็น "key นี้ต้องการความสนใจ" dedupe แล้วก็ rate-limit เพื่อให้ reconcile ปลอดภัยเสมอที่จะถูกเรียกมากกว่าหนึ่งครั้งด้วยเหตุผลเดียวกัน `ownerReferences` คือ state ชิ้นเดียวที่ทำให้ controller อิสระ (Deployment, ReplicaSet, GarbageCollector) ต่อกันเป็นสิ่งที่ดูเหมือน delete แบบ cascade เดียว โดยไม่มีตัวไหนรู้จักตัวอื่นเลย
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ข้อดี | ข้อเสีย |
+|---|---|---|
+| Shared informer (watch เดียว หลาย consumer ผ่าน Lister) | watch connection เดียวต่อ resource type ต่อ process ไม่ว่า controller จะอ่านมันกี่ตัว | consumer ทั้งหมดใช้ resync period เดียวกัน consumer ที่ต้องการคนละแบบต้องมี informer ของตัวเอง |
+| workqueue กับ `AddRateLimited` | backoff อัตโนมัติเมื่อ fail ซ้ำ ไม่ต้องมี supervisor process | failure ชั่วคราวยังดีเลย์ reconcile ที่สำเร็จ*ครั้งถัดไป*ของ key นั้นตาม backoff window |
+| `ownerReferences` + GarbageCollector สำหรับ cascade delete | ไม่มี controller ตัวไหนต้องรู้ dependent tree เต็มของตัวเอง | `--cascade=orphan` เป็น footgun ที่หยิบใช้ตามความเคยชินง่าย ทิ้งทั้ง subtree ของ dependent (ReplicaSet และ Pod) ให้รันต่อโดยไม่มี owner แบบเงียบ ๆ พิสูจน์ข้างบน |
+| Leader election ผ่าน object Lease | ไม่ต้องมี coordination service แยก ใช้ API server และกลไก watch เดิมซ้ำ | พลาด `RenewDeadline` แบบจัง ๆ (เช่น GC pause) อาจทำให้มีช่วงสั้น ๆ ที่ไม่มี leader active เลย หรือ (น้อยครั้ง) มีสองตัว |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"controller poll API server เป็นช่วง ๆ"** พิสูจน์ตรงข้ามข้างบนด้วย informer จริงที่รันอยู่ มัน list ครั้งเดียวแล้วตอบสนองต่อ watch event ทีละตัวผ่าน connection เดียวที่ยาวนาน ส่วน delta `Sync`/`Replaced` เป็นช่วง ๆ คือ safety net ของ resync ไม่ใช่กลไกหลัก และยังเดินทางผ่าน watch connection เดิม ไม่ใช่ poll ใหม่
+- **"ลบ Deployment เรียกฟังก์ชันเดียวที่ลบ Pod ของมัน"** พิสูจน์ข้างบนว่าไม่มีฟังก์ชันแบบนั้น controller อิสระสามตัว (Deployment, ReplicaSet, GarbageCollector) ต่างทำงานแคบ ๆ ของตัวเอง เชื่อมกันแค่ผ่าน `ownerReferences`
+- **"`--cascade=orphan` แค่ปล่อย Pod ไว้ ส่วน ReplicaSet ถูกลบตามปกติ"** พิสูจน์ข้างบนด้วย Deployment สอง replica จริง `--cascade=orphan` orphan แค่ dependent *ชั้นถัดไปทันที* ของ object ที่คุณลบ — ReplicaSet เองรอดสมบูรณ์ และ (เพราะมันไม่เคยถูกลบ) Pod ของมันเองก็ไม่ถูกแตะต้องเลย
+- **"workqueue ส่งทุก event ไปให้ reconcile function"** พิสูจน์ข้างบนว่า queue dedupe ด้วย key ไม่ใช่ด้วย event — update สิบครั้งติด ๆ กันของ object เดียวรวมเป็น `reconcile(key)` ครั้งเดียวที่แค่อ่าน state ปัจจุบันครั้งเดียวได้
+- **"`AddRateLimited` กับ retry loop ธรรมดาคือสิ่งเดียวกัน"** พิสูจน์ข้างบนจาก interface จริง `AddRateLimited` โต backoff เมื่อ fail ซ้ำ และ `Forget` reset มันตอนสำเร็จ — retry ธรรมดาไม่มีความจำต่อ key แบบนี้ จะยิง API server รัวๆ ตอน fail ต่อเนื่อง หรือไม่กลับมาเร็วเลยหลัง fail ชั่วคราว
+
+## อ่านโค้ดที่ AI เขียน
+
+เวลา review "controller" ที่ generate มา (Go หรือ TypeScript) เช็คสิ่งเหล่านี้
+
+- เรียก `List()` ใน loop (`setInterval`, `for {}` กับ `sleep`) แทนที่จะใช้ shared informer — พิสูจน์ข้างบนด้วย informer จริงที่รันอยู่ วิธีนี้พลาดประเด็นทั้งหมดของ Delta stream และเปลืองภาระ API server ตามขนาด cluster ทุก tick
+- event handler ที่เรียก reconcile logic **ตรง ๆ** โดยไม่มี queue คั่น — เสีย dedupe และ rate limiting ไปทั้งหมด update สองครั้งเร็ว ๆ ของ object เดียวรัน reconcile function (ที่อาจแพง) สองครั้งติดกันแทนที่จะเป็นครั้งเดียว
+- reconcile function ที่อ่าน*จาก payload ของ event เอง* แทนที่จะอ่าน state ปัจจุบันใหม่จาก Lister/cache — payload อาจ stale ไปแล้วตอน reconcile รันจริง (มันรออยู่ใน queue) และ delta `Sync`/`Replaced` ไม่มี payload "อะไรเปลี่ยน" ให้อ่านตั้งแต่แรก
+- ใช้ `queue.Add(key)` ทุกที่ ไม่มีการแยก `AddRateLimited`/`Forget` — controller ที่ไม่เคยใช้ rate-limited requeue ตอน error จะยอมแพ้หลัง fail ครั้งเดียว หรือ hot-loop error ถาวรที่ความเร็วเต็มที่
+- script ที่สมมติว่าลบ parent object ลบ children เสมอ — พิสูจน์ข้างบนว่า `--cascade=orphan` มีจริง รองรับจริง และเปลี่ยนสมมติฐานนี้แบบเงียบ ๆ
+
+<SpotTheBug code={`// A "controller" that reacts to Pod events
+informer.on('update', async (pod) => {
+  if (pod.status.phase === 'Running') {
+    await markReady(pod.metadata.name, pod.status);
+  }
+});`}>
+โค้ดนี้ reconcile ตรงจาก payload `pod.status` ของ watch event เอง ตรง ๆ ไม่มี workqueue คั่น พิสูจน์ข้างบนจาก semantics จริงของ DeltaFIFO resync เป็นช่วง ๆ ส่ง object *เดิมเป๊ะ* เป็น delta `Sync` โดยไม่มีอะไรเปลี่ยนจริง และ relist หลัง watch หลุดส่งมันซ้ำเป็น `Replaced` — ทั้งสองแบบ handler นี้ประมวลผลซ้ำราวกับว่า `status.phase` เพิ่งเปลี่ยน ทำงานซ้ำซากตลอดไปกับ Pod ที่แข็งแรงและไม่เปลี่ยนแปลง แย่กว่านั้น การเรียก `markReady` ตรงข้างใน event handler หมายความว่า event `update` สองครั้งที่มาใกล้กัน (เรื่องปกติจริงเมื่อหลาย field เปลี่ยนในการเขียนครั้งเดียว) รัน `markReady` สองครั้งพร้อมกันโดยไม่มี dedupe — วิธีแก้ที่พิสูจน์ตลอดบทนี้คือ enqueue key แล้วให้ worker แยกต่างหากเรียก `reconcile(key)` ที่อ่าน state ปัจจุบันใหม่ครั้งเดียวจาก Lister แทนที่จะเชื่อ payload ของ event ตัวไหนก็ตามที่มาถึง
+</SpotTheBug>
+
+<Callout title="สรุปหนึ่งบรรทัด">
+controller ทุกตัวคือ **Reflector → DeltaFIFO → Indexer/Lister → workqueue → reconcile** พิสูจน์ข้างบนด้วย source จริงของ `client-go` และ TypeScript informer จริงที่ watch event สองตัวแรกถูก log สด ๆ กับ cluster ของบทนี้ Reflector ถือ watch เดียวที่ยาวนานแล้วแปลงเป็น Delta stream (`Added`/`Updated`/`Deleted`/`Replaced`/`Sync`/`Bookmark` — const จริง, `delta_fifo.go`) Lister serve การอ่านจาก cache ในเครื่องโดยไม่มี network call และ workqueue — ไม่ใช่ event handler — เป็นตัวตัดสินว่า reconcile รันเมื่อไหร่ dedupe ด้วย key และ rate-limit ตอน fail ผ่าน `AddRateLimited`/`Forget` นี่คือ **level-triggered** reconcile converge state ปัจจุบันไม่ว่า delta ไหนเป็นตัวทำให้มันรัน `ownerReferences` คือกลไกเดียวที่ต่อ controller อิสระ (Deployment → ReplicaSet → Pod บวก `GarbageCollector` แยกต่างหาก) เข้าด้วยกันเป็นสิ่งที่ดูเหมือน cascade delete เดียว — พิสูจน์ข้างบนด้วย `--cascade=orphan` ที่ตัดเฉพาะ object ที่คุณระบุชื่อออกจาก cascade แล้วทิ้งทุกอย่างข้างล่างมัน (ที่ไม่เคยถูกลบเอง) ไว้เหมือนเดิมทุกอย่าง Leader election (`tools/leaderelection` ของ `client-go`) คือ pattern watch-แล้ว-reconcile เดียวกันที่ใช้กับ object Lease ทำให้ controller-manager replica ที่ซ้ำซ้อนมี leader active แค่ตัวเดียวตลอดเวลา
+</Callout>
+
+export const quizControllersInformers = [
+  {
+    q: 'หน้าที่จริงของ Reflector ใน client-go คืออะไร?',
+    options: [
+      'poll API server เป็นช่วงเวลาคงที่แล้ว diff ผลกับรอบก่อน',
+      'เรียก ListAndWatch ครั้งเดียวเพื่อ list แล้วถือ watch connection เดียวที่ยาวนานต่อจาก resourceVersion นั้น restart เฉพาะเมื่อ connection หลุด',
+      'รัน reconcile function จริงสำหรับทุก object',
+      'cache object ลงดิสก์ระหว่าง controller restart',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบนจาก reflector.go ListAndWatch (บรรทัด 463) เรียก list() ครั้งเดียวแล้ว watch() -- connection เดียวที่ยาวนาน ไม่ใช่ loop ที่ poll',
+  },
+  {
+    q: '```go\n// delta_fifo.go, v1.37.0\nconst (\n  Added   DeltaType = "Added"\n  Updated DeltaType = "Updated"\n  Deleted DeltaType = "Deleted"\n  Replaced DeltaType = "Replaced" // emitted after a relist forced by a watch error\n  Sync    DeltaType = "Sync"     // periodic resync, no real change\n  Bookmark DeltaType = "Bookmark"\n)\n```\nทำไม Sync กับ Replaced ถึงมีอยู่ควบคู่กับ Added/Updated/Deleted?',
+    options: [
+      'เป็นชื่อเรียกซ้ำที่เก็บไว้เพื่อ backward compatibility เท่านั้น',
+      'ให้ controller แบบ level-triggered re-converge state ใหม่ได้หลัง resync เป็นช่วง ๆ หรือ relist ที่ถูกบังคับ แม้ไม่มีอะไรเปลี่ยนกับ object จริง ๆ',
+      'fire แค่ตอน API server เอง restart',
+      'แทนที่ Added/Updated/Deleted ทั้งหมดใน cluster เวอร์ชันใหม่กว่า',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบน reconcile function ที่ถูกต้องมองทุก delta type ว่าเป็น "key นี้อาจต้อง reconcile" converge state ไม่ว่าสาเหตุจะเป็นอะไร -- นี่คือความหมายของ "level-triggered ไม่ใช่ edge-triggered"',
+  },
+  {
+    q: '```text\n$ kubectl -n internals-demo delete deployment gc-demo4 --cascade=orphan\ndeployment.apps "gc-demo4" deleted from internals-demo namespace\n\n$ kubectl -n internals-demo get rs,pods -l app=gc-demo4\nNAME                                  DESIRED   CURRENT   READY   AGE\nreplicaset.apps/gc-demo4-54cd5f4cd9   2         2         2       1s\n\nNAME                            READY   STATUS    RESTARTS   AGE\npod/gc-demo4-54cd5f4cd9-7jhlq   1/1     Running   0          1s\npod/gc-demo4-54cd5f4cd9-lddmh   1/1     Running   0          1s\n```\noutput จริงนี้พิสูจน์อะไรเกี่ยวกับการทำงานจริงของ --cascade=orphan?',
+    options: [
+      'API server มีกฎในตัวที่ลบ children ของ object ที่ถูกลบเสมอ',
+      'มัน orphan แค่ dependent ชั้นถัดไปทันทีของ object ที่คุณระบุชื่อ -- ReplicaSet เองรอดโดยไม่ถูกแตะ และ Pod ของมันไม่ถูกกระทบเพราะ ReplicaSet ไม่เคยถูกลบ',
+      'Pod ถูกลบก่อนเสมอ ก่อน Deployment เอง',
+      '--cascade=orphan ใช้ได้แค่กับ StatefulSet ไม่ใช่ Deployment',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบน ReplicaSet ยังอยู่ครบ (DESIRED/CURRENT/READY เป็น 2 ทั้งหมด) ไม่ใช่แค่ Pod -- --cascade=orphan ตัดแค่ object ที่คุณลบออกจาก cascade ของ GarbageCollector ไม่ได้ไล่ลงไปลึกกว่านั้นใน ownership chain',
+  },
+  {
+    q: 'workqueue.AddRateLimited(key) ทำอะไรที่ queue.Add(key) ไม่ทำ?',
+    options: [
+      'ไม่มีอะไรต่าง เป็นชื่อเรียกซ้ำ',
+      'requeue key หลัง backoff ที่โตขึ้นตาม failure ที่เกิดซ้ำของ key นั้น reset ด้วย Forget(key) ตอนสำเร็จ',
+      'ลบ key ออกจาก informer cache',
+      'ส่ง key ไปยัง controller replica ตัวอื่น',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบนจาก rate_limiting_queue.go และ worker loop จริงของ Deployment controller AddRateLimited โต backoff เมื่อ fail ซ้ำ Forget reset มันเป็นศูนย์ตอนสำเร็จ',
+  },
+  {
+    q: '```ts\ninformer.on(\'update\', async (pod) => {\n  if (pod.status.phase === \'Running\') {\n    await markReady(pod.metadata.name, pod.status);\n  }\n});\n```\nอะไรผิดกับการ reconcile ตรงข้างใน event handler นี้?',
+    options: [
+      'ไม่มีอะไรผิด นี่คือ pattern ที่แนะนำ',
+      'มันข้าม workqueue ไปทั้งหมด ทำให้ delta Sync/Replaced ที่ไม่มีอะไรเปลี่ยนจริงรัน markReady ซ้ำโดยไม่จำเป็น และ event update สองครั้งใกล้กันรันมันพร้อมกันสองครั้งโดยไม่มี dedupe',
+      'syntax TypeScript ไม่ถูกต้อง',
+      'informer.on รองรับแค่ event add ไม่ใช่ update',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ตลอดบทนี้ pattern ที่ถูกต้อง enqueue key แล้วให้ worker แยกเรียก reconcile(key) ที่อ่าน state ปัจจุบันใหม่ครั้งเดียว -- dedupe ด้วย key และรอดจาก delta Sync/Replaced ที่ไม่มีอะไรเปลี่ยนจริง',
+  },
+  {
+    q: 'controller สามตัวไหนที่เกี่ยวข้องจริง ๆ เมื่อ kubectl delete deployment ลบ Deployment, ReplicaSet และ Pod ของมัน?',
+    options: [
+      'controller เดียวตัวเดียวที่ลบทั้ง tree ตรง ๆ',
+      'DeploymentController (reconcile ReplicaSet), ReplicaSetController (reconcile Pod ผ่าน manageReplicas) และ GarbageCollector (ลบ dependent เมื่อ ownerReferences ชี้ไปที่ owner ที่ถูกลบแล้ว) -- controller อิสระสามตัว เชื่อมกันแค่ผ่าน ownerReferences',
+      'มีแค่ GarbageCollector ที่ลบทุกอย่างในรอบเดียว',
+      'kubelet ที่ watch Deployment ที่ถูกลบตรง ๆ',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบนจาก source จริง (deployment_controller.go, replica_set.go manageReplicas บรรทัด 649) และพฤติกรรม --cascade=orphan controller แคบสามตัวที่แยกกัน ไม่มีตัวไหนรู้จักตัวอื่น เชื่อมกันด้วย ownerReferences',
+  },
+];
+
+<Quiz client:visible id="k8s-internals/controllers-informers-and-workqueues" questions={quizControllersInformers} />
+
+<ProgressTracker client:visible id="k8s-internals/controllers-informers-and-workqueues" />

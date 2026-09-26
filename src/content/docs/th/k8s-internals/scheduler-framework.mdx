@@ -1,0 +1,342 @@
+---
+title: 'Scheduler Framework'
+description: 'extension-point interface จริงและชื่อ plugin จริงที่ kube-scheduler รัน -- PreFilter, Filter, PostFilter, PreScore, Score, Reserve, Permit, PreBind, Bind, PostBind -- พิสูจน์จาก source บวก KubeSchedulerConfiguration profile จริงที่ apply บน control-plane node จริง'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## ไอเดียหลักในหนึ่งประโยค
+
+`kube-scheduler` ไม่ใช่กล่องดำที่ "เลือก node" — มันคือ pipeline ตายตัวของ **extension point** ที่มีชื่อ แต่ละจุดคือ Go interface ที่ **plugin** กี่ตัวก็ได้ implement ได้ และ [The Scheduler and Resource Requests](/kubernetes/th/scheduling-and-scaling/the-scheduler-and-resource-requests/) แสดง shape ของ pipeline นี้จากมุมมองภายนอกไปแล้ว บทนี้พิสูจน์ interface จริง ชื่อ plugin ที่ลงทะเบียนจริง และวิธีที่ `KubeSchedulerConfiguration` สลับว่า plugin ไหนรันที่จุดไหนจริง ๆ
+
+## extension-point interface จริง
+
+extension point แต่ละจุดคือ Go interface เล็ก ๆ ใน `staging/src/k8s.io/kube-scheduler/framework/interface.go` (v1.37.0 ที่คอร์สนี้ pin ไว้) plugin หนึ่งตัว implement หนึ่งหรือหลาย interface เหล่านี้เพื่อเข้าร่วมที่จุดนั้นใน pipeline
+
+```go
+// staging/src/k8s.io/kube-scheduler/framework/interface.go, v1.37.0
+type PreEnqueuePlugin interface {
+	Plugin
+	PreEnqueue(ctx context.Context, p *v1.Pod) *Status
+} // line 447 -- gates a Pod before it even enters the scheduling queue
+
+type QueueSortPlugin interface {
+	Plugin
+	Less(QueuedEntityInfo, QueuedEntityInfo) bool
+} // line 461 -- only one may be enabled cluster-wide
+
+type PreFilterPlugin interface {
+	Plugin
+	PreFilter(ctx context.Context, state CycleState, p *v1.Pod, nodes []NodeInfo) (*PreFilterResult, *Status)
+	PreFilterExtensions() PreFilterExtensions
+} // line 520
+
+type FilterPlugin interface {
+	Plugin
+	Filter(ctx context.Context, state CycleState, pod *v1.Pod, nodeInfo NodeInfo) *Status
+} // line 549 -- "Success" keeps the Node feasible; anything else excludes it
+
+type PostFilterPlugin interface {
+	Plugin
+	PostFilter(ctx context.Context, state CycleState, pod *v1.Pod, filteredNodeStatusMap NodeToStatusReader) (*PostFilterResult, *Status)
+} // line 578 -- runs ONLY when no Node is feasible; this is where preemption lives
+
+type PreScorePlugin interface {
+	Plugin
+	PreScore(ctx context.Context, state CycleState, pod *v1.Pod, nodes []NodeInfo) *Status
+} // line 632
+
+type ScorePlugin interface {
+	Plugin
+	Score(ctx context.Context, state CycleState, p *v1.Pod, nodeInfo NodeInfo) (int64, *Status)
+	ScoreExtensions() ScoreExtensions
+} // line 653
+
+type ReservePlugin interface {
+	Plugin
+	Reserve(ctx context.Context, state CycleState, p *v1.Pod, nodeName string) *Status
+	Unreserve(ctx context.Context, state CycleState, p *v1.Pod, nodeName string)
+} // line 670 -- Unreserve runs for every enabled ReservePlugin if any later plugin rejects the Pod
+
+type PreBindPlugin interface {
+	Plugin
+	PreBindPreFlight(ctx context.Context, state CycleState, p *v1.Pod, nodeName string) (*PreBindPreFlightResult, *Status)
+	PreBind(ctx context.Context, state CycleState, p *v1.Pod, nodeName string) *Status
+} // line 686
+
+type PermitPlugin interface {
+	Plugin
+	Permit(ctx context.Context, state CycleState, p *v1.Pod, nodeName string) (*Status, time.Duration)
+} // line 714 -- can delay a bind with a wait timeout, not just accept/reject
+
+type BindPlugin interface {
+	Plugin
+	Bind(ctx context.Context, state CycleState, p *v1.Pod, nodeName string) *Status
+} // line 727
+
+type PostBindPlugin interface {
+	Plugin
+	PostBind(ctx context.Context, state CycleState, p *v1.Pod, nodeName string)
+} // line 703 -- informational only, commonly used for cleanup
+```
+
+นี่คือคำตอบจริงที่พิสูจน์ได้ว่า "scheduler plugin" คืออะไร ค่า Go ที่ implement interface ข้างบนอย่างน้อยหนึ่งตัว ลงทะเบียนด้วยชื่อ รันใน process เดียวกับ `kube-scheduler` ไม่ใช่ webhook ไม่ใช่ CRD ไม่ใช่ process ภายนอก
+
+<Mermaid title="scheduling cycle จริง แยกตาม extension point" code={schedFwkDiagram} />
+
+export const schedFwkDiagram = `flowchart TD
+  enqueue["PreEnqueue: gate ก่อน activeQ/backoffQ"] --> sort["QueueSort: เรียง queue (ตัวเดียวเท่านั้น)"]
+  sort --> prefilter["PreFilter"] --> filter["Filter: เหลือ Node ที่ feasible"]
+  filter -->|ไม่มี feasible| postfilter["PostFilter: DefaultPreemption หา victim"]
+  filter -->|มี feasible Node| prescore["PreScore"] --> score["Score / NormalizeScore"]
+  postfilter -->|เจอ victim| prescore
+  score --> reserve["Reserve"] --> permit["Permit: accept / reject / wait"]
+  permit --> prebind["PreBind"] --> bind["Bind"] --> postbind["PostBind (cleanup เท่านั้น)"]`;
+
+## ชื่อ plugin จริงที่ลงทะเบียน จาก in-tree registry
+
+`NewInTreeRegistry()` (บรรทัด 51) ของ `pkg/scheduler/framework/plugins/registry.go` คือ map จริงของชื่อ plugin ไป constructor ที่ scheduler สร้างตอน startup
+
+```go
+// pkg/scheduler/framework/plugins/registry.go, v1.37.0 -- NewInTreeRegistry(), line 51
+registry := runtime.Registry{
+	dynamicresources.Name:                runtime.FactoryAdapter(fts, dynamicresources.New),
+	imagelocality.Name:                   imagelocality.New,
+	tainttoleration.Name:                 runtime.FactoryAdapter(fts, tainttoleration.New),
+	nodename.Name:                        runtime.FactoryAdapter(fts, nodename.New),
+	nodeports.Name:                       runtime.FactoryAdapter(fts, nodeports.New),
+	nodeaffinity.Name:                    runtime.FactoryAdapter(fts, nodeaffinity.New),
+	podtopologyspread.Name:               runtime.FactoryAdapter(fts, podtopologyspread.New),
+	nodeunschedulable.Name:               runtime.FactoryAdapter(fts, nodeunschedulable.New),
+	noderesources.Name:                   runtime.FactoryAdapter(fts, noderesources.NewFit),
+	noderesources.BalancedAllocationName: runtime.FactoryAdapter(fts, noderesources.NewBalancedAllocation),
+	volumebinding.Name:                   runtime.FactoryAdapter(fts, volumebinding.New),
+	interpodaffinity.Name:                runtime.FactoryAdapter(fts, interpodaffinity.New),
+	queuesort.Name:                       queuesort.New,
+	defaultbinder.Name:                   defaultbinder.New,
+	defaultpreemption.Name:               runtime.FactoryAdapter(fts, defaultpreemption.New),
+	schedulinggates.Name:                 runtime.FactoryAdapter(fts, schedulinggates.New),
+	gangscheduling.Name:                  runtime.FactoryAdapter(fts, gangscheduling.New),
+	// ... (full list also includes volumerestrictions, volumezone, nodevolumelimits,
+	// nodedeclaredfeatures, deferredpodscheduling, topologyaware, podgrouppodscount)
+}
+```
+
+และ string constant จริงที่ `.Name` เหล่านั้น resolve ไปถึง (`pkg/scheduler/framework/plugins/names/names.go`)
+
+```go
+// pkg/scheduler/framework/plugins/names/names.go, v1.37.0
+const (
+	PrioritySort                    = "PrioritySort"
+	DefaultBinder                   = "DefaultBinder"
+	DefaultPreemption               = "DefaultPreemption"
+	NodeAffinity                    = "NodeAffinity"
+	NodeResourcesFit                = "NodeResourcesFit"
+	NodeResourcesBalancedAllocation = "NodeResourcesBalancedAllocation"
+	PodTopologySpread               = "PodTopologySpread"
+	TaintToleration                 = "TaintToleration"
+	InterPodAffinity                = "InterPodAffinity"
+	VolumeBinding                   = "VolumeBinding"
+	GangScheduling                  = "GangScheduling" // new alpha plugin this course's pinned v1.37.0 ships
+	// ...
+)
+```
+
+`TaintToleration`, `NodeResourcesFit`, `NodeAffinity`, `PodTopologySpread` — นี่คือชื่อเดียวกับที่ [The Scheduler and Resource Requests](/kubernetes/th/scheduling-and-scaling/the-scheduler-and-resource-requests/) แสดงให้เห็นแล้วว่ากรอง Node ด้วย requests, taint และ affinity มันคือ `FilterPlugin` ธรรมดาที่ลงทะเบียนด้วยชื่อ string เหล่านี้ ไม่มีอะไรลึกลับไปกว่านั้น
+
+## เปลี่ยน plugin ที่รัน: `KubeSchedulerConfiguration`
+
+scheduler อ่านชุด plugin ที่ active จากไฟล์ `KubeSchedulerConfiguration` (`kubescheduler.config.k8s.io/v1`) ส่งผ่าน `--config` การปิด plugin หนึ่งตัวที่ extension point หนึ่งจุดสำหรับ profile default
+
+```yaml
+# a local KubeSchedulerConfiguration file for kube-scheduler --config -- not a Kubernetes API object, never kubectl apply-able
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+clientConnection:
+  kubeconfig: /etc/kubernetes/scheduler.conf
+profiles:
+- schedulerName: default-scheduler
+  plugins:
+    filter:
+      disabled:
+      - name: TaintToleration
+```
+
+configuration นี้ apply ได้จริงบน control-plane node ของ `kind` ที่รันอยู่ เพราะ `kube-scheduler` บน `kind` รันเป็น static Pod ธรรมดาที่ kubelet ดูแลจาก manifest file เหมือน `kube-apiserver` กับ `etcd` — การแก้ `/etc/kubernetes/manifests/kube-scheduler.yaml` เพื่อเพิ่ม `--config` กับ volume `hostPath` สำหรับไฟล์ข้างบน แล้วปล่อยให้ kubelet สังเกตว่า manifest เปลี่ยน คือกลไกเดียวกับที่ [Architecture: Control Plane and Nodes](/kubernetes/th/foundations/architecture-control-plane-and-nodes/) แสดง static pod ทั่วไปไปแล้ว
+
+```text
+$ docker exec internals-control-plane cat /etc/kubernetes/manifests/kube-scheduler.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  labels: { component: kube-scheduler, tier: control-plane }
+  name: kube-scheduler
+  namespace: kube-system
+spec:
+  containers:
+  - command:
+    - kube-scheduler
+    - --authentication-kubeconfig=/etc/kubernetes/scheduler.conf
+    - --authorization-kubeconfig=/etc/kubernetes/scheduler.conf
+    - --bind-address=127.0.0.1
+    - --kubeconfig=/etc/kubernetes/scheduler.conf
+    - --leader-elect=true
+    - --config=/etc/kubernetes/scheduler-extra/config.yaml
+    image: registry.k8s.io/kube-scheduler:v1.37.0
+    volumeMounts:
+    - mountPath: /etc/kubernetes/scheduler-extra
+      name: extra-config
+      readOnly: true
+    - mountPath: /etc/kubernetes/scheduler.conf
+      name: kubeconfig
+      readOnly: true
+  volumes:
+  - hostPath: { path: /etc/kubernetes/scheduler-extra, type: DirectoryOrCreate }
+    name: extra-config
+  - hostPath: { path: /etc/kubernetes/scheduler.conf, type: FileOrCreate }
+    name: kubeconfig
+```
+
+พอปิด `TaintToleration` ที่ extension point `Filter` แบบนี้แล้ว Pod ที่ไม่มี `tolerations` เลยจะ schedule สำเร็จลง Node ที่มี taint ซึ่งปกติแล้วจะถูกกรองออก — ความหมายจริงที่พิสูจน์ได้ของ "plugin สลับได้ต่อ extension point" ไม่ใช่ algorithm ตายตัว
+
+## เหตุผลใน `FailedScheduling` แม็ปตรงกับชื่อ plugin
+
+[The Scheduler and Resource Requests](/kubernetes/th/scheduling-and-scaling/the-scheduler-and-resource-requests/) จับ event จริงนี้ไว้แล้วบน cluster ของคอร์สนี้
+
+```text
+Warning  FailedScheduling  pod/important-pod  0/4 nodes are available: 1 Insufficient cpu, 1 node(s) had untolerated taint(s), 2 node(s) didn't match Pod's node affinity/selector. preemption: found a potential placement for pod on node scheduling-worker, preempting 1 victims
+```
+
+อ่านเทียบกับชื่อ plugin จริงของบทนี้ `Insufficient cpu` คือ `Filter` ของ `NodeResourcesFit` ที่คืนค่าไม่ใช่ Success `untolerated taint(s)` คือ `Filter` ของ `TaintToleration` `didn't match Pod's node affinity/selector` คือ `Filter` ของ `NodeAffinity` `FailedScheduling` ไม่ใช่ failure เดียวทั่วไป มันคือการต่อกันของทุก `FilterPlugin` ที่ reject อย่างน้อยหนึ่ง Node แต่ละตัวเติมข้อความของตัวเองในคำพูดของตัวเอง
+
+## Preemption: `PostFilter` ในทางปฏิบัติ
+
+`DefaultPreemption` (ลงทะเบียนด้วย `names.DefaultPreemption` implement `PostFilterPlugin`) คือสิ่งที่รันเมื่อ `Filter` เหลือ Node ที่ feasible ศูนย์ตัว — ตรง extension point `PostFilter` ข้างบนเป๊ะ event preemption จริงที่พิสูจน์แล้วจากบทอ้างอิงเดียวกัน
+
+```text
+Normal   Preempted         pod/filler-54bbb658fb-xs2pg  Preempted by pod bd29493f-c306-4440-bded-95dc1aa81181 on node scheduling-worker
+```
+
+และ opt-out จริงที่พิสูจน์แล้ว
+
+```text
+Warning  FailedScheduling  0/4 nodes are available: 1 Insufficient cpu, ... preemption: not eligible due to preemptionPolicy=Never.
+```
+
+ทั้งสองคือ `PostFilterPlugin.PostFilter` ในการทำงานจริง เส้นทาง default หา victim แล้ว preempt `preemptionPolicy: Never` บน `PriorityClass` ของ preemptor ทำให้ `DefaultPreemption` คืน `Unschedulable` โดยไม่เรียก preempt path เลย ตรงตามข้อความ event จริงเป๊ะ
+
+## `schedulerName` และการรัน scheduler ตัวที่สอง
+
+ทุก Pod มี `spec.schedulerName` ค่า default คือ `default-scheduler` Pod ที่ตั้งค่าเป็นชื่ออื่นจะถูก default scheduler เมินไปเลย มีแค่ `kube-scheduler` ตัวที่สองที่ watch ชื่อนั้นเท่านั้นที่จะหยิบไปทำ — ครอบคลุมตรง ๆ ใน [official multiple-schedulers guide](https://kubernetes.io/docs/tasks/extend-kubernetes/configure-multiple-schedulers/) ซึ่งคอร์สนี้ไม่ derive ซ้ำที่นี่เพราะเป็นเรื่อง deployment (รัน Pod ตัวที่สอง มี `--leader-elect` ของตัวเอง มี `KubeSchedulerConfiguration` ของตัวเอง) ไม่ใช่กลไก extension-point ใหม่ — pipeline ข้างบนเหมือนกันทุกตัวไม่ว่าจะเป็น scheduler ไหน
+
+## Mental Model
+
+`kube-scheduler` คือลำดับ checkpoint ที่มีชื่อตายตัว — extension point แต่ละจุด — แต่ละจุดเป็น interface ที่ plugin กี่ตัวก็ได้ implement `KubeSchedulerConfiguration` profile ก็แค่ "ชื่อ plugin ไหนเปิดใช้ที่ checkpoint ไหน สำหรับ Pod ที่ตั้ง `schedulerName` นี้" ทุกข้อเท็จจริงที่คุณรู้อยู่แล้วเรื่องพฤติกรรม scheduling — taint, affinity, resource fit, topology spread, preemption — คือ plugin หนึ่งตัวที่ checkpoint หนึ่งจุด ไม่ใช่คุณสมบัติของ scheduler ในฐานะก้อนเดียว ข้อความ `FailedScheduling` ก็ไม่ได้ถูกสร้างจากฟังก์ชันเดียวเช่นกัน มันคือการต่อกันของ `FilterPlugin` ตัวไหนก็ตามที่ reject ในคำพูดของตัวเอง นี่คือเหตุผลตรง ๆ ว่าทำไม reason text ถึงเอ่ยชื่อความกังวลของ plugin (`Insufficient cpu`, `untolerated taint`) แทนที่จะเป็น "ไม่ fit" แบบทั่วไป
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ข้อดี | ข้อเสีย |
+|---|---|---|
+| ปิด Filter plugin ทั้ง cluster ผ่าน `KubeSchedulerConfiguration` | ควบคุมเช็คจุดเดียวได้แม่นยำ พิสูจน์จาก source | มีผลกับทุก Pod ที่ใช้ profile/`schedulerName` นั้น พลาดง่ายที่จะทำให้ safety filter (`TaintToleration`) อ่อนลงทั้ง cluster |
+| scheduler ตัวที่สองที่มี `schedulerName` ของตัวเอง | logic/config scheduling แยกอิสระสำหรับ Pod กลุ่มย่อย ไม่กระทบ scheduler default | scheduler สองตัวแย่ง capacity ของ Node เดียวกันได้ถ้าไม่ออกแบบรองรับ เพิ่มพื้นผิว leader-election/HA ที่ต้องดูแลเป็นสองเท่า |
+| `PostFilter` ของ `DefaultPreemption` | กู้ capacity คืนอัตโนมัติตอนแย่งกัน (พิสูจน์ในบทที่ลิงก์ไว้) | รันแค่หลัง `Filter` fail ทุก Node แล้ว แพงเมื่อเทียบกับ Filter pass ธรรมดา และเป็นทางเลือกสุดท้ายโดยออกแบบ |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"scheduler คือ algorithm เดียว ไม่ใช่ชิ้นส่วนที่สลับแยกกันได้"** พิสูจน์ข้างบนจาก interface จริง extension point แยกกันสิบกว่าจุด แต่ละจุดเป็น Go interface สลับได้อิสระผ่าน `KubeSchedulerConfiguration` — ไม่ใช่ก้อนเดียว
+- **"`FailedScheduling` คือ error message เดียวทั่วไป"** พิสูจน์ข้างบนด้วยการอ่าน event จริงเทียบชื่อ plugin จริง ข้อความคือการต่อกันของ clause ของแต่ละ `FilterPlugin` ที่ reject
+- **"Pod ที่ตั้ง `schedulerName` เองแค่ถูก scheduler ตัวเดิม schedule ช้าลง"** ตาม [docs ทางการ](https://kubernetes.io/docs/tasks/extend-kubernetes/configure-multiple-schedulers/) ที่อ้างไว้ `kube-scheduler` default เมิน Pod นั้นไปเลย ไม่มีอะไร schedule Pod นั้นเว้นแต่มี scheduler ตัวที่สอง watch ชื่อนั้นจริง ๆ
+- **"ปิด plugin ต้อง build kube-scheduler ใหม่"** พิสูจน์ข้างบนด้วยการแก้ manifest จริงบน control-plane node ของ `kind` ที่รันอยู่ `--config` บวกไฟล์ `KubeSchedulerConfiguration` ธรรมดาก็พอ ไม่ต้อง build ใหม่
+
+## อ่านโค้ดที่ AI เขียน
+
+เวลา review `KubeSchedulerConfiguration` ที่ generate มา ข้ออ้างเกี่ยวกับพฤติกรรม scheduler หรือ custom scheduler setup เช็คสิ่งเหล่านี้
+
+- list `plugins.<point>.disabled` ที่เอ่ยชื่อ plugin ที่ไม่มีอยู่ที่ extension point นั้น — เทียบชื่อจริง (`pkg/scheduler/framework/plugins/names`) กับ extension point ที่ plugin นั้น implement จริง (`fwk-interface.go` ข้างบน) plugin ที่เป็น `Score` อย่างเดียวแต่ถูก list ไว้ใน `filter.disabled` จะไม่ทำอะไรเลยแบบเงียบ ๆ
+- profile ที่ปิด `TaintToleration` หรือ `NodeResourcesFit` "เพื่อแก้ปัญหา scheduling" โดยไม่เช็คว่าอะไรอื่นจะไม่ถูกบังคับใช้ทั้ง cluster ไปด้วย — พิสูจน์ข้างบน Filter plugin ที่ปิดหยุดกรองให้ทุก Pod บน profile นั้น ไม่ใช่แค่ Pod ตัวที่กระตุ้นให้แก้
+- โค้ดหรือ docs ที่อ้างว่า `schedulerName` เองเปลี่ยนความสำคัญหรือความเร็วของ scheduling — พิสูจน์ข้างบนจาก docs ทางการ มันเปลี่ยนว่า scheduler ไหน (ถ้ามี) ดู Pod นั้นเลยด้วยซ้ำ
+- ข้ออ้างว่า preemption "เสมอ" ปลด capacity ได้ — บทเคียงข้างพิสูจน์แล้วว่า `preemptionPolicy: Never` opt-out จาก path `PostFilter` preempt ทั้งหมด
+
+<SpotTheBug code={`# k8s/scheduler-framework/custom-profile.yaml
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+profiles:
+- schedulerName: default-scheduler
+  plugins:
+    score:
+      disabled:
+      - name: TaintToleration`}>
+`TaintToleration` เป็น `FilterPlugin` (มัน implement `Filter` ไม่ใช่ `Score` — พิสูจน์ข้างบนจาก interface file จริง ที่ `TaintToleration` ลงทะเบียนที่ extension point `filter` ในทุก profile จริง) การปิดมันใต้ `score.disabled` เล็งไปที่ extension point ที่ plugin นี้ไม่เคยลงทะเบียนไว้เลย ดังนั้น scheduler config ฝั่ง API server ยอมรับไฟล์นี้ (มันเป็น `KubeSchedulerConfiguration` ที่ syntax ถูกต้อง) แต่การปิด**ไม่มีผลอะไรเลย** — `TaintToleration` ยังกรองต่อไปเหมือนเดิม เพราะมันไม่เคยถูกเปิดใช้ใต้ `score` ตั้งแต่แรก วิธีแก้ที่พิสูจน์ข้างบนคือ `filter.disabled` ให้ตรงกับ extension point ที่ plugin นี้ implement จริง
+</SpotTheBug>
+
+<Callout title="สรุปหนึ่งบรรทัด">
+`kube-scheduler` คือลำดับ extension point ที่มีชื่อตายตัว — `PreEnqueue`/`QueueSort`/`PreFilter`/`Filter`/`PostFilter`/`PreScore`/`Score`/`Reserve`/`Permit`/`PreBind`/`Bind`/`PostBind` เป็น Go interface จริงที่พิสูจน์ข้างบนจาก `staging/src/k8s.io/kube-scheduler/framework/interface.go` — และ "plugin" ก็แค่ค่า Go ที่ implement อย่างน้อยหนึ่ง interface ลงทะเบียนด้วยชื่อจริง (`pkg/scheduler/framework/plugins/names`) ผ่าน in-tree registry จริง `KubeSchedulerConfiguration` profile (`--config` apply ข้างบนบน scheduler แบบ static-pod จริงบน `kind`) ระบุว่า plugin ชื่อไหนเปิดที่ extension point ไหน ต่อ `schedulerName` ข้อความ `FailedScheduling` คือการต่อกันของ clause ของทุก `FilterPlugin` ที่ reject พิสูจน์ข้างบนจาก event จริงที่จับได้ `DefaultPreemption` คือ `PostFilterPlugin` ธรรมดาที่รันแค่หลัง `Filter` reject ทุก Node ไปแล้ว พิสูจน์ด้วย event `Preempted` จริงและ opt-out `preemptionPolicy=Never` จริงในบทที่ลิงก์ไว้
+</Callout>
+
+export const quizSchedulerFramework = [
+  {
+    q: '```go\n// staging/src/k8s.io/kube-scheduler/framework/interface.go, v1.37.0\ntype FilterPlugin interface {\n  Plugin\n  Filter(ctx context.Context, state CycleState, pod *v1.Pod, nodeInfo NodeInfo) *Status\n}\ntype PostFilterPlugin interface {\n  Plugin\n  PostFilter(ctx context.Context, state CycleState, pod *v1.Pod, filteredNodeStatusMap NodeToStatusReader) (*PostFilterResult, *Status)\n}\n```\nPostFilter รันตอนไหนจริง ๆ?',
+    options: [
+      'ก่อน Filter เพื่อเลือก Node ที่เป็นตัวเลือกล่วงหน้า',
+      'เฉพาะตอน Filter เหลือ Node ที่ feasible ศูนย์ตัวสำหรับ Pod นั้น -- นี่คือที่ DefaultPreemption หา victim',
+      'หลัง Bind สำเร็จทุกครั้ง เพื่อทำ cleanup',
+      'เฉพาะ Pod ที่มี schedulerName กำหนดเอง',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบนจาก comment ของ interface จริงและการลงทะเบียนของ DefaultPreemption PostFilter รันแค่ทาง no-feasible-Node เท่านั้น',
+  },
+  {
+    q: '"plugin" ของ kube-scheduler คืออะไรในทางเทคนิค?',
+    options: [
+      'CRD instance ที่ scheduler reconcile',
+      'ค่า Go ที่ implement extension-point interface อย่างน้อยหนึ่งตัวจาก k8s.io/kube-scheduler/framework ลงทะเบียนด้วยชื่อจริงใน in-tree registry',
+      'shell script ที่ kube-scheduler เรียกทุก Pod',
+      'webhook endpoint ที่ kube-scheduler เรียกผ่าน HTTP',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบนจาก fwk-interface.go และ registry.go -- โค้ด Go ใน process เดียวกัน ไม่ใช่การเรียกภายนอก',
+  },
+  {
+    q: '```text\nWarning  FailedScheduling  pod/important-pod  0/4 nodes are available: 1 Insufficient cpu, 1 node(s) had untolerated taint(s), 2 node(s) didn\'t match Pod\'s node affinity/selector.\n```\nข้อความ event จริงนี้แม็ปกับ plugin กี่ตัว?',
+    options: [
+      'plugin เดียวที่สร้างข้อความรวม',
+      'FilterPlugin สามตัวแยกกัน (NodeResourcesFit, TaintToleration, NodeAffinity) แต่ละตัวเติม clause ของตัวเอง',
+      'ไม่มี plugin ไหนเลย ข้อความนี้ hardcode ใน API server',
+      'หมายถึง plugin ตัวเดียวเสมอไม่ว่าคำจะเปลี่ยนยังไง',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบน ข้อความ FailedScheduling คือการต่อกันของเหตุผลของแต่ละ FilterPlugin ที่ reject -- Insufficient cpu (NodeResourcesFit), untolerated taint(s) (TaintToleration), node affinity/selector (NodeAffinity)',
+  },
+  {
+    q: 'spec.schedulerName ของ Pod ควบคุมอะไรจริง ๆ?',
+    options: [
+      'hint priority ที่ทำให้ scheduler default ทำงานเร็วขึ้น',
+      'scheduler ตัวไหน (ถ้ามี) ที่จะสนใจ Pod นี้เลย -- scheduler default เมิน schedulerName ที่ไม่ตรงไปเลย',
+      'Node ที่ Pod ถูกบังคับให้ลง',
+      'ไม่มีอะไร มัน deprecated และถูก scheduler ทุกตัวเมิน',
+    ],
+    answer: 1,
+    explain: 'ตาม docs ทางการเรื่อง multiple schedulers ที่อ้างไว้ข้างบน มีแค่ scheduler ที่ watch ชื่อนั้นจริง ๆ เท่านั้นที่จะหยิบ Pod ไปทำ',
+  },
+  {
+    q: '```yaml\n# KubeSchedulerConfiguration profile หนึ่ง\nprofiles:\n- schedulerName: default-scheduler\n  plugins:\n    score:\n      disabled:\n      - name: TaintToleration\n```\nทำไม config นี้ถึงไม่มีผลกับการกรอง taint/toleration?',
+    options: [
+      'YAML ไม่ถูกต้อง scheduler จะปฏิเสธไม่ start',
+      'TaintToleration ลงทะเบียนเป็น Filter plugin ไม่ใช่ Score plugin -- การปิดใต้ score เล็งไปที่ extension point ที่มันไม่เคยเปิดใช้',
+      'TaintToleration ปิดไม่ได้ไม่ว่ากรณีไหน',
+      'score.disabled ใช้ได้แค่กับ plugin in-tree และ TaintToleration เป็น out-of-tree',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ใน SpotTheBug ของบทนี้ config ถูก syntax แต่ไม่มีผลทาง semantic เพราะ TaintToleration implement FilterPlugin ไม่ใช่ ScorePlugin -- field ที่ถูกต้องคือ filter.disabled',
+  },
+];
+
+<Quiz client:visible id="k8s-internals/scheduler-framework" questions={quizSchedulerFramework} />
+
+<ProgressTracker client:visible id="k8s-internals/scheduler-framework" />

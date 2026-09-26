@@ -1,0 +1,147 @@
+---
+title: 'How Kubernetes Works'
+description: 'The API server request path and etcd watch, the client-go informer/workqueue pattern, the scheduler framework, the admission chain, and Server-Side Apply internals — the mechanics that let you actually judge unfamiliar or AI-generated Kubernetes code and controllers, not just apply manifests.'
+sidebar:
+  order: 0
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## What this module is for
+
+Every earlier module in this course taught you to *use* Kubernetes: writing manifests, applying them with `kubectl`, reading back status, scaling, scheduling, securing, storing, networking, and shipping with Helm/GitOps. None of it required knowing what the API server actually does with a request between "you typed `kubectl apply`" and "the object exists," how a controller actually finds out something changed, what a `kube-scheduler` plugin actually is under the extension-point names you have already seen, what order admission webhooks and `ValidatingAdmissionPolicy` actually run in, or what `managedFields` really tracks when two tools apply the same object.
+
+That gap is exactly where AI-generated Kubernetes tooling fails in ways that look fine on the surface: a controller written with `List` in a `for`-loop instead of a shared informer, silently polling and missing events between polls; a reconcile function with no rate limiting that hot-loops on a permanent error; a webhook assumed to run "before validation" when the real chain interleaves mutating and validating differently; a script that "fixes" a `managedFields` conflict by force-taking every field instead of reading which one is actually contested. None of these are syntax errors. None of them are caught by `kubectl apply --dry-run=client`. All of them are facts about the runtime this whole module makes provable.
+
+This module has one job: give you five pieces of runtime knowledge that let you look at **someone else's Kubernetes code or YAML** — a controller, a webhook config, a scheduler profile, a script full of `kubectl apply --server-side` calls — and answer:
+
+1. **What actually happens to a request inside the API server, and how does a watch really work?** (the API server and etcd — `resourceVersion`, watch, bookmarks, `410 Gone`, and etcd as the one place state lives)
+2. **How does a controller actually learn "something changed," without polling?** (controllers, informers, and workqueues — Reflector → DeltaFIFO → Indexer/Lister → workqueue → reconcile, straight from `client-go`)
+3. **What is a scheduler "plugin," concretely, and in what order do they run?** (the scheduler framework — the real extension-point interfaces and the real plugin names from `pkg/scheduler`)
+4. **What order do mutating webhooks, schema validation, validating webhooks, and `ValidatingAdmissionPolicy` actually run in?** (the admission chain — proven with a real chain, a real dry-run, and the exact source that decides the order)
+5. **What does `managedFields` actually track, and what does "conflict" really mean?** (Server-Side Apply internals — the `f:`/`k:`/`v:` markers, `x-kubernetes-list-type`, and the `structured-merge-diff` library that makes it work)
+
+Every claim in this module is backed by one of three things: the real Kubernetes source at [github.com/kubernetes/kubernetes](https://github.com/kubernetes/kubernetes), tag **v1.37.0** (this course's pinned version), cited by file and line; the official docs at [kubernetes.io/docs](https://kubernetes.io/docs/); or a real, reproduced run against a live 3-node `kind` cluster (`kind create cluster --name internals`, 1 control-plane + 2 workers, Kubernetes 1.37.0) — a real `kubectl -v=8` trace, a real `etcdctl get`, a real scheduler log, a real API-server error — pasted below the claim, never a guess about internals.
+
+<Callout title="The one-line takeaway">
+This module doesn't add new Kubernetes APIs — it explains the five mechanisms every manifest, controller, and script actually runs through: the **API server** (a stateless HTTP layer over **etcd**, the only place cluster state actually lives — reads are a `resourceVersion`-stamped list-then-watch, never a raw poll), the **informer pattern** (`client-go`'s Reflector → DeltaFIFO → Indexer/Lister → workqueue → reconcile, the shape every controller in this course's Deployment/ReplicaSet chain and every custom controller you will ever write actually has), the **scheduler framework** (a pipeline of named plugins at fixed extension points — `PreFilter`/`Filter`/`PostFilter`/`PreScore`/`Score`/`Reserve`/`Permit`/`PreBind`/`Bind`/`PostBind` — not a monolithic black box), the **admission chain** (mutating admission, then schema/strategy validation, then validating admission — each phase itself an ordered chain of in-tree plugins, `MutatingAdmissionPolicy`/`ValidatingAdmissionPolicy`, and webhooks, in an order fixed by the API server's own source), and **Server-Side Apply** (per-field ownership tracked in `managedFields`, computed by the `structured-merge-diff` library against the live OpenAPI schema's `x-kubernetes-list-type`/`x-kubernetes-map-type` markers). Every one of the five is either on kubernetes.io/docs or directly readable in `kubernetes/kubernetes` — unfamiliar, not undocumented.
+</Callout>
+
+## What this module covers
+
+| Lesson | Answers the question |
+|---|---|
+| [API Server and etcd Watch](/kubernetes/en/k8s-internals/api-server-and-etcd-watch/) | What is the real, provable request path through the API server, and how does a watch actually stay consistent with `resourceVersion`? |
+| [Controllers, Informers, and Workqueues](/kubernetes/en/k8s-internals/controllers-informers-and-workqueues/) | What does a controller actually do, mechanically, from the moment a watch event arrives to the moment it reconciles? |
+| [Scheduler Framework](/kubernetes/en/k8s-internals/scheduler-framework/) | What are the real extension points and plugins the scheduler runs, and how do you change which ones are active? |
+| [Admission Chain](/kubernetes/en/k8s-internals/admission-chain/) | In what real, source-proven order do mutating webhooks, validation, validating webhooks, and VAP/MAP actually run? |
+| [Server-Side Apply Internals](/kubernetes/en/k8s-internals/server-side-apply-internals/) | What does `managedFields` actually record, and what decides whether two managers conflict? |
+
+The Foundations module already introduced `kubectl apply --server-side` and a real field-manager conflict error from the outside. This module goes past that framing into the actual request path, the actual watch, the actual scheduler plugins, the actual admission order, and the actual merge algorithm.
+
+<Mermaid title="One Pod, from kubectl apply to a running container" code={bigDiagram} />
+
+export const bigDiagram = `flowchart TD
+  kubectl["kubectl apply -f pod.yaml"] --> authn["Authentication"]
+  authn --> authz["Authorization (RBAC)"]
+  authz --> mutate["Mutating admission chain\\n(in-tree -> MutatingAdmissionPolicy -> MutatingAdmissionWebhook)\\n(Admission Chain)"]
+  mutate --> schema["Schema + strategy validation\\n(OpenAPI, x-kubernetes-list-type)\\n(Server-Side Apply Internals)"]
+  schema --> validate["Validating admission chain\\n(in-tree -> ValidatingAdmissionPolicy -> ValidatingAdmissionWebhook)\\n(Admission Chain)"]
+  validate --> etcd["etcd: the one place state lives\\n(API Server and etcd Watch)"]
+  etcd --> watch["Watch stream, resourceVersion-ordered"]
+  watch --> reflector["client-go Reflector -> DeltaFIFO -> Indexer/Lister\\n(Controllers, Informers, and Workqueues)"]
+  reflector --> queue["workqueue (rate-limited, level-triggered)"]
+  queue --> reconcile["Controller reconcile\\n(e.g. ReplicaSet controller creates a Pod)"]
+  reconcile --> sched["kube-scheduler: Filter -> Score -> Bind\\n(Scheduler Framework)"]
+  sched --> kubelet["kubelet starts the container"]`;
+
+## Mental Model
+
+Everything in this module is one story told from five different points on the same loop: **you send a mutation, the API server runs it through a fixed pipeline (auth, admission, validation, storage) and writes exactly one copy of the truth to etcd; every other component — a controller, the scheduler, `kubectl get -w` — finds out about that write the same way, by watching a `resourceVersion`-ordered stream from that one API server, never by polling, never by talking to etcd directly.** A controller is nothing more than "watch, queue, reconcile" wired through `client-go`'s informer machinery; the scheduler is nothing more than one more consumer of that same watch stream, running a pipeline of named plugins before it writes its own decision back through the same API server; admission and Server-Side Apply are both just extra structure the API server imposes on the write path itself, before anything reaches etcd. Once you can place any given fact in this module against that one loop, "how does Kubernetes actually work" stops being five separate things to memorize.
+
+## Common Misconceptions
+
+- **"A controller polls the API server on an interval to check for changes."** [Controllers, Informers, and Workqueues](/kubernetes/en/k8s-internals/controllers-informers-and-workqueues/) proves the opposite with a real, running informer: it lists once, then holds a long-lived HTTP watch connection and reacts to individual `ADDED`/`MODIFIED`/`DELETED` events — the periodic full `List` you may have heard of is a much longer **resync**, a safety net, not the primary mechanism.
+- **"Admission webhooks all run in one undifferentiated pool, in registration order."** [Admission Chain](/kubernetes/en/k8s-internals/admission-chain/) proves the real order straight from `pkg/kubeapiserver/options/plugins.go`: mutating admission (in-tree plugins, then `MutatingAdmissionPolicy`, then `MutatingAdmissionWebhook`) all completes, then schema/strategy validation runs, then validating admission (in-tree, `ValidatingAdmissionPolicy`, `ValidatingAdmissionWebhook`) runs — two genuinely separate phases, not one pool.
+- **"The scheduler is a black box that just picks a node."** [Scheduler Framework](/kubernetes/en/k8s-internals/scheduler-framework/) proves it is a pipeline of separately named, separately swappable plugins — real names straight from `pkg/scheduler/framework/plugins/names`, at fixed extension points defined in `k8s.io/kube-scheduler/framework`.
+- **"`managedFields` is basically the same idea as the old `last-applied-configuration` annotation, just server-side."** [Server-Side Apply Internals](/kubernetes/en/k8s-internals/server-side-apply-internals/) proves they are structurally different: `managedFields` is a per-manager, per-field ownership map keyed by real OpenAPI schema markers (`x-kubernetes-list-type: map` vs `atomic`), computed by the `structured-merge-diff` library — not a single stashed blob of "what I applied last time."
+
+## Reading AI-generated code
+
+The whole point of this module is this section, five times over — one per lesson. As a preview, here is the survey-level version: a snippet that looks like a correct controller and is missing the one thing that makes it a controller rather than a poller.
+
+<SpotTheBug code={`// A "controller" a teammate wrote to react to Pod changes
+setInterval(async () => {
+  const pods = await api.listNamespacedPod('default');
+  for (const pod of pods.body.items) {
+    reconcile(pod);
+  }
+}, 5000);`}>
+This runs `reconcile` on every Pod every 5 seconds, forever, whether anything changed or not — proven wrong by [Controllers, Informers, and Workqueues](/kubernetes/en/k8s-internals/controllers-informers-and-workqueues/): a real controller uses a **watch**, delivered as individual `ADDED`/`MODIFIED`/`DELETED` events through a Reflector into a DeltaFIFO, and reconciles only the object whose key was actually enqueued. This `setInterval` version reconciles every object on every tick regardless of whether it changed (wasted API server load that scales with cluster size, not with the change rate), and — worse — it can **miss** a change entirely if an object is created and deleted again inside one 5-second window, since nothing about polling guarantees you see every intermediate state the way an ordered watch stream does.
+</SpotTheBug>
+
+export const quizK8sInternalsIndex = [
+  {
+    q: 'What does every controller, the scheduler, and `kubectl get -w` all have in common in how they learn about a change?',
+    options: [
+      'They all poll the API server on a fixed interval',
+      'They all watch a resourceVersion-ordered stream from the API server rather than talking to etcd directly or polling',
+      'They all read etcd directly for speed',
+      'They all use gRPC streaming to bypass the API server',
+    ],
+    answer: 1,
+    explain: 'The API server is the single source of truth over etcd; every consumer -- a controller\'s informer, the scheduler, kubectl -- learns about changes the same way, by watching a resourceVersion-ordered stream from the API server.',
+  },
+  {
+    q: '```go\n// pkg/kubeapiserver/options/plugins.go, v1.37.0 -- tail of AllOrderedPlugins\nmutatingadmissionpolicy.PluginName,   // MutatingAdmissionPolicy\nmutatingwebhook.PluginName,           // MutatingAdmissionWebhook\nvalidatingadmissionpolicy.PluginName, // ValidatingAdmissionPolicy\nvalidatingwebhook.PluginName,         // ValidatingAdmissionWebhook\nresourcequota.PluginName,             // ResourceQuota\n```\nThis is the real, ordered plugin list the API server compiles in. What does it prove about MutatingAdmissionPolicy vs MutatingAdmissionWebhook?',
+    options: [
+      'They run in one undifferentiated, unordered pool',
+      'MutatingAdmissionPolicy runs before MutatingAdmissionWebhook, and both are still in the mutating phase, before any validating-phase plugin runs',
+      'MutatingAdmissionWebhook always runs before any in-tree plugin',
+      'ResourceQuota runs before admission even starts',
+    ],
+    answer: 1,
+    explain: 'Admission Chain proves this from this exact real slice of AllOrderedPlugins: MutatingAdmissionPolicy is ordered immediately before MutatingAdmissionWebhook, and ResourceQuota (a validating-phase plugin) sits after both validating admission policy and webhook -- the order is fixed by this one array, not by registration time or webhook config.',
+  },
+  {
+    q: '```go\n// staging/src/k8s.io/kube-scheduler/framework/interface.go, v1.37.0\ntype PreFilterPlugin interface { ... }\ntype FilterPlugin interface { ... }\ntype PostFilterPlugin interface { ... }\ntype PreScorePlugin interface { ... }\ntype ScorePlugin interface { ... }\ntype ReservePlugin interface { ... }\ntype PreBindPlugin interface { ... }\ntype PermitPlugin interface { ... }\ntype BindPlugin interface { ... }\ntype PostBindPlugin interface { ... }\n```\nWhat is a kube-scheduler "plugin" in this real source?',
+    options: [
+      'An external binary the scheduler shells out to for every Pod',
+      'A Go implementation of one or more of these extension-point interfaces, registered under a real name from pkg/scheduler/framework/plugins/names',
+      'A CRD instance that the scheduler watches and reconciles',
+      'A webhook endpoint the scheduler calls over HTTP for every Pod',
+    ],
+    answer: 1,
+    explain: 'Scheduler Framework proves this directly from this real interface file and pkg/scheduler/framework/plugins/names -- real named plugins implementing real Go interfaces at fixed extension points, running in-process inside kube-scheduler, not external processes or webhooks.',
+  },
+  {
+    q: 'What does managedFields track that the old kubectl.kubernetes.io/last-applied-configuration annotation did not?',
+    options: [
+      'Nothing different -- it is the same data in a new location',
+      'Per-manager, per-field ownership, computed against the live OpenAPI schema\'s list/map type markers by the structured-merge-diff library',
+      'Only the timestamp of the last change',
+      'A full history of every past version of the object',
+    ],
+    answer: 1,
+    explain: 'Server-Side Apply Internals proves managedFields is a structurally different, per-field ownership map -- not a single blob -- and that its merge behavior depends on real OpenAPI schema markers like x-kubernetes-list-type.',
+  },
+  {
+    q: 'A generated "controller" uses setInterval to re-list and reconcile every object every 5 seconds. What is the real problem with this, proven in this module?',
+    options: [
+      'It is actually the correct, recommended pattern',
+      'It wastes API server load proportional to cluster size rather than change rate, and can still miss an intermediate change (e.g. create-then-delete) within one poll window',
+      'It is fine as long as the interval is under 1 second',
+      'It only fails if the cluster has webhooks installed',
+    ],
+    answer: 1,
+    explain: 'Proven in the module preview: polling costs load proportional to the whole object count on every tick, and unlike an ordered watch stream, it has no guarantee of seeing every state a fast create-then-delete passed through.',
+  },
+];
+
+<Quiz client:visible id="k8s-internals/index" questions={quizK8sInternalsIndex} />
+
+<ProgressTracker client:visible id="k8s-internals/index" />

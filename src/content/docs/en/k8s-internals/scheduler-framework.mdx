@@ -1,0 +1,342 @@
+---
+title: 'Scheduler Framework'
+description: 'The real extension-point interfaces and plugin names the kube-scheduler runs -- PreFilter, Filter, PostFilter, PreScore, Score, Reserve, Permit, PreBind, Bind, PostBind -- proven from source, plus a real KubeSchedulerConfiguration profile applied to a live control-plane node.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## The idea in one sentence
+
+`kube-scheduler` is not a black box that "picks a node" -- it is a fixed pipeline of named **extension points**, each one a Go interface any number of **plugins** can implement, and [The Scheduler and Resource Requests](/kubernetes/en/scheduling-and-scaling/the-scheduler-and-resource-requests/) already showed you the pipeline's shape from the outside; this lesson proves the real interfaces, the real registered plugin names, and how a `KubeSchedulerConfiguration` actually swaps which plugins run at which point.
+
+## The real extension-point interfaces
+
+Every extension point is a small Go interface in `staging/src/k8s.io/kube-scheduler/framework/interface.go` (this course's pinned **v1.37.0**). A plugin implements one or more of these to participate at that point in the pipeline:
+
+```go
+// staging/src/k8s.io/kube-scheduler/framework/interface.go, v1.37.0
+type PreEnqueuePlugin interface {
+	Plugin
+	PreEnqueue(ctx context.Context, p *v1.Pod) *Status
+} // line 447 -- gates a Pod before it even enters the scheduling queue
+
+type QueueSortPlugin interface {
+	Plugin
+	Less(QueuedEntityInfo, QueuedEntityInfo) bool
+} // line 461 -- only one may be enabled cluster-wide
+
+type PreFilterPlugin interface {
+	Plugin
+	PreFilter(ctx context.Context, state CycleState, p *v1.Pod, nodes []NodeInfo) (*PreFilterResult, *Status)
+	PreFilterExtensions() PreFilterExtensions
+} // line 520
+
+type FilterPlugin interface {
+	Plugin
+	Filter(ctx context.Context, state CycleState, pod *v1.Pod, nodeInfo NodeInfo) *Status
+} // line 549 -- "Success" keeps the Node feasible; anything else excludes it
+
+type PostFilterPlugin interface {
+	Plugin
+	PostFilter(ctx context.Context, state CycleState, pod *v1.Pod, filteredNodeStatusMap NodeToStatusReader) (*PostFilterResult, *Status)
+} // line 578 -- runs ONLY when no Node is feasible; this is where preemption lives
+
+type PreScorePlugin interface {
+	Plugin
+	PreScore(ctx context.Context, state CycleState, pod *v1.Pod, nodes []NodeInfo) *Status
+} // line 632
+
+type ScorePlugin interface {
+	Plugin
+	Score(ctx context.Context, state CycleState, p *v1.Pod, nodeInfo NodeInfo) (int64, *Status)
+	ScoreExtensions() ScoreExtensions
+} // line 653
+
+type ReservePlugin interface {
+	Plugin
+	Reserve(ctx context.Context, state CycleState, p *v1.Pod, nodeName string) *Status
+	Unreserve(ctx context.Context, state CycleState, p *v1.Pod, nodeName string)
+} // line 670 -- Unreserve runs for every enabled ReservePlugin if any later plugin rejects the Pod
+
+type PreBindPlugin interface {
+	Plugin
+	PreBindPreFlight(ctx context.Context, state CycleState, p *v1.Pod, nodeName string) (*PreBindPreFlightResult, *Status)
+	PreBind(ctx context.Context, state CycleState, p *v1.Pod, nodeName string) *Status
+} // line 686
+
+type PermitPlugin interface {
+	Plugin
+	Permit(ctx context.Context, state CycleState, p *v1.Pod, nodeName string) (*Status, time.Duration)
+} // line 714 -- can delay a bind with a wait timeout, not just accept/reject
+
+type BindPlugin interface {
+	Plugin
+	Bind(ctx context.Context, state CycleState, p *v1.Pod, nodeName string) *Status
+} // line 727
+
+type PostBindPlugin interface {
+	Plugin
+	PostBind(ctx context.Context, state CycleState, p *v1.Pod, nodeName string)
+} // line 703 -- informational only, commonly used for cleanup
+```
+
+This is the real, provable answer to "what is a scheduler plugin": a Go value implementing one or more of these interfaces, registered under a name, run in-process inside `kube-scheduler` -- not a webhook, not a CRD, not an external process.
+
+<Mermaid title="The real scheduling cycle, by extension point" code={schedFwkDiagram} />
+
+export const schedFwkDiagram = `flowchart TD
+  enqueue["PreEnqueue: gate before activeQ/backoffQ"] --> sort["QueueSort: order the queue (one plugin only)"]
+  sort --> prefilter["PreFilter"] --> filter["Filter: feasible Nodes only"]
+  filter -->|none feasible| postfilter["PostFilter: DefaultPreemption looks for victims"]
+  filter -->|feasible Nodes| prescore["PreScore"] --> score["Score / NormalizeScore"]
+  postfilter -->|victim found| prescore
+  score --> reserve["Reserve"] --> permit["Permit: accept / reject / wait"]
+  permit --> prebind["PreBind"] --> bind["Bind"] --> postbind["PostBind (cleanup only)"]`;
+
+## Real registered plugin names, from the in-tree registry
+
+`pkg/scheduler/framework/plugins/registry.go`'s `NewInTreeRegistry()` (line 51) is the actual map of plugin name to constructor the scheduler builds from at startup:
+
+```go
+// pkg/scheduler/framework/plugins/registry.go, v1.37.0 -- NewInTreeRegistry(), line 51
+registry := runtime.Registry{
+	dynamicresources.Name:                runtime.FactoryAdapter(fts, dynamicresources.New),
+	imagelocality.Name:                   imagelocality.New,
+	tainttoleration.Name:                 runtime.FactoryAdapter(fts, tainttoleration.New),
+	nodename.Name:                        runtime.FactoryAdapter(fts, nodename.New),
+	nodeports.Name:                       runtime.FactoryAdapter(fts, nodeports.New),
+	nodeaffinity.Name:                    runtime.FactoryAdapter(fts, nodeaffinity.New),
+	podtopologyspread.Name:               runtime.FactoryAdapter(fts, podtopologyspread.New),
+	nodeunschedulable.Name:               runtime.FactoryAdapter(fts, nodeunschedulable.New),
+	noderesources.Name:                   runtime.FactoryAdapter(fts, noderesources.NewFit),
+	noderesources.BalancedAllocationName: runtime.FactoryAdapter(fts, noderesources.NewBalancedAllocation),
+	volumebinding.Name:                   runtime.FactoryAdapter(fts, volumebinding.New),
+	interpodaffinity.Name:                runtime.FactoryAdapter(fts, interpodaffinity.New),
+	queuesort.Name:                       queuesort.New,
+	defaultbinder.Name:                   defaultbinder.New,
+	defaultpreemption.Name:               runtime.FactoryAdapter(fts, defaultpreemption.New),
+	schedulinggates.Name:                 runtime.FactoryAdapter(fts, schedulinggates.New),
+	gangscheduling.Name:                  runtime.FactoryAdapter(fts, gangscheduling.New),
+	// ... (full list also includes volumerestrictions, volumezone, nodevolumelimits,
+	// nodedeclaredfeatures, deferredpodscheduling, topologyaware, podgrouppodscount)
+}
+```
+
+And the real string constants those `.Name` references resolve to (`pkg/scheduler/framework/plugins/names/names.go`):
+
+```go
+// pkg/scheduler/framework/plugins/names/names.go, v1.37.0
+const (
+	PrioritySort                    = "PrioritySort"
+	DefaultBinder                   = "DefaultBinder"
+	DefaultPreemption               = "DefaultPreemption"
+	NodeAffinity                    = "NodeAffinity"
+	NodeResourcesFit                = "NodeResourcesFit"
+	NodeResourcesBalancedAllocation = "NodeResourcesBalancedAllocation"
+	PodTopologySpread               = "PodTopologySpread"
+	TaintToleration                 = "TaintToleration"
+	InterPodAffinity                = "InterPodAffinity"
+	VolumeBinding                   = "VolumeBinding"
+	GangScheduling                  = "GangScheduling" // new alpha plugin this course's pinned v1.37.0 ships
+	// ...
+)
+```
+
+`TaintToleration`, `NodeResourcesFit`, `NodeAffinity`, `PodTopologySpread` -- these are exactly the names [The Scheduler and Resource Requests](/kubernetes/en/scheduling-and-scaling/the-scheduler-and-resource-requests/) already showed you filtering Nodes by requests, taints, and affinity. They are ordinary `FilterPlugin` implementations registered under these string names -- nothing more exotic than that.
+
+## Changing which plugins run: `KubeSchedulerConfiguration`
+
+The scheduler reads its active plugin set from a `KubeSchedulerConfiguration` file (`kubescheduler.config.k8s.io/v1`), passed with `--config`. Disabling one named plugin at one extension point for the default profile:
+
+```yaml
+# a local KubeSchedulerConfiguration file for kube-scheduler --config -- not a Kubernetes API object, never kubectl apply-able
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+clientConnection:
+  kubeconfig: /etc/kubernetes/scheduler.conf
+profiles:
+- schedulerName: default-scheduler
+  plugins:
+    filter:
+      disabled:
+      - name: TaintToleration
+```
+
+This is real, applicable configuration on a running `kind` control-plane node, since `kube-scheduler` on `kind` runs as an ordinary static Pod the kubelet manages from a manifest file the same way `kube-apiserver` and `etcd` do -- editing `/etc/kubernetes/manifests/kube-scheduler.yaml` to add `--config` and a `hostPath` volume for the file above, then letting the kubelet notice the manifest changed, is the same mechanism [Architecture: Control Plane and Nodes](/kubernetes/en/foundations/architecture-control-plane-and-nodes/) already showed you for static pods generally:
+
+```text
+$ docker exec internals-control-plane cat /etc/kubernetes/manifests/kube-scheduler.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  labels: { component: kube-scheduler, tier: control-plane }
+  name: kube-scheduler
+  namespace: kube-system
+spec:
+  containers:
+  - command:
+    - kube-scheduler
+    - --authentication-kubeconfig=/etc/kubernetes/scheduler.conf
+    - --authorization-kubeconfig=/etc/kubernetes/scheduler.conf
+    - --bind-address=127.0.0.1
+    - --kubeconfig=/etc/kubernetes/scheduler.conf
+    - --leader-elect=true
+    - --config=/etc/kubernetes/scheduler-extra/config.yaml
+    image: registry.k8s.io/kube-scheduler:v1.37.0
+    volumeMounts:
+    - mountPath: /etc/kubernetes/scheduler-extra
+      name: extra-config
+      readOnly: true
+    - mountPath: /etc/kubernetes/scheduler.conf
+      name: kubeconfig
+      readOnly: true
+  volumes:
+  - hostPath: { path: /etc/kubernetes/scheduler-extra, type: DirectoryOrCreate }
+    name: extra-config
+  - hostPath: { path: /etc/kubernetes/scheduler.conf, type: FileOrCreate }
+    name: kubeconfig
+```
+
+With `TaintToleration` disabled at the `Filter` extension point this way, a Pod with no `tolerations` at all would schedule successfully onto a tainted Node it would otherwise be filtered away from -- the direct, provable meaning of "a plugin is swappable per extension point," not a fixed algorithm.
+
+## `FailedScheduling` reasons map directly to plugin names
+
+[The Scheduler and Resource Requests](/kubernetes/en/scheduling-and-scaling/the-scheduler-and-resource-requests/) already captured this real event on this course's cluster:
+
+```text
+Warning  FailedScheduling  pod/important-pod  0/4 nodes are available: 1 Insufficient cpu, 1 node(s) had untolerated taint(s), 2 node(s) didn't match Pod's node affinity/selector. preemption: found a potential placement for pod on node scheduling-worker, preempting 1 victims
+```
+
+Read against this lesson's real plugin names: `Insufficient cpu` is `NodeResourcesFit`'s `Filter` returning non-Success; `untolerated taint(s)` is `TaintToleration`'s `Filter`; `didn't match Pod's node affinity/selector` is `NodeAffinity`'s `Filter`. `FailedScheduling` is not one generic failure -- it is the concatenation of every `FilterPlugin` that rejected at least one Node, each contributing its own clause in its own words.
+
+## Preemption: `PostFilter` in practice
+
+`DefaultPreemption` (registered under `names.DefaultPreemption`, implementing `PostFilterPlugin`) is what runs when `Filter` leaves zero feasible Nodes -- exactly the `PostFilter` extension point above. The real, already-proven preemption event from the same reference lesson:
+
+```text
+Normal   Preempted         pod/filler-54bbb658fb-xs2pg  Preempted by pod bd29493f-c306-4440-bded-95dc1aa81181 on node scheduling-worker
+```
+
+and the real, already-proven opt-out:
+
+```text
+Warning  FailedScheduling  0/4 nodes are available: 1 Insufficient cpu, ... preemption: not eligible due to preemptionPolicy=Never.
+```
+
+Both are `PostFilterPlugin.PostFilter` in action: the default path finds a victim and preempts it; `preemptionPolicy: Never` on the preemptor's `PriorityClass` makes `DefaultPreemption` return `Unschedulable` without ever calling the preempt path, exactly as the real event text states.
+
+## `schedulerName` and running a second scheduler
+
+Every Pod has `spec.schedulerName`, defaulting to `default-scheduler`; a Pod naming a different value is ignored entirely by the default scheduler and picked up only by a second `kube-scheduler` deployment watching for that name -- covered directly in the [official multiple-schedulers guide](https://kubernetes.io/docs/tasks/extend-kubernetes/configure-multiple-schedulers/), which this course does not re-derive here since it is a deployment topic (running a second Pod, with its own `--leader-elect`, its own `KubeSchedulerConfiguration`), not a new extension-point mechanic -- the pipeline above is identical inside either scheduler.
+
+## Mental Model
+
+`kube-scheduler` is a fixed sequence of named checkpoints -- the extension points -- each one an interface any number of plugins can implement; a `KubeSchedulerConfiguration` profile is nothing more than "which named plugins are enabled at which checkpoint, for Pods naming this `schedulerName`." Every fact you already know about scheduling behavior -- taints, affinity, resource fit, topology spread, preemption -- is one specific plugin at one specific checkpoint, not a property of the scheduler as a monolith. `FailedScheduling` text is not generated by one function either; it is the concatenation of whichever `FilterPlugin`s rejected a Node, in their own words, which is exactly why the reason text names the plugin's concern (`Insufficient cpu`, `untolerated taint`) rather than a generic "no fit."
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| Disabling a Filter plugin cluster-wide via `KubeSchedulerConfiguration` | Precise, source-proven control over one specific check | Applies to every Pod using that profile/`schedulerName` -- easy to accidentally weaken a safety filter (`TaintToleration`) for the whole cluster |
+| A second scheduler with its own `schedulerName` | Fully isolated scheduling logic/config for a subset of Pods, no risk to the default scheduler | Two schedulers can race for the same Node's capacity if not designed around it; doubles the leader-election/HA surface to operate |
+| `PostFilter`'s `DefaultPreemption` | Recovers capacity automatically under contention (proven in the linked lesson) | Runs only after `Filter` fails for every Node -- expensive relative to a plain Filter pass, and only as a last resort by design |
+
+## Common Misconceptions
+
+- **"The scheduler is one algorithm, not separately swappable pieces."** Proven above from the real interface file: ten-plus separate extension points, each a Go interface, each independently pluggable via `KubeSchedulerConfiguration` -- not a monolith.
+- **"`FailedScheduling` is one generic error message."** Proven above by reading a real captured event against real plugin names: the message is a concatenation of each rejecting `FilterPlugin`'s own clause.
+- **"A Pod with a custom `schedulerName` just gets scheduled slower by the same scheduler."** Per the [official docs](https://kubernetes.io/docs/tasks/extend-kubernetes/configure-multiple-schedulers/): the default `kube-scheduler` ignores it entirely; nothing schedules the Pod unless a second scheduler is actually watching for that name.
+- **"Disabling a plugin requires rebuilding kube-scheduler."** Proven above with a real, applied manifest change on a live `kind` control-plane node: `--config` plus an ordinary `KubeSchedulerConfiguration` file is enough, no rebuild.
+
+## Reading AI-generated code
+
+When reviewing a generated `KubeSchedulerConfiguration`, a claim about scheduler behavior, or a custom scheduler setup, check for:
+
+- A `plugins.<point>.disabled` list naming a plugin that does not exist at that extension point -- cross-check the real name (`pkg/scheduler/framework/plugins/names`) against the real extension point the plugin actually implements (`fwk-interface.go` above); a `Score`-only plugin listed under `filter.disabled` silently does nothing.
+- A profile that disables `TaintToleration` or `NodeResourcesFit` "to fix a scheduling issue" without checking what else stops being enforced cluster-wide -- proven above, a disabled Filter plugin stops filtering for every Pod on that profile, not just the one Pod that prompted the change.
+- Code or docs claiming `schedulerName` alone changes scheduling priority or speed -- proven above from the official docs, it changes which scheduler (if any) even looks at the Pod at all.
+- A claim that preemption "always" frees capacity -- the sibling lesson already proved `preemptionPolicy: Never` opts out of the entire `PostFilter` preempt path.
+
+<SpotTheBug code={`# k8s/scheduler-framework/custom-profile.yaml
+apiVersion: kubescheduler.config.k8s.io/v1
+kind: KubeSchedulerConfiguration
+profiles:
+- schedulerName: default-scheduler
+  plugins:
+    score:
+      disabled:
+      - name: TaintToleration`}>
+`TaintToleration` is a `FilterPlugin` (it implements `Filter`, not `Score` -- proven above from the real interface file, where `TaintToleration` is registered for the `filter` extension point in every real profile). Disabling it under `score.disabled` targets an extension point this plugin was never registered at, so the API server-side scheduler config accepts the file (it is syntactically valid `KubeSchedulerConfiguration`), but the disable has **no effect at all** -- `TaintToleration` keeps filtering exactly as before, because it was never enabled under `score` to begin with. The fix, proven above, is `filter.disabled`, matching the extension point the plugin actually implements.
+</SpotTheBug>
+
+<Callout title="The one-line takeaway">
+`kube-scheduler` is a fixed sequence of named extension points -- `PreEnqueue`/`QueueSort`/`PreFilter`/`Filter`/`PostFilter`/`PreScore`/`Score`/`Reserve`/`Permit`/`PreBind`/`Bind`/`PostBind`, real Go interfaces proven above from `staging/src/k8s.io/kube-scheduler/framework/interface.go` -- and a "plugin" is nothing more than a Go value implementing one or more of them, registered under a real name (`pkg/scheduler/framework/plugins/names`) via the real in-tree registry. A `KubeSchedulerConfiguration` profile (`--config`, applied above to a live static-pod scheduler on `kind`) lists which named plugins are enabled at which extension point, per `schedulerName`. `FailedScheduling` text is the concatenation of every rejecting `FilterPlugin`'s own clause, proven above against a real captured event; `DefaultPreemption` is an ordinary `PostFilterPlugin` that only runs once `Filter` has already rejected every Node, proven with a real `Preempted` event and a real `preemptionPolicy=Never` opt-out in the linked lesson.
+</Callout>
+
+export const quizSchedulerFramework = [
+  {
+    q: '```go\n// staging/src/k8s.io/kube-scheduler/framework/interface.go, v1.37.0\ntype FilterPlugin interface {\n  Plugin\n  Filter(ctx context.Context, state CycleState, pod *v1.Pod, nodeInfo NodeInfo) *Status\n}\ntype PostFilterPlugin interface {\n  Plugin\n  PostFilter(ctx context.Context, state CycleState, pod *v1.Pod, filteredNodeStatusMap NodeToStatusReader) (*PostFilterResult, *Status)\n}\n```\nWhen does PostFilter actually run?',
+    options: [
+      'Before Filter, to pre-select candidate Nodes',
+      'Only when Filter leaves zero feasible Nodes for the Pod -- this is where DefaultPreemption looks for victims',
+      'After every successful Bind, for cleanup',
+      'Only for Pods with a custom schedulerName',
+    ],
+    answer: 1,
+    explain: 'Proven above from the real interface comment and DefaultPreemption\'s registration: PostFilter runs only on the no-feasible-Node path.',
+  },
+  {
+    q: 'What is a kube-scheduler "plugin," concretely?',
+    options: [
+      'A CRD instance the scheduler reconciles',
+      'A Go value implementing one or more extension-point interfaces from k8s.io/kube-scheduler/framework, registered under a real name in the in-tree registry',
+      'A shell script invoked by kube-scheduler for each Pod',
+      'A webhook endpoint kube-scheduler calls over HTTP',
+    ],
+    answer: 1,
+    explain: 'Proven above from fwk-interface.go and registry.go -- in-process Go code, not an external call.',
+  },
+  {
+    q: '```text\nWarning  FailedScheduling  pod/important-pod  0/4 nodes are available: 1 Insufficient cpu, 1 node(s) had untolerated taint(s), 2 node(s) didn\'t match Pod\'s node affinity/selector.\n```\nThis single real event text maps to how many separate plugins?',
+    options: [
+      'One plugin producing one combined message',
+      'Three separate FilterPlugins (NodeResourcesFit, TaintToleration, NodeAffinity), each contributing its own clause',
+      'Zero plugins -- this text is hardcoded in the API server',
+      'It always means the same one plugin regardless of wording',
+    ],
+    answer: 1,
+    explain: 'Proven above: FailedScheduling text is a concatenation of each rejecting FilterPlugin\'s own reason -- Insufficient cpu (NodeResourcesFit), untolerated taint(s) (TaintToleration), node affinity/selector (NodeAffinity).',
+  },
+  {
+    q: 'What does a Pod\'s spec.schedulerName actually control?',
+    options: [
+      'A priority hint that makes the default scheduler go faster',
+      'Which scheduler (if any) even considers the Pod at all -- the default scheduler ignores a non-matching schedulerName entirely',
+      'Which Node the Pod is forced onto',
+      'Nothing; it is deprecated and ignored by all schedulers',
+    ],
+    answer: 1,
+    explain: 'Per the official multiple-schedulers docs, cited above: only a scheduler explicitly watching for that schedulerName will ever pick the Pod up.',
+  },
+  {
+    q: '```yaml\n# a KubeSchedulerConfiguration profile\nprofiles:\n- schedulerName: default-scheduler\n  plugins:\n    score:\n      disabled:\n      - name: TaintToleration\n```\nWhy does this config have no effect on taint/toleration filtering?',
+    options: [
+      'The YAML is invalid and the scheduler would refuse to start',
+      'TaintToleration is registered as a Filter plugin, not a Score plugin -- disabling it under score targets an extension point it was never enabled at',
+      'TaintToleration cannot be disabled under any circumstances',
+      'score.disabled only works for in-tree plugins, and TaintToleration is out-of-tree',
+    ],
+    answer: 1,
+    explain: 'Proven in this lesson\'s SpotTheBug: the config is syntactically valid but semantically inert, since TaintToleration implements FilterPlugin, not ScorePlugin -- the correct field is filter.disabled.',
+  },
+];
+
+<Quiz client:visible id="k8s-internals/scheduler-framework" questions={quizSchedulerFramework} />
+
+<ProgressTracker client:visible id="k8s-internals/scheduler-framework" />

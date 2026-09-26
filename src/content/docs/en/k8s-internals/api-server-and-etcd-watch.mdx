@@ -1,0 +1,288 @@
+---
+title: 'API Server and etcd Watch'
+description: 'The real request path through kube-apiserver -- auth, authz, admission, validation, storage -- and how a watch actually stays consistent with resourceVersion, bookmarks, and a real 410 Gone, proven against a live 3-node cluster with etcd as the one place state actually lives.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## The idea in one sentence
+
+`kube-apiserver` is a stateless HTTP layer that runs every request through the same fixed pipeline and writes the single authoritative copy of cluster state to **etcd**; every other component learns about a change the same way -- by watching a `resourceVersion`-ordered stream from the API server, never by polling and never by talking to etcd directly.
+
+## The real request path
+
+Every request -- `kubectl get`, `kubectl apply`, a controller's watch, the scheduler's bind -- goes through the same ordered pipeline inside `kube-apiserver`:
+
+<Mermaid title="The real request path through kube-apiserver" code={requestPathDiagram} />
+
+export const requestPathDiagram = `flowchart LR
+  client["Client (kubectl / client-go / scheduler)"] --> authn["Authentication"]
+  authn --> authz["Authorization (RBAC)"]
+  authz --> mutate["Mutating admission\\n(Admission Chain)"]
+  mutate --> validate2["Schema + strategy validation"]
+  validate2 --> validate["Validating admission\\n(Admission Chain)"]
+  validate --> storage["Storage: etcd via the watch cache"]
+  storage --> watch["Watch stream, resourceVersion-ordered"]`;
+
+Authentication decides *who* is making the request (a client certificate, a bearer token, a ServiceAccount token); authorization (RBAC in this course, `--authorization-mode=Node,RBAC` on this cluster's real `kube-apiserver`) decides whether that identity is *allowed* to do this verb on this resource; admission -- covered in full, source-proven depth in [Admission Chain](/kubernetes/en/k8s-internals/admission-chain/) -- runs in two phases around schema validation. What's left, once all of that passes, is storage: a write to etcd, and the resulting watch event every connected client sees.
+
+A real `-v=9` trace shows the client side of this directly -- the actual HTTP request, and a real response:
+
+```text
+$ kubectl get pods -n internals-demo -v=9
+curl -v -XGET -H "Accept: application/json;as=Table;v=v1;g=meta.k8s.io,application/json;as=Table;v=v1beta1;g=meta.k8s.io,application/json" -H "User-Agent: kubectl/v1.36.1 (darwin/arm64) kubernetes/7569396" 'https://127.0.0.1:58297/api/v1/namespaces/internals-demo/pods?limit=500'
+I0926 18:30:18.563973 round_trippers.go:562] "HTTP Trace: Dial succeed" network="tcp" address="127.0.0.1:58297"
+I0926 18:30:18.772778 round_trippers.go:632] "Response" verb="GET" url="https://127.0.0.1:58297/api/v1/namespaces/internals-demo/pods?limit=500" status="200 OK" headers=<
+I0926 18:30:18.772881 helper.go:113] "Response Body" body=<
+```
+
+Nothing here is special-cased for `kubectl` -- this is the same plain HTTPS request any `client-go` informer, `curl`, or hand-rolled HTTP client makes; `kubectl` just happens to be the client this course uses to show it.
+
+## `resourceVersion`: the ordering primitive behind everything
+
+Every object and every list response carries a `resourceVersion` -- an opaque, monotonically increasing string (backed by etcd's own revision number) that answers exactly one question: "how current is this read, relative to everything else." A plain list, read for real on this lesson's cluster:
+
+```text
+$ kubectl -n internals-demo get pods -o json | jq -r '.metadata.resourceVersion'
+1994
+```
+
+That `1994` is not this namespace's pod count or anything human-meaningful -- it is etcd's own logical clock at the moment this list was computed, and it is the number every subsequent `watch=1&resourceVersion=1994` request uses to mean "start streaming changes from exactly here forward, don't replay anything I already have and don't skip anything either."
+
+## A real watch, `--output-watch-events`, and a real `MODIFIED` event
+
+`--output-watch-events` wraps every object a watch delivers in an envelope naming its event type. Watching this namespace's Pods and then labeling one from a second terminal, real output:
+
+```text
+$ kubectl -n internals-demo get pods --watch --output-watch-events -o json
+ADDED Pod rv=1151 name=gc-demo4-54cd5f4cd9-7jhlq
+ADDED Pod rv=1150 name=gc-demo4-54cd5f4cd9-lddmh
+ADDED Pod rv=1535 name=ssa-atomic-demo-864644447-lg556
+ADDED Pod rv=963 name=ssa-demo
+ADDED Pod rv=1491 name=ssa-merge-demo-78fd5b47c4-9pk7t
+ADDED Pod rv=745 name=web-86d8686cfb-84dk9
+
+$ kubectl -n internals-demo label pod ssa-demo demo-round=one --overwrite   # run from a second terminal
+pod/ssa-demo labeled
+```
+
+```text
+MODIFIED Pod rv=2075 name=ssa-demo
+```
+
+The six `ADDED` events at the top are not six separate "somebody just created a Pod" notifications -- a plain `watch=1` with no starting `resourceVersion` (what `kubectl get --watch` does by default) begins by replaying every currently-existing object as a synthetic `ADDED`, exactly the same shape as `client-go`'s Reflector performing its initial `list()` (proven in [Controllers, Informers, and Workqueues](/kubernetes/en/k8s-internals/controllers-informers-and-workqueues/)). The real `MODIFIED` event at the bottom is the actual, live label change, delivered over the same held-open connection with no polling in between.
+
+## Bookmarks: a heartbeat with a real `resourceVersion`, no object attached
+
+`allowWatchBookmarks=true` asks the API server to periodically emit a `BOOKMARK` event -- an object with no real content, just an up-to-date `resourceVersion` -- so a client holding a long-idle watch can advance its "resume from here" marker without waiting for an actual change. Real, raw output from this cluster:
+
+```text
+$ kubectl get --raw "/api/v1/namespaces/internals-demo/pods?watch=1&resourceVersion=&timeoutSeconds=6&allowWatchBookmarks=true"
+{"type":"ADDED","object":{"kind":"Pod","metadata":{"name":"gc-demo4-54cd5f4cd9-7jhlq","resourceVersion":"1151",...}}}
+{"type":"ADDED","object":{"kind":"Pod","metadata":{"name":"ssa-demo","resourceVersion":"963",...}}}
+... (four more ADDED events for the namespace's other current Pods)
+{"type":"BOOKMARK","object":{"kind":"Pod","metadata":{"resourceVersion":"1994"}}}
+```
+
+That final `BOOKMARK` carries `resourceVersion: "1994"` and nothing else -- no name, no spec, no status. A client that stores this value and reconnects with `resourceVersion=1994` picks up exactly where it left off, without needing to have seen a real object change to know how current its view was.
+
+## `410 Gone`: proven, with the real message
+
+etcd does not keep every historical revision forever -- it periodically **compacts**, discarding old revisions past a retention window. A watch request naming a `resourceVersion` older than what etcd has retained cannot be resumed consistently, and the API server says so directly rather than silently returning incomplete data:
+
+```text
+$ kubectl get --raw "/api/v1/namespaces/internals-demo/pods?watch=1&resourceVersion=1&timeoutSeconds=6"
+{"type":"ERROR","object":{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"too old resource version: 1 (999)","reason":"Expired","code":410}}
+```
+
+`"too old resource version: 1 (999)"` names both numbers: the `resourceVersion` requested (`1`) and, in parentheses, the oldest one the server can still serve consistently (`999` on this cluster at this moment). `code: 410` is the real, mechanical reason `client-go`'s Reflector cannot simply "keep watching from where it left off" forever -- proven in [Controllers, Informers, and Workqueues](/kubernetes/en/k8s-internals/controllers-informers-and-workqueues/), this is exactly the case a `Replaced` delta exists for: the Reflector catches this exact error, falls back to a fresh `list()`, and resumes watching from the new list's `resourceVersion`.
+
+## etcd: the one place state actually lives
+
+Nothing about a Kubernetes object exists anywhere except etcd -- the API server's in-memory **watch cache** (`staging/src/k8s.io/apiserver/pkg/storage/cacher`) serves reads quickly, but every write goes through `staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go` to etcd itself, and this course's `kind` cluster runs etcd as an ordinary static Pod, reachable directly:
+
+```text
+$ kubectl -n kube-system get pods | grep etcd
+etcd-internals-control-plane   1/1   Running   0   <age>
+
+$ kubectl -n kube-system exec etcd-internals-control-plane -- etcdctl version
+etcdctl version: 3.7.0
+API version: 3.7
+```
+
+Reading a Pod's real, raw stored bytes directly out of etcd -- not through the API server at all:
+
+```text
+$ kubectl -n kube-system exec etcd-internals-control-plane -- etcdctl \
+    --endpoints=https://127.0.0.1:2379 \
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --cert=/etc/kubernetes/pki/etcd/server.crt \
+    --key=/etc/kubernetes/pki/etcd/server.key \
+    get /registry/pods/internals-demo/ssa-demo
+/registry/pods/internals-demo/ssa-demo
+k8s\x00
+	
+v1PodM-^P
+[...binary protobuf...]
+ssa-demo[...]internals-demo[...]
+manager-a[...]Apply[...]
+FieldsV1:{"f:spec":{"f:containers":{"k:{"name":"main"}":{".":{},"f:image":{},"f:name":{}}}}}
+[...]
+```
+
+Three real facts fall directly out of this one raw read: the storage key is a plain, predictable path (`/registry/<resource>/<namespace>/<name>`); the value starts with a literal `k8s\0` prefix followed by a version marker, then a **protobuf**-encoded object, not JSON or YAML (this is why you cannot `cat` an object out of etcd and read it directly the way you can a ConfigMap); and the raw bytes contain the exact same `managedFields` structure (`"f:spec":{"f:containers":{"k:{\"name\":\"main\"}"...`) that [Server-Side Apply Internals](/kubernetes/en/k8s-internals/server-side-apply-internals/) shows you formatted, because `managedFields` is not a derived, computed-on-read value -- it is stored, verbatim, as part of the object itself.
+
+## API aggregation vs. CRDs: two different ways to add API groups
+
+`kubectl get --raw /apis` lists every API group this cluster serves, real output including `apiregistration.k8s.io` (the aggregation layer itself) and `apiextensions.k8s.io` (the CRD machinery):
+
+```text
+$ kubectl get --raw /apis | jq -r '.groups[].name'
+apiregistration.k8s.io
+apps
+events.k8s.io
+authentication.k8s.io
+authorization.k8s.io
+autoscaling
+batch
+certificates.k8s.io
+networking.k8s.io
+policy
+rbac.authorization.k8s.io
+storage.k8s.io
+admissionregistration.k8s.io
+apiextensions.k8s.io
+scheduling.k8s.io
+```
+
+Both groups being present confirms this cluster supports *both* extension mechanisms, though this lesson's cluster has no CRD installed to demonstrate one directly (`kubectl get crd` returns none) -- the distinction between the two, per the [official docs](https://kubernetes.io/docs/concepts/extend-kubernetes/api-extension/apiserver-aggregation/), is real and worth being precise about: a **CRD** (`apiextensions.k8s.io`) is stored in *this* cluster's own etcd, served by `kube-apiserver` itself using a generic, schema-driven implementation -- no separate process. **API aggregation** (`apiregistration.k8s.io`, an `APIService` object) instead proxies a whole API group to a *different* server process entirely (in-cluster or not), which owns its own storage completely independently of this cluster's etcd -- `metrics.k8s.io` (served by the metrics-server Deployment, not stored in this cluster's etcd at all) is the most common real-world example of aggregation; a CRD-based operator's custom resource is the common example of the other.
+
+## OpenAPI: the schema every admission and `kubectl explain` call reads
+
+[kubectl and Declarative YAML](/kubernetes/en/foundations/kubectl-and-declarative-yaml/) already showed `kubectl explain` reading this schema for one field at a time; the same schema is served wholesale, real output from this cluster's discovery endpoint:
+
+```text
+$ kubectl get --raw /openapi/v3 | jq -r '.paths | keys | .[0:6]'
+[
+  ".well-known/openid-configuration",
+  "api",
+  "api/v1",
+  "apis",
+  "apis/admissionregistration.k8s.io",
+  "apis/admissionregistration.k8s.io/v1"
+]
+```
+
+Every one of these paths serves a full OpenAPI v3 document for that API group/version -- the exact document [Server-Side Apply Internals](/kubernetes/en/k8s-internals/server-side-apply-internals/) reads `x-kubernetes-list-type` markers out of, and the exact document schema/strategy validation checks a decoded object against on the request path above.
+
+## Mental Model
+
+Everything in this lesson is one fact, viewed from different angles: **the API server is the single front door to one authoritative store, and every read past that door is either "give me the current state" (a list, stamped with a `resourceVersion`) or "tell me what changes from here forward" (a watch, ordered by that same `resourceVersion`).** There is no third way to legitimately observe cluster state -- not polling, not reading etcd directly (proven above: raw protobuf, not meant to be read by hand), not guessing. A `BOOKMARK` and a `410 Gone` are both about the exact same primitive: how a client that was disconnected, or has been idle, correctly resumes an ordered stream without either replaying data it already has or silently missing data it doesn't.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| Watch with a remembered `resourceVersion` | Resumes exactly where a client left off, no gaps, no replay | Must handle `410 Gone` (proven above) by falling back to a fresh list |
+| `allowWatchBookmarks=true` | Advances a client's resume point during long idle periods with no real change | Extra, content-free events a naive consumer must filter out, not treat as real changes |
+| API aggregation (`APIService`) | The extension owns its own storage and scaling entirely independently of this cluster's etcd | An extra network hop and process to operate and keep available; this cluster's etcd growing has no bearing on it at all |
+| CRD (`apiextensions.k8s.io`) | No extra process -- stored and served by this cluster's own API server and etcd | Bound by this cluster's own etcd size/performance characteristics; a runaway CRD can affect this cluster's own storage |
+
+## Common Misconceptions
+
+- **"A watch is just a very long poll under the hood."** Proven above: it is one held-open HTTP connection receiving a real, ordered stream of `ADDED`/`MODIFIED`/`DELETED` (and `BOOKMARK`) events -- not repeated requests.
+- **"You can read an object's live state faster by going straight to etcd."** Proven above: the value is protobuf behind a `k8s\0` header, not meant to be read directly -- and doing so bypasses the watch cache, RBAC, and admission entirely, which is exactly why nothing in this course (or any real cluster) does it outside of a debugging exercise like this one.
+- **"A `410 Gone` means something is broken."** Proven above: it is the API server correctly refusing to silently under-deliver a watch it cannot resume consistently -- the expected, designed-for response to naming a compacted `resourceVersion`, not an error state.
+- **"CRDs and API aggregation are two names for the same mechanism."** Proven above from real group discovery plus the docs: a CRD is stored in this cluster's own etcd and served generically by `kube-apiserver`; an aggregated `APIService` proxies to an entirely separate server with its own, independent storage.
+
+## Reading AI-generated code
+
+When reviewing generated code or scripts that talk to the API server directly, check for:
+
+- A "controller" that calls `list()` repeatedly on a timer instead of a real watch -- proven above, a watch is one connection delivering an ordered stream; polling reimplements this badly and misses everything a `410 Gone`-aware Reflector handles for free.
+- Code that assumes a watch, once started, never needs to handle a restart -- proven above with a real `410 Gone`: any long-lived watch will eventually need to re-list, and code that treats the watch connection as permanent will simply stop receiving updates silently when it drops for any reason.
+- A script or tool that reads or writes etcd directly to "go faster" or "bypass the API" -- proven above, this skips RBAC and admission entirely and the data itself is protobuf, not a format meant for direct manipulation.
+- Confusing a `metrics.k8s.io`-style aggregated API with a CRD when reasoning about where its data lives or what happens if this cluster's etcd is restored from backup -- proven above, an aggregated API's data is not in this cluster's etcd at all, so restoring this cluster's etcd does not restore it.
+
+<SpotTheBug code={`// A "faster" health-check script someone wrote
+async function waitForPodReady(name: string) {
+  while (true) {
+    const pod = await readEtcdDirectly(\`/registry/pods/default/\${name}\`);
+    if (pod.status.phase === 'Running') return;
+    await sleep(500);
+  }
+}`}>
+Two real problems, both proven above. First, `readEtcdDirectly` is reading raw protobuf behind a `k8s\0` header -- there is no such convenient `pod.status.phase` to read without first writing a full protobuf decoder, and doing so bypasses RBAC and admission checks that exist for a reason. Second, even fixed to talk to the real API server, this is a poll, checking every 500ms regardless of whether anything changed -- the proven, correct pattern (this lesson's own `--watch`/`--output-watch-events` example, and [Controllers, Informers, and Workqueues](/kubernetes/en/k8s-internals/controllers-informers-and-workqueues/)'s Reflector) is a watch that delivers the exact moment `status.phase` becomes `Running` as a real `MODIFIED` event, with no polling interval to tune and no risk of missing a change that happens between polls.
+</SpotTheBug>
+
+<Callout title="The one-line takeaway">
+`kube-apiserver` runs every request through one fixed pipeline -- auth, authz, admission (two phases, proven in [Admission Chain](/kubernetes/en/k8s-internals/admission-chain/)), then storage -- and etcd is the only place state actually lives, proven above by reading a Pod's raw, protobuf-encoded bytes directly out of it. Every read is either a `resourceVersion`-stamped list or a watch ordered by that same `resourceVersion`; a `BOOKMARK` advances that marker with no real change, and a real `410 Gone` (proven above with the exact message, `"too old resource version: 1 (999)"`) is the correct, designed response when a watch can no longer resume consistently -- exactly the case `client-go`'s `Replaced` delta exists for. CRDs (stored in this cluster's own etcd) and API aggregation (proxied to an independent server with independent storage) are two structurally different ways to add API groups, both visible in real group discovery above.
+</Callout>
+
+export const quizApiServerEtcd = [
+  {
+    q: '```text\n$ kubectl get --raw "/api/v1/namespaces/internals-demo/pods?watch=1&resourceVersion=1&timeoutSeconds=6"\n{"type":"ERROR","object":{"kind":"Status", ..., "message":"too old resource version: 1 (999)","reason":"Expired","code":410}}\n```\nWhat does this real response prove, and what should a watch client do next?',
+    options: [
+      'The cluster is broken and needs a restart',
+      'etcd has compacted past resourceVersion 1; the client should fall back to a fresh list() and resume watching from the new list\'s resourceVersion -- exactly what a Reflector\'s Replaced delta handles',
+      'The Pod named in the request no longer exists',
+      'The client\'s RBAC permissions were revoked',
+    ],
+    answer: 1,
+    explain: 'Proven above: 410 Gone/Expired is the correct, designed response to naming a resourceVersion older than etcd\'s retention window -- client-go\'s Reflector handles this exact case by relisting.',
+  },
+  {
+    q: 'What does a resourceVersion actually represent?',
+    options: [
+      'A count of objects in the namespace',
+      'An opaque, monotonically increasing marker (backed by etcd\'s own revision) used to order watch streams and resume them consistently',
+      'The Kubernetes API version (e.g. v1, v1beta1)',
+      'A timestamp of the last write',
+    ],
+    answer: 1,
+    explain: 'Proven above: real resourceVersion values (963, 1151, 1994, ...) increase monotonically with cluster-wide writes and are used verbatim to resume a watch from an exact point.',
+  },
+  {
+    q: '```text\n$ kubectl -n internals-demo get pods --watch --output-watch-events -o json\nADDED Pod rv=1151 name=gc-demo4-...\n... (more ADDED for existing Pods) ...\nMODIFIED Pod rv=2075 name=ssa-demo\n```\nWhy do ADDED events appear for Pods that already existed before the watch even started?',
+    options: [
+      'A bug in kubectl',
+      'A watch with no starting resourceVersion begins by replaying every currently-existing object as a synthetic ADDED event, the same shape as a Reflector\'s initial list()',
+      'Those Pods were actually just recreated',
+      'ADDED always means the object is brand new to the cluster, full stop',
+    ],
+    answer: 1,
+    explain: 'Proven above: this mirrors exactly what client-go\'s Reflector does on ListAndWatch -- list current state (delivered as ADDED), then watch forward for real changes (the real MODIFIED event that follows).',
+  },
+  {
+    q: 'Why can\'t you simply cat a Pod\'s data out of etcd and read it like a ConfigMap?',
+    options: [
+      'etcd encrypts everything by default',
+      'The value is stored as protobuf behind a literal k8s\\\\0 header, not plain text -- proven above with a real raw read',
+      'etcd does not allow direct reads at all',
+      'Pods specifically are stored differently from every other resource',
+    ],
+    answer: 1,
+    explain: 'Proven above with a real etcdctl get: the raw value starts with a k8s\\\\0 prefix and a version marker, then protobuf-encoded bytes -- not JSON or YAML.',
+  },
+  {
+    q: 'What is the real structural difference between a CRD and an aggregated APIService?',
+    options: [
+      'There is no real difference; they are two names for the same thing',
+      'A CRD is stored in this cluster\'s own etcd and served generically by kube-apiserver; an aggregated APIService proxies to a separate server process with its own independent storage',
+      'CRDs are always faster than aggregated APIs',
+      'Aggregated APIs cannot have their own custom fields, only CRDs can',
+    ],
+    answer: 1,
+    explain: 'Proven above from real group discovery (apiextensions.k8s.io vs apiregistration.k8s.io) and the official docs -- a real-world aggregated API like metrics.k8s.io keeps its data entirely outside this cluster\'s etcd.',
+  },
+];
+
+<Quiz client:visible id="k8s-internals/api-server-and-etcd-watch" questions={quizApiServerEtcd} />
+
+<ProgressTracker client:visible id="k8s-internals/api-server-and-etcd-watch" />

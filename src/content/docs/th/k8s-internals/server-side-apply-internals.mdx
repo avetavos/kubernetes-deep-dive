@@ -1,0 +1,363 @@
+---
+title: 'Server-Side Apply Internals'
+description: 'โครงสร้างจริงของ managedFields -- marker f:/k:/v:, x-kubernetes-list-type merge เทียบกับ atomic พิสูจน์ด้วย field manager จริงสองตัว และ library structured-merge-diff ที่คำนวณทั้งหมดนี้ -- ไปไกลกว่า field-manager conflict ที่ Foundations แสดงไปแล้ว'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+## ไอเดียหลักในหนึ่งประโยค
+
+`managedFields` ไม่ใช่ list แบนของ "ใครแตะ object นี้บ้าง" — มันคือ tree ต่อ manager ว่า field ไหนบ้าง คีย์ด้วยอะไร ที่ manager นั้นเป็นเจ้าของ คำนวณโดย library `structured-merge-diff` เทียบกับ marker `x-kubernetes-list-type` ของ OpenAPI schema จริงที่ใช้งานอยู่ นี่คือเหตุผลที่ manager สองตัวเป็นเจ้าของ element คนละตัวของ list เดียวกันได้โดยไม่ conflict เลย ในขณะที่ manager ตัวที่สามที่แตะ list *คนละชนิด* จะ conflict ตั้งแต่ครั้งแรกที่ลอง
+
+[kubectl and Declarative YAML](/kubernetes/th/foundations/kubectl-and-declarative-yaml/) แสดง `--server-side`, block `managedFields` จริงและ error conflict ของ field manager จริงไปแล้ว บทนี้พิสูจน์ว่าอะไรตัดสินว่า manager สองตัวจะ conflict กันไหมเลย
+
+## `managedFields` อ่านเป็น tree: `f:`, `k:`, `v:`
+
+ทุก entry ใน `metadata.managedFields` คือ tree `fieldsV1` ที่ใช้ marker นำหน้าสามแบบ `f:<name>` สำหรับ field struct ธรรมดา `k:<key>` สำหรับ element หนึ่งตัวของ list ที่คีย์ด้วย identity (ไม่ใช่ index) และ (พบน้อยกว่า) `v:<value>` สำหรับ element หนึ่งตัวของ set ที่คีย์ด้วยค่าของตัวเอง manager สองตัว ต่างก็ SSA-apply `Deployment` เดียวกันและตั้ง environment variable ของ container คนละตัวชื่อ
+
+```yaml
+# k8s/server-side-apply-internals/ssa-env-a.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ssa-merge-demo
+  namespace: internals-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ssa-merge-demo }
+  template:
+    metadata:
+      labels: { app: ssa-merge-demo }
+    spec:
+      containers:
+        - name: c
+          image: registry.k8s.io/pause:3.10
+          env:
+            - name: FROM_MANAGER_A
+              value: "a"
+```
+
+```yaml
+# k8s/server-side-apply-internals/ssa-env-b.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ssa-merge-demo
+  namespace: internals-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ssa-merge-demo }
+  template:
+    metadata:
+      labels: { app: ssa-merge-demo }
+    spec:
+      containers:
+        - name: c
+          image: registry.k8s.io/pause:3.10
+          env:
+            - name: FROM_MANAGER_B
+              value: "b"
+```
+
+apply ด้วย field manager สองตัวที่ต่างกันจริง ไม่มี conflict เลย
+
+```text
+$ kubectl apply --server-side --field-manager=manager-a -f ssa-env-a.yaml
+deployment.apps/ssa-merge-demo serverside-applied
+$ kubectl apply --server-side --field-manager=manager-b -f ssa-env-b.yaml
+deployment.apps/ssa-merge-demo serverside-applied
+
+$ kubectl -n internals-demo get deployment ssa-merge-demo -o jsonpath='{.spec.template.spec.containers[0].env}'
+[{"name":"FROM_MANAGER_A","value":"a"},{"name":"FROM_MANAGER_B","value":"b"}]
+```
+
+environment variable ทั้งสองรอด — ไม่มี manager ตัวไหนเขียนทับอีกตัว `managedFields` จริง อ่านกลับมา แสดงเหตุผลตรง ๆ
+
+```text
+$ kubectl -n internals-demo get deployment ssa-merge-demo -o yaml --show-managed-fields
+  managedFields:
+  - manager: manager-a
+    operation: Apply
+    fieldsV1:
+      f:spec:
+        f:template:
+          f:spec:
+            f:containers:
+              k:{"name":"c"}:
+                f:env:
+                  k:{"name":"FROM_MANAGER_A"}:
+                    .: {}
+                    f:name: {}
+                    f:value: {}
+                f:image: {}
+                f:name: {}
+  - manager: manager-b
+    operation: Apply
+    fieldsV1:
+      f:spec:
+        f:template:
+          f:spec:
+            f:containers:
+              k:{"name":"c"}:
+                f:env:
+                  k:{"name":"FROM_MANAGER_B"}:
+                    .: {}
+                    f:name: {}
+                    f:value: {}
+                f:image: {}
+                f:name: {}
+```
+
+อ่านตรงตัว `k:{"name":"c"}` แปลว่า "element ใน list `containers` ที่ identity key `name` เท่ากับ `c`" — ไม่ใช่ "index 0" ลึกลงไปอีกชั้น `k:{"name":"FROM_MANAGER_A"}` ก็แปลว่าเรื่องเดียวกันเป๊ะสำหรับ list `env` อีกชั้นหนึ่ง `manager-a` เป็นเจ้าของ `env[name=FROM_MANAGER_A]` `manager-b` เป็นเจ้าของ `env[name=FROM_MANAGER_B]` มันคือ field path ที่แยกจากกันในเชิงโครงสร้าง ไม่มีอะไรให้ conflict เลย เพราะ SSA ไม่เคยมองว่า `env` เป็น field เดียวที่ต้องเป็นเจ้าของ มันมอง element ที่มีคีย์แต่ละตัวเป็น field ของตัวเอง
+
+## marker ของ schema ที่ทำให้สิ่งนี้เป็นไปได้
+
+การ address ด้วย `k:` ข้างบนทำงานได้เพราะ OpenAPI schema จริงบอก API server ว่า `env` เป็น **map-type list** คีย์ด้วย `name` — อ่านตรง ๆ จาก cluster 1.37 ที่รันอยู่จริง
+
+```text
+$ kubectl get --raw /openapi/v3/api/v1 | jq '.components.schemas."io.k8s.api.core.v1.Container".properties.env'
+{
+  "type": "array",
+  "items": { "$ref": "#/components/schemas/io.k8s.api.core.v1.EnvVar" },
+  "x-kubernetes-list-map-keys": ["name"],
+  "x-kubernetes-list-type": "map",
+  "x-kubernetes-patch-merge-key": "name",
+  "x-kubernetes-patch-strategy": "merge"
+}
+```
+
+เทียบกับ `args` output จริงจาก schema เดียวกัน property ถัดไป
+
+```text
+$ kubectl get --raw /openapi/v3/api/v1 | jq '.components.schemas."io.k8s.api.core.v1.Container".properties.args'
+{
+  "type": "array",
+  "items": { "type": "string" },
+  "x-kubernetes-list-type": "atomic"
+}
+```
+
+`x-kubernetes-list-type: atomic` แปลว่าตรงตามตัวหนังสือ *ทั้ง list* คือ field เดียว เป็นเจ้าของเป็นก้อนเดียว ไม่มีการคีย์ต่อ element เลย (ไม่มี identity ให้คีย์ด้วย `args` เป็น string array ธรรมดา ไม่มีอะไรแยก element แต่ละตัวออกจากกันเหมือนที่ `name` ทำให้ `env`)
+
+## Atomic list พิสูจน์แล้ว: array ทั้งก้อน conflict ไม่ใช่ element เดียว
+
+การทดลอง two-manager แบบเดียวกัน คราวนี้กับ `args`
+
+```yaml
+# k8s/server-side-apply-internals/ssa-args-a.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ssa-atomic-demo
+  namespace: internals-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ssa-atomic-demo }
+  template:
+    metadata:
+      labels: { app: ssa-atomic-demo }
+    spec:
+      containers:
+        - name: c
+          image: registry.k8s.io/pause:3.10
+          args: ["--flag-a"]
+```
+
+```text
+$ kubectl apply --server-side --field-manager=manager-a -f ssa-args-a.yaml
+deployment.apps/ssa-atomic-demo serverside-applied
+
+$ kubectl apply --server-side --field-manager=manager-b -f ssa-args-b.yaml   # args: ["--flag-b"]
+error: Apply failed with 1 conflict: conflict with "manager-a": .spec.template.spec.containers[name="c"].args
+Please review the fields above--they currently have other managers. Here
+are the ways you can resolve this warning:
+* If you intend to manage all of these fields, please re-run the apply
+  command with the `--force-conflicts` flag.
+...
+```
+
+field path ที่ conflict คือ `.args` ทั้งก้อน ไม่ใช่ `.args[0]` — `manager-b` ไม่ได้เป็นเจ้าของ "แค่ element ของตัวเอง" เหมือนตอนที่ทำกับ `env` เพราะไม่มี identity ต่อ element ให้ `args` คีย์ ownership ด้วย `managedFields` จริงของ `manager-a` สำหรับ object นี้ยืนยันว่ามันถือ field นี้เป็นก้อนทึบก้อนเดียว
+
+```text
+$ kubectl -n internals-demo get deployment ssa-atomic-demo -o yaml --show-managed-fields
+  managedFields:
+  - manager: manager-a
+    fieldsV1:
+      f:spec:
+        f:template:
+          f:spec:
+            f:containers:
+              k:{"name":"c"}:
+                f:args: {}    # field ทึบก้อนเดียว -- ไม่มี k:/v: ลูก ต่างจาก env ข้างบน
+                f:image: {}
+                f:name: {}
+```
+
+`f:args: {}` ไม่มี key ลูกเลย เทียบกับ `f:env` ที่มี `k:{"name":...}` เป็นลูกต่อ element ข้างบน — นี่คือ field-ownership tree ที่สะท้อน marker `map` กับ `atomic` ของ schema ตรง ๆ ไม่ใช่เรื่องบังเอิญของสองตัวอย่างนี้
+
+## marker ของ schema ไม่ overrides กฎ immutability ที่ hardcode ไว้
+
+ผลลัพธ์จริงอีกอันที่เข้าใจผิดง่าย `containers` เองก็เป็น `x-kubernetes-list-type: map` (คีย์ด้วย `name` เหมือน `env`) —
+
+```text
+$ kubectl get --raw /openapi/v3/api/v1 | jq '.components.schemas."io.k8s.api.core.v1.PodSpec".properties.containers'
+{
+  "description": "List of containers belonging to the pod. Containers cannot currently be added or removed. ... Cannot be updated.",
+  "type": "array",
+  "x-kubernetes-list-map-keys": ["name"],
+  "x-kubernetes-list-type": "map",
+  ...
+}
+```
+
+— ซึ่งดูเหมือนจะให้ manager ตัวที่สองเพิ่ม container ใหม่ทั้งตัวได้เหมือนที่ `env` ให้ manager ตัวที่สองเพิ่มตัวแปรใหม่ แต่มันไม่ได้ บน Pod เปล่า ๆ เพราะกฎ validation ระดับ strategy ที่ hardcode แยกต่างหาก (ไม่ใช่อะไรที่ SSA หรือ list-type ของ schema ควบคุม)
+
+```text
+$ kubectl apply --server-side --field-manager=manager-b -f add-sidecar.yaml
+The Pod "ssa-demo" is invalid: spec.containers: Forbidden: pod updates may not add or remove containers
+```
+
+description ของ schema เองบอกตรง ๆ *"Containers cannot currently be added or removed... Cannot be updated"* — นี่คือ Kubernetes เลือกที่จะห้าม mutation นี้ทั้งหมดที่ชั้น update-validation ไม่ขึ้นกับว่า merge algorithm จะยอมให้อะไรก็ตาม `list-type: map` อธิบาย *วิธีที่ merge รวมค่าของสอง manager ถ้า update ได้รับอนุญาตแล้ว* มันไม่ได้บอกว่า update ได้รับอนุญาตหรือเปล่า (Deployment's `spec.template.spec.containers` ตรงข้ามกัน เป็น template ข้างใน object ที่ mutable เต็มที่คนละตัว นี่คือเหตุผลเป๊ะที่การทดลอง `env`/`args` ข้างบนใช้ Deployment ไม่ใช่ Pod เปล่า ๆ)
+
+## `structured-merge-diff`: library ที่คำนวณสิ่งนี้จริง ๆ
+
+ไม่มีการ merge ข้างบนอันไหนเป็นโค้ด Kubernetes เฉพาะทางเลย มันคือ `sigs.k8s.io/structured-merge-diff` (pin ไว้ที่ **v6.4.2** ใน `go.mod` ของคอร์สนี้) library อเนกประสงค์สำหรับคำนวณ field ownership บน typed schema vendor เข้ามาใน `k8s.io/apimachinery` package `managedfields` ของ API server เอง (`staging/src/k8s.io/apimachinery/pkg/util/managedfields/internal/manager.go`) ห่อมันไว้หลัง interface จริงตัวเดียว
+
+```go
+// staging/src/k8s.io/apimachinery/pkg/util/managedfields/internal/manager.go, v1.37.0
+type Manager interface {
+	Apply(liveObj, appliedObj runtime.Object, managed Managed, fieldManager string, force bool) (runtime.Object, Managed, error)
+	// ...
+}
+```
+
+`--server-side` apply ทุกอันที่ API server ประมวลผลคือการเรียก `Apply()` ตัวเดียวกันนี้ ซึ่งก็คือฟังก์ชันเดียวกับที่ `fieldmanager.NewManagedFieldsValidatingAdmissionController` (เห็นใน excerpt จริงของ `create.go` ใน [Admission Chain](/kubernetes/th/k8s-internals/admission-chain/)) ห่อไว้เป็นส่วนหนึ่งของ admission — การคำนวณ field-ownership ไม่ใช่ side effect ที่แปะเพิ่มบน request path มันคือขั้นตอนที่ใกล้ admission อีกขั้นที่ create/update ทุกอันวิ่งผ่าน
+
+## controller ใช้ SSA อย่างไร: Apply Configuration ใน `client-go`
+
+controller ที่เขียนเองได้พฤติกรรม merge ที่ปลอดภัยจาก conflict แบบเดียวกัน ผ่าน type **Apply Configuration** ที่ generate มา — `DeploymentApplyConfiguration` และเพื่อน ๆ (`staging/src/k8s.io/client-go/applyconfigurations/apps/v1/deployment.go`) สร้างขึ้นเฉพาะเพื่อแสดง "field ที่ฉันเป็นเจ้าของ" แทนที่จะเป็น object เต็ม
+
+```go
+// staging/src/k8s.io/client-go/applyconfigurations/apps/v1/deployment.go, v1.37.0
+func Deployment(name, namespace string) *DeploymentApplyConfiguration { /* ... */ }
+func ExtractDeployment(deployment *appsv1.Deployment, fieldManager string) (*DeploymentApplyConfiguration, error) { /* ... */ }
+```
+
+`ExtractDeployment` คือครึ่งการอ่านของ idea เดียวกัน มันดึงกลับจาก object จริงเฉพาะ field ที่ `fieldManager` ที่ระบุเป็นเจ้าของอยู่ตอนนี้ ทำให้ controller สร้าง apply ครั้งถัดไปจาก "สิ่งที่ฉันเป็นเจ้าของจริงตอนนี้" แทนที่จะสมมติว่ายังเป็นเจ้าของทุกอย่างที่ apply ไปครั้งที่แล้ว — ภาพสะท้อนฝั่ง controller ของการอ่าน `managedFields` เองที่พิสูจน์ตลอดบทนี้
+
+<Mermaid title="field manager สองตัว list เดียว สองผลลัพธ์" code={ssaDiagram} />
+
+export const ssaDiagram = `flowchart TD
+  schema["Live OpenAPI schema: x-kubernetes-list-type"] -->|map, คีย์ด้วย name| mapPath["env: manager-a เป็นเจ้าของ env[name=A]\\nmanager-b เป็นเจ้าของ env[name=B]\\nไม่ conflict (พิสูจน์ข้างบน)"]
+  schema -->|atomic| atomicPath["args: manager-a เป็นเจ้าของ array ทั้งก้อน\\nการ apply ของ manager-b CONFLICT (พิสูจน์ข้างบน)"]
+  mapPath --> smd["structured-merge-diff คำนวณ field ownership\\n(sigs.k8s.io/structured-merge-diff v6.4.2)"]
+  atomicPath --> smd
+  smd --> managedFields["metadata.managedFields: tree f:/k:/v: ต่อ manager"]`;
+
+## Mental Model
+
+`managedFields` ไม่ใช่ "log ว่าใคร apply ล่าสุด" มันคือ field-ownership tree *ปัจจุบัน* และคำถามว่า manager สองตัวจะ conflict ไหมลดรูปเหลือคำถามเดียว schema ให้ identity แก่ element ของ list นี้ให้คีย์ ownership ด้วยไหม `x-kubernetes-list-type: map` (หรือ `set`) บอกว่าใช่ ดังนั้น `structured-merge-diff` ให้ ownership ที่แยกกันได้บน element ที่แยกกัน — พิสูจน์ข้างบน ไม่ conflict เลยบน `env` `x-kubernetes-list-type: atomic` บอกว่าไม่ใช่ ดังนั้นทั้ง list คือ field เดียว เจ้าของเดียวในแต่ละช่วงเวลา — พิสูจน์ข้างบน conflict จริงทันทีบน `args` กฎ immutability ที่ hardcode ไว้ (Pod `containers`) เป็นแกนที่สาม แยกอิสระโดยสิ้นเชิง มันห้าม update ได้ตรง ๆ ไม่ว่า merge algorithm จะคำนวณอะไรไว้ก็ตาม
+
+## ข้อแลกเปลี่ยน
+
+| ชนิด list | ข้อดี | ข้อเสีย |
+|---|---|---|
+| `map` (คีย์ด้วย identity เช่น `env`, `ports`, `containers`) | manager หลายตัวเป็นเจ้าของ element คนละตัวได้อย่างปลอดภัย ไม่ conflict เลย (พิสูจน์ข้างบน) | ต้องมี identity key จริงใน schema ไม่ใช่ทุก list จะมี |
+| `atomic` (เช่น `args`, `command`) | ownership ชัดเจน ไม่กำกวม เจ้าของเดียวต่อ field ทั้งก้อน | manager ตัวที่สองแตะ element*ไหนก็ตาม* บังคับให้เกิด conflict จริง แม้จะแค่เพิ่มค่าที่ดูไม่มีพิษภัย |
+| immutability ที่ hardcode ไว้ (ห้ามเพิ่ม/ลบ `containers` ของ Pod) | ป้องกันความผิดพลาดทั้งกลุ่ม "แก้รูปร่าง Pod ที่รันอยู่แบบเงียบ ๆ" | override สิ่งที่ marker list-type อย่างเดียวจะบอกว่าเป็นไปได้ พิสูจน์ข้างบน เดาผิดง่าย |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"`managedFields` ก็แค่เวอร์ชัน server-side ของ `last-applied-configuration`"** พิสูจน์ข้างบน มันคือ tree ต่อ manager ต่อ field-path คีย์ด้วย marker schema จริง ไม่ใช่ blob ก้อนเดียว manager สองตัวเป็นเจ้าของ list เดียวกันโดยไม่ conflict เลยได้ ซึ่งกลไก annotation เก่าไม่มี concept แบบนี้เลย
+- **"ถ้า field เป็น list manager สองตัวแตะ element คนละตัวไม่มีวัน conflict"** พิสูจน์ข้างบนว่าจริงแค่กับ list type `map`/`set` การทดลองเดียวกันเป๊ะบน list แบบ `atomic` (`args`) เกิด conflict จริงทันทีบน array ทั้งก้อน
+- **"list แบบ `map` แปลว่าเปลี่ยนอะไรก็ได้เสมอ"** พิสูจน์ข้างบนด้วย Pod `containers` marker `list-type: map` ของ schema เองอยู่ร่วมกับกฎที่ hardcode แยกต่างหากที่ห้ามเพิ่มหรือลบ element เลยบน object นั้นเฉพาะ
+- **"`managedFields` คือ logic เฉพาะทางของ Kubernetes เอง"** พิสูจน์ข้างบน การคำนวณจริงคือ `sigs.k8s.io/structured-merge-diff` library อเนกประสงค์ ห่อด้วย interface จริงตัวเดียว `Manager.Apply()` ใน `k8s.io/apimachinery`
+
+## อ่านโค้ดที่ AI เขียน
+
+เวลา review การใช้ SSA ที่ generate มา การแก้ conflict ที่อ้างว่าถูกต้อง หรือ logic apply ของ controller เช็คสิ่งเหล่านี้
+
+- ใช้ `--force-conflicts` ทันทีที่เจอ conflict โดยไม่อ่านว่า field path ไหนที่มันเอ่ยชื่อ — พิสูจน์ข้างบน field path (`.args` เทียบกับ `.env[name=...]`) บอกตรง ๆ ว่าคุณกำลังจะขโมย field แบบ atomic ทั้งก้อนจาก manager อื่น หรือแค่เคลม map key ที่แยกกันอยู่แล้ว
+- โค้ดที่สมมติว่า list field ไหนก็ตามรองรับ "แค่เพิ่ม element ของตัวเองอย่างปลอดภัย" — พิสูจน์ข้างบน การรับประกันนั้นมีแค่กับ list type `map`/`set` เช็ค schema จริง (`kubectl get --raw /openapi/v3/...`) ก่อนจะสมมติ ไม่ใช่หลังจาก conflict โผล่มาบน production
+- controller ที่สร้าง apply ครั้งถัดไปจากสิ่งที่ apply ไปครั้งที่แล้ว แทนที่จะใช้ `Extract*` (เช่น `ExtractDeployment`) เทียบกับ object จริง — พิสูจน์ข้างบน `Extract*` ให้สิ่งที่คุณเป็นเจ้าของจริง *ตอนนี้* ซึ่งอาจต่างไปถ้า manager อื่นเข้าครอบครอง field ที่คุณเลิกตั้งค่าไปแล้ว
+- สมมติว่า `x-kubernetes-list-type: map` อย่างเดียวรับประกันว่า update ได้รับอนุญาตแน่ ๆ — พิสูจน์ข้างบนด้วย Pod `containers` กฎ immutability ที่ hardcode ไว้ห้าม update ได้ตรง ๆ ไม่ขึ้นกับ merge type เลย
+
+<SpotTheBug code={`# A teammate's fix for a recurring SSA conflict on a Deployment's args
+kubectl apply --server-side --force-conflicts --field-manager=my-controller -f patch.yaml`}>
+วิธีนี้หยิบ `--force-conflicts` มาใช้โดยไม่เคยอ่านเลยว่า field ไหนที่ conflict เอ่ยชื่อ พิสูจน์ข้างบน บน list แบบ `atomic` อย่าง `args` field path ที่ conflict คือ *array ทั้งก้อน* (`.spec.template.spec.containers[name="c"].args`) การ force ทิ้งค่า `args` ของ manager อีกตัวไปเงียบ ๆ ไม่ใช่แค่ "เพิ่มของฉันเข้าไปข้าง ๆ ของเขา" แบบที่จะเกิดกับ list แบบ `map` อย่าง `env` การตอบสนองที่ถูกต้อง พิสูจน์ตลอดบทนี้ คืออ่าน field path ที่แน่ชัดของ conflict ก่อน ถ้าเป็น list แบบ atomic `--force-conflicts` คือการเขียนทับค่าทั้งหมดของคนอื่นจริง ตั้งใจ ไม่ใช่ merge ที่ปลอดภัย — การตัดสินใจนั้นควรมาจากคนอ่าน field เฉพาะนั้นจริง ๆ ไม่ใช่ฝังไว้ใน script ที่ยิงทุกครั้งที่เจอ conflict ไม่ว่าจะ field ไหน
+</SpotTheBug>
+
+<Callout title="สรุปหนึ่งบรรทัด">
+`managedFields` คือ tree ต่อ manager ของ marker `f:`/`k:`/`v:` ไม่ใช่ log แบน `k:{"name":"..."}` address element ของ list ด้วย identity พิสูจน์ข้างบนด้วย manager สองตัวที่เป็นเจ้าของ `env` entry คนละตัวบน Deployment เดียวกันอย่างสะอาด ไม่ conflict เลย เป็นไปได้หรือไม่ขึ้นกับ `x-kubernetes-list-type` ของ OpenAPI schema จริงที่ใช้งานอยู่ **`map`** (คีย์ด้วย identity เช่น `env`, `ports`) ให้ element ที่แยกกันมีเจ้าของแยกกันได้ **`atomic`** (เช่น `args`) ทำให้ list ทั้งก้อนเป็น field เดียว เจ้าของเดียว พิสูจน์ข้างบนด้วย conflict จริงทันทีที่เอ่ยชื่อ array ทั้งก้อน กฎ strategy ที่ hardcode ไว้ (ห้ามเพิ่ม/ลบ `containers` ของ Pod) ยัง override สิ่งที่ marker แบบ `map` อย่างเดียวจะบอกว่าปลอดภัยได้ ทั้งหมดนี้วิ่งผ่าน library จริงตัวเดียว `structured-merge-diff` (`sigs.k8s.io/structured-merge-diff` v6.4.2) ห่อด้วย interface `Manager.Apply()` ตัวเดียวที่ request `--server-side` ทุกอันวิ่งผ่าน และ controller ได้ความปลอดภัยแบบเดียวกันผ่าน type `Extract*`/Apply Configuration ที่ generate มาใน `client-go` ไม่ใช่เขียน field tracking เองมือ
+</Callout>
+
+export const quizSSAInternals = [
+  {
+    q: '```text\nk:{"name":"c"}:\n  f:env:\n    k:{"name":"FROM_MANAGER_A"}:\n      .: {}\n```\nprefix k: ใน output จริงของ managedFields นี้แปลว่าอะไร?',
+    options: [
+      'ตำแหน่ง index ของ element นี้ใน array (ตำแหน่ง 0, 1, 2...)',
+      'element ของ list นี้ถูก address ด้วย identity key (ในที่นี้คือ name) ไม่ใช่ตำแหน่งใน array',
+      'field นี้เป็น keyword เฉพาะของ Kubernetes ไม่เกี่ยวกับการ address list',
+      'manager มีสิทธิ์แค่อ่าน field นี้',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบน k:{"name":"c"} แปลว่า "element ที่ key name เท่ากับ c" -- ownership ถูก track ต่อ identity นี่คือเหตุผลเป๊ะที่ manager สองตัวแตะคีย์คนละตัวไม่มีวันชนกัน',
+  },
+  {
+    q: '```text\n$ kubectl apply --server-side --field-manager=manager-b -f ssa-args-b.yaml\nerror: Apply failed with 1 conflict: conflict with "manager-a": .spec.template.spec.containers[name="c"].args\n```\nทำไม field args ทั้งก้อนถึง conflict แทนที่จะเป็นแค่ค่าใหม่ตัวเดียวที่ manager-b พยายามเพิ่ม?',
+    options: [
+      'args บังเอิญตั้งค่าผิดบน cluster นี้เท่านั้น',
+      'args เป็น list แบบ atomic ใน schema (x-kubernetes-list-type: atomic) -- ไม่มี identity key ต่อ element เลย array ทั้งก้อนถูก track และเป็นเจ้าของเป็น field เดียว',
+      'manager-b พิมพ์ YAML ผิด',
+      'string array เป็น map-type ได้เท่านั้น args เป็น string array เลยต้องเป็น atomic',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบนจาก schema จริง args มี x-kubernetes-list-type: atomic ไม่มี list-map-keys เลย -- ไม่มี identity ให้คีย์ ownership ด้วย list ทั้งก้อนเลยเป็น field เดียว',
+  },
+  {
+    q: '```text\n$ kubectl get --raw /openapi/v3/api/v1 | jq \'...PodSpec.properties.containers\'\n{"x-kubernetes-list-type": "map", "description": "...Containers cannot currently be added or removed...Cannot be updated."}\n```\nจาก schema จริงนี้ ทำไม manager ตัวที่สองยังเพิ่ม container ใหม่ลง Pod ผ่าน SSA ไม่ได้?',
+    options: [
+      'schema ผิด list-type ควรจะเป็น atomic',
+      'มีกฎ validation ระดับ strategy ที่ hardcode แยกต่างหากห้ามเพิ่ม/ลบ container ของ Pod ทั้งหมด ไม่ขึ้นกับสิ่งที่ marker list-type อย่างเดียวจะอนุญาตให้ merge',
+      'SSA ไม่รองรับการเพิ่ม element ใหม่ให้ list แบบ map เลยไม่ว่า field ไหน',
+      'มีแค่ Deployment เท่านั้นที่รองรับ merge list แบบ map ไม่ใช่ Pod เปล่า ๆ',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบน description ของ schema เองระบุว่าห้ามเพิ่มหรือลบ containers -- นี่บังคับใช้แยกจาก semantics การ merge ของ list-type นี่คือเหตุผลที่ field env เดียวกันบน template ของ Deployment กลับให้ manager ตัวที่สองเพิ่ม element ใหม่ได้',
+  },
+  {
+    q: 'library ตัวไหนที่คำนวณ field ownership กับพฤติกรรม merge ของ Server-Side Apply จริง ๆ?',
+    options: [
+      'algorithm เฉพาะทางที่เขียนขึ้นสำหรับ API server ของ Kubernetes โดยเฉพาะ',
+      'sigs.k8s.io/structured-merge-diff library อเนกประสงค์ (pin v6.4.2) ห่อด้วย interface Manager.Apply() ตัวเดียวใน k8s.io/apimachinery',
+      'library validation OpenAPI ตัวเดียวกับที่ kubectl explain ใช้',
+      'กลไก conflict resolution ภายในของ etcd เองสำหรับการเขียนพร้อมกัน',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบนจาก go.mod และ manager.go -- structured-merge-diff เป็น library อเนกประสงค์แยกต่างหาก ไม่ใช่ logic เฉพาะทางของ API server',
+  },
+  {
+    q: 'controller ที่เขียนเองควรสร้าง Server-Side Apply request ครั้งถัดไปอย่างไร ตาม pattern จริงของ client-go?',
+    options: [
+      'ส่ง object เดิมเป๊ะที่ apply ไปครั้งที่แล้วซ้ำเสมอ ไม่มีเงื่อนไข',
+      'ใช้ฟังก์ชัน Extract* ที่ generate มา (เช่น ExtractDeployment) เทียบกับ object จริง เพื่ออ่านกลับเฉพาะ field ที่ตัวเองเป็นเจ้าของอยู่ตอนนี้ แล้วสร้าง apply ครั้งถัดไปจากตรงนั้น',
+      'อ่าน metadata.resourceVersion แล้วเพิ่มเลขเองมือ',
+      'ใส่ --force-conflicts เสมอเพื่อการันตีว่า apply จะสำเร็จ',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบนจาก package applyconfigurations ของ client-go Extract* สะท้อนการอ่าน managedFields เอง -- มันแสดง ownership จริงตอนนี้ ซึ่งอาจเปลี่ยนไปได้ถ้า manager อื่นเข้าครอบครอง field ที่คุณเลิกตั้งค่า',
+  },
+];
+
+<Quiz client:visible id="k8s-internals/server-side-apply-internals" questions={quizSSAInternals} />
+
+<ProgressTracker client:visible id="k8s-internals/server-side-apply-internals" />
