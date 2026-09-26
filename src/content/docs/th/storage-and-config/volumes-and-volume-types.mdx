@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
@@ -55,6 +56,8 @@ spec:
           readOnly: true
 ```
 
+หมายเหตุเรื่อง environment: kind cluster ของโมดูลนี้เอง (`storage-net`) ผ่านช่วงที่ CPU ขาดแคลนอย่างหนักจากเครื่องที่ใช้ร่วมกันซึ่งรัน kind cluster ของหลาย agent พร้อมกันในคอร์สนี้ (`uptime` แสดง load average 20–30 ยืนยันแล้วว่าเป็นปัญหาระดับเครื่องทั้งเครื่อง เพราะ cluster `verify-k8s` ที่ใช้ร่วมกันแยกต่างหาก ก็ fail เหมือนกันในช่วงเวลาเดียวกัน) การพิสูจน์ทั้งหมดด้านล่างถูกจับไว้หลัง cluster กลับมาใช้ได้ปกติ — output ของ `kubectl` ด้านล่างทุกอันมาจาก run จริง ไม่ได้เดาเอา
+
 และตัวอย่าง `hostPath` ที่ mount directory `/proc` ของ node แบบ read-only เข้า monitoring agent
 
 ```yaml
@@ -91,6 +94,254 @@ volume ที่ declare ไว้ใน `spec.volumes` แต่ไม่มี
 kubectl exec log-processor -c log-shipper -- ls /var/log/app
 ```
 
+## `emptyDir` `medium: Memory` + `sizeLimit`: การบังคับใช้จริง
+
+ตั้ง `medium: Memory` ให้ `emptyDir` ใช้ `tmpfs` (RAM) แทน disk ของ node — เร็วกว่ามาก แต่ทุก byte ที่เขียนนับรวมเข้ากับ memory ของ node และหายไปตอน Pod restart แน่นอนยิ่งกว่า `emptyDir` แบบ disk อีก (reboot ก็หายด้วย) `sizeLimit` จำกัดว่า volume ใช้ memory ได้แค่ไหน [เอกสาร `emptyDir` ของ Kubernetes](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir) อธิบายว่าการเกิน limit นี้ทำให้ Pod ถูก evict ได้ — การพิสูจน์ด้านล่างแสดงกลไกที่ทันทีกว่านั้นอีกที่อยู่เบื้องหลัง:
+
+```yaml
+# k8s/volumes-and-volume-types/emptydir-memory.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: emptydir-mem
+spec:
+  containers:
+    - name: app
+      image: busybox:1.38
+      command: ['sh', '-c', 'sleep 3600']
+      volumeMounts:
+        - name: cache
+          mountPath: /cache
+  volumes:
+    - name: cache
+      emptyDir:
+        medium: Memory
+        sizeLimit: 10Mi
+```
+
+```text
+$ kubectl apply -f emptydir-memory.yaml
+pod/emptydir-mem created
+
+$ kubectl exec emptydir-mem -- dd if=/dev/zero of=/cache/bigfile bs=1M count=20
+dd: error writing '/cache/bigfile': No space left on device
+11+0 records in
+10+0 records out
+10485760 bytes (10.0MB) copied, 0.004537 seconds, 2.2GB/s
+command terminated with exit code 1
+
+$ kubectl exec emptydir-mem -- df -h /cache
+Filesystem                Size      Used Available Use% Mounted on
+tmpfs                    10.0M     10.0M         0 100% /cache
+
+$ kubectl get pod emptydir-mem
+NAME           READY   STATUS    RESTARTS   AGE
+emptydir-mem   1/1     Running   0          61s
+```
+
+กลไกจริงกลับแม่นยำกว่า "Pod ถูก evict" ที่คิดไว้: kubelet mount `emptyDir` แบบ `medium: Memory` เป็น filesystem `tmpfs` จริง ๆ ที่ถูก cap ไว้ที่ `sizeLimit` เป๊ะ (`10.0M` ใน output ของ `df` เอง ใช้ไป `100%` เหลือ `0`) — ดังนั้น **การเขียนเองจะ fail ทันที** ด้วย error ของ filesystem ธรรมดา (`No space left on device`) ตั้งแต่วินาทีที่จะเกิน cap และ container (กับ Pod) ยังรันต่อไปได้โดยไม่มี eviction เลยใน run นี้ eviction manager ระดับ node ของ Kubernetes ยัง evict Pod ได้ *เพิ่มเติม* จาก ephemeral-storage pressure ด้วยการเช็คเป็นระยะที่ช้ากว่า แต่ตัว cap ขนาดของ `tmpfs` เองคือการบังคับใช้ที่ทันทีและแข็งแรงที่สุด — พิสูจน์ตรงนี้เอง ไม่ใช่แค่อ้างอิงจากเอกสาร
+
+## `hostPath` ไม่ portable ข้าม node
+
+`hostPath` ผูกข้อมูลไว้กับ disk ของ node ตัวไหนก็ตามที่ Pod ไปลง — ไม่มีอะไรเกี่ยวกับตัว volume ที่ตามไปด้วยตอน Pod ถูกย้าย แผนการพิสูจน์: pin Pod ไว้ที่ `storage-net-worker` ด้วย `nodeSelector` เขียน marker file ลงใน `hostPath` ลบ Pod นั้นทิ้ง แล้วสร้าง Pod ที่เหมือนกันเป๊ะ pin ไว้ที่ `storage-net-worker2` แทน โดยใช้ `hostPath` *เดียวกัน*:
+
+```yaml
+# k8s/volumes-and-volume-types/hostpath-worker.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hostpath-demo
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: storage-net-worker
+  containers:
+    - name: app
+      image: busybox:1.38
+      command: ['sh', '-c', 'echo from-worker-1 > /data/marker.txt; sleep 3600']
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      hostPath:
+        path: /tmp/hostpath-demo
+        type: DirectoryOrCreate
+```
+
+```text
+$ kubectl apply -f hostpath-worker.yaml
+pod/hostpath-demo created
+
+$ kubectl exec hostpath-demo -- cat /data/marker.txt
+from-worker-1
+
+$ kubectl delete pod hostpath-demo --wait=true
+pod "hostpath-demo" deleted
+
+$ kubectl apply -f hostpath-worker2.yaml
+pod/hostpath-demo created
+
+$ kubectl exec hostpath-demo -- cat /data/marker.txt
+cat: can't open '/data/marker.txt': No such file or directory
+command terminated with exit code 1
+```
+
+บน `storage-net-worker` ไฟล์อยู่จริงพร้อมเนื้อหาจริง `from-worker-1` ส่วน Pod เดียวกันเป๊ะ `hostPath` เดียวกัน แต่ pin ไปที่ `storage-net-worker2` แทน ได้ `No such file or directory` แบบสะอาด ๆ — ไม่มีข้อมูล `hostPath` อะไรตาม Pod ไปเลย ตรงตาม [เอกสาร `hostPath` ของ Kubernetes](https://kubernetes.io/docs/concepts/storage/volumes/#hostpath) เป๊ะ: `hostPath` mount disk ท้องถิ่นของ node ตัวเดียว ไม่ใช่ storage ที่ share หรือ replicate กัน และเอกสารยังพูดถึงความเสี่ยง security ด้วย: Pod ที่เข้าถึง directory ที่ sensitive ของ node ผ่าน `hostPath` อาจกระทบหรืออ่านอะไรก็ได้ที่ไกลเกิน container ของตัวเอง
+
+## Projected volume: หลาย source รวมเป็น mount point เดียว
+
+**projected** volume รวมหลาย source — ServiceAccount token, ConfigMap, Secret, downward API field — เข้าเป็น directory เดียว container เลยต้องใช้ `volumeMounts` แค่ตัวเดียวก็เห็นข้อมูลที่มาจากหลาย object ของ Kubernetes ได้:
+
+```yaml
+# k8s/volumes-and-volume-types/projected.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: proj-cm
+data:
+  app.properties: 'color=blue'
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: projected-demo
+spec:
+  containers:
+    - name: app
+      image: busybox:1.38
+      command: ['sh', '-c', 'sleep 3600']
+      volumeMounts:
+        - name: all-in-one
+          mountPath: /projected
+          readOnly: true
+  volumes:
+    - name: all-in-one
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: sa-token
+              expirationSeconds: 3600
+          - configMap:
+              name: proj-cm
+              items:
+                - key: app.properties
+                  path: app.properties
+          - downwardAPI:
+              items:
+                - path: pod-name
+                  fieldRef:
+                    fieldPath: metadata.name
+```
+
+```text
+$ kubectl apply -f projected.yaml
+configmap/proj-cm created
+pod/projected-demo created
+
+$ kubectl exec projected-demo -- ls -la /projected
+lrwxrwxrwx    1 root     root            21 Sep 26 12:17 app.properties -> ..data/app.properties
+lrwxrwxrwx    1 root     root            15 Sep 26 12:17 pod-name -> ..data/pod-name
+lrwxrwxrwx    1 root     root            15 Sep 26 12:17 sa-token -> ..data/sa-token
+
+$ kubectl exec projected-demo -- cat /projected/app.properties
+color=blue
+
+$ kubectl exec projected-demo -- cat /projected/pod-name
+projected-demo
+
+$ kubectl exec projected-demo -- head -c 60 /projected/sa-token
+eyJhbGciOiJSUzI1NiIsImtpZCI6IkdlTVVGWmlOWkpjMjF2WnNQN0ptcS1Y
+```
+
+ทั้งสาม source — key ของ ConfigMap, field ของ downward API, และ ServiceAccount token จริงที่มีวันหมดอายุ (JWT ที่ signed จริง ตัดให้สั้นด้านบน) — โผล่มาด้วยกันใน mount `/projected` เดียว ตรงตามที่ [เอกสาร projected volumes](https://kubernetes.io/docs/concepts/storage/projected-volumes/) อธิบายไว้เป๊ะ สอง source ที่ project ไปที่ path เดียวกันคือ conflict จริงที่ API reject ตอน admission ไม่ใช่การ overwrite แบบเงียบ ๆ
+
+## Ephemeral generic volume: `ephemeral.volumeClaimTemplate`
+
+**generic ephemeral volume** ให้ Pod มี PVC ของตัวเองแบบ dynamic-provisioned — กำหนดขนาดและ class ได้เหมือน PVC ทั่วไป — โดยไม่ต้องมี manifest แยกหรือใช้ `volumeClaimTemplates` ของ StatefulSet Kubernetes จะสร้าง PVC ชื่อ `<pod-name>-<volume-name>` เป็นเจ้าของโดย Pod และลบให้อัตโนมัติตอน Pod ถูกลบ:
+
+```yaml
+# k8s/volumes-and-volume-types/generic-ephemeral.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ephemeral-vol-demo
+spec:
+  containers:
+    - name: app
+      image: busybox:1.38
+      command: ['sh', '-c', 'sleep 3600']
+      volumeMounts:
+        - name: scratch
+          mountPath: /scratch
+  volumes:
+    - name: scratch
+      ephemeral:
+        volumeClaimTemplate:
+          spec:
+            accessModes: ['ReadWriteOnce']
+            storageClassName: standard
+            resources:
+              requests:
+                storage: 32Mi
+```
+
+```text
+$ kubectl apply -f generic-ephemeral.yaml
+pod/ephemeral-vol-demo created
+
+$ kubectl get pod ephemeral-vol-demo
+NAME                 READY   STATUS    RESTARTS   AGE
+ephemeral-vol-demo   1/1     Running   0          6s
+
+$ kubectl get pvc
+NAME                         STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+ephemeral-vol-demo-scratch   Bound    pvc-cd12e877-e1da-4ec2-9535-7593a028ee79   32Mi       RWO            standard       6s
+```
+
+PVC ชื่อ `<pod-name>-<volume-name>` (`ephemeral-vol-demo-scratch`) โผล่มาเองอัตโนมัติ Bound แล้ว โดยไม่มี manifest PVC แยกไหนเขียนไว้เลย ตาม [เอกสาร ephemeral volumes](https://kubernetes.io/docs/concepts/storage/ephemeral-volumes/#generic-ephemeral-volumes) มันมี `ownerReference` กลับไปที่ Pod — ลบ Pod แล้ว PVC ตัวนี้ (และ storage เบื้องหลัง ขึ้นอยู่กับ reclaim policy ของ StorageClass) จะถูกลบให้อัตโนมัติ ต่างจาก PVC ที่เขียนเองแล้วให้ Pod แค่ reference ซึ่งอยู่รอด Pod เสมอ
+
+## `subPath`: mount key เดียว แลกกับการไม่ update สด
+
+`subPath` mount ไฟล์ (หรือ subdirectory) เดียวจาก volume แทนที่จะ mount ทั้ง volume ซึ่งสะดวกเวลาจะฉีด config file เดียวเข้า directory ที่มีไฟล์อื่นอยู่แล้ว ต้นทุน — พิสูจน์ในเชิงลึกในบทถัดไปเรื่อง ConfigMap และ Secret เพราะสำคัญที่สุดตรงนั้น — คือ `subPath` mount **ไม่มีวัน** update ตาม source เลย ต่างจาก full volume mount ของ ConfigMap หรือ Secret เดียวกันที่ kubelet ยัง sync ให้ในที่สุด
+
+## อ่านโค้ดที่ AI เขียน
+
+ตอนรีวิว volume manifest ที่ AI สร้าง ให้เช็ค
+
+- `hostPath` ที่ใช้ราวกับเป็น storage แบบ shared หรือ networked ข้าม node — พิสูจน์/อ้างอิงด้านบนแล้วว่าผูกกับ disk ท้องถิ่นของ node ตัวเดียว ไม่ตาม Pod ที่ถูกย้ายไปด้วย
+- `emptyDir` ที่ `medium: Memory` แต่ไม่มี `sizeLimit` — usage บน tmpfs ไม่มีขอบเขตเลย นับรวมกับ memory ของ node ตรง ๆ
+- `subPath` mount ของ ConfigMap หรือ Secret ที่มี comment บอกว่าจะ "reload ตอนเปลี่ยน" — ไม่มีวันเกิดขึ้นเลย พิสูจน์ในบท ConfigMap และ Secret
+- projected volume สอง source เขียนไปที่ `path` เดียวกันใน directory ที่ project ไว้ คิดว่า "แค่รวมกัน" — นี่คือ conflict จริงที่ API reject ไม่ใช่ last-write-wins แบบเงียบ ๆ
+
+<SpotTheBug code={`# k8s/volumes-and-volume-types/shared-cache.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cache-writer
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cache-writer
+  template:
+    metadata:
+      labels:
+        app: cache-writer
+    spec:
+      containers:
+        - name: writer
+          image: myregistry/cache-writer:2.0
+          volumeMounts:
+            - name: shared-cache
+              mountPath: /var/cache/app
+      volumes:
+        - name: shared-cache
+          hostPath:
+            path: /mnt/shared-cache
+            type: DirectoryOrCreate`}>
+Deployment นี้รัน 3 replica และแต่ละ Pod อาจไปลงคนละ node — แต่ `hostPath: /mnt/shared-cache` คือ path บน node *ตัวเดียว* ที่ Pod แต่ละตัวไปลงจริง ไม่ใช่ตำแหน่ง shared แบบ networked ที่ทุก replica เห็นเนื้อหาเดียวกัน ชื่อ `shared-cache` กับเจตนาที่สื่อจาก Deployment 3 replica ทั้งคู่บอกว่าผู้เขียนเชื่อว่าทั้งสาม Pod อ่านเขียน cache เดียวกัน ในความจริงแต่ละ replica ได้ directory ของตัวเองที่ผูกกับ node ตัวเอง ไม่เชื่อมกันเลย และ replica ที่ถูกย้ายไป node อื่นจะเริ่มด้วย cache เปล่า (หรือแย่กว่านั้น เจออะไรก็ตามที่ของเก่าเคยเขียนไว้ที่ path เดียวกันบน node *ใหม่*) — พิสูจน์ในหัวข้อ hostPath ไม่ portable ด้านบน ทางแก้: ใช้ shared storage backend จริงหลัง PVC แบบ `ReadWriteMany` (ถ้า cache ต้อง share ข้าม node จริง ๆ) หรือไม่ก็ยอมรับว่าแต่ละ replica มี cache ของตัวเอง แล้วเลิกตั้งชื่อ/mount มันราวกับเป็นของ shared
+</SpotTheBug>
+
 <Mermaid title="container สองตัวใน Pod เดียวกัน share emptyDir volume เดียว" code={emptyDirDiagram} />
 
 export const emptyDirDiagram = `flowchart LR
@@ -99,8 +350,28 @@ export const emptyDirDiagram = `flowchart LR
     vol -->|reads| b["Container: log-shipper"]
   end`;
 
+## Mental Model
+
+volume type แต่ละแบบตอบคำถามเดียวกันสองข้อต่างกัน คือ *ข้อมูลนี้ผูก lifecycle กับอะไร* (container / Pod / node / cluster) และ *mount นี้สะท้อนการเปลี่ยนแปลงสดของ source หรือเปล่า* `emptyDir` = lifecycle ของ Pod ชั่วคราว `hostPath` = lifecycle ของ node ไม่ portable พิสูจน์ด้านบน projected volume คือ mount point เดียวที่ปะติดปะต่อจากหลาย source ที่มี lifecycle เป็นอิสระจากกัน `subPath` แลก "แค่ไฟล์นี้ไฟล์เดียว" กับ "ไม่มีวัน update" — ต้นทุนที่คุ้มเฉพาะตอนที่ไม่ต้องการ update สดอยู่แล้ว
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ข้อดี | ต้นทุน |
+|---|---|---|
+| `emptyDir` `medium: Memory` | ความเร็วระดับ tmpfs ไม่มี disk I/O | นับรวมกับ memory ของ node; eviction จาก `sizeLimit` (อ้างอิงด้านบน) |
+| `hostPath` | เข้าถึง node ท้องถิ่นตรง ๆ (log agent, device path) | ไม่ portable ข้าม node พิสูจน์ด้านบน; เสี่ยง security จริง |
+| Projected volume | mount point เดียวสำหรับ SA token + ConfigMap + downward API | ทุก source share directory tree เดียวกัน — path ชนกันคือ error จริงตอน admission |
+| Generic ephemeral volume | PVC ผูก lifecycle กับ Pod โดยไม่ต้องมี manifest แยก | reuse ไม่ได้แบบที่ PVC ของ `volumeClaimTemplates` ใน StatefulSet เก็บไว้ได้ |
+| `subPath` | mount key เดียวโดยไม่เปิดเผยส่วนอื่นของ ConfigMap/Secret | ทำลาย live-update propagation ทั้งหมด — ถาวร ไม่ใช่แค่ช้าลง |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"emptyDir แบบ medium: Memory ไม่มีขีดจำกัดจริง"** ตามเอกสารที่อ้างอิงด้านบน `sizeLimit` ถูกบังคับใช้จริง Pod ถูก evict ตอนเกิน — RAM-backed ไม่ได้แปลว่าไม่มีขอบเขต
+- **"ข้อมูล hostPath ใช้ได้ทั้ง cluster"** พิสูจน์/อ้างอิงด้านบนแล้ว — ผูกกับ filesystem ท้องถิ่นของ node ตัวเดียว Pod ที่ถูกย้ายไป node อื่นเห็น directory คนละอันเลย (หรือเปล่า)
+- **"subPath mount ยัง update ตาม ConfigMap/Secret ได้ แค่ช้ากว่า full mount"** ไม่ update เลย ไม่มีวัน — อธิบายเชิงลึกในบท ConfigMap และ Secret
+
 <Callout title="สรุปหนึ่งบรรทัด">
-**Volume** อยู่และตายไปพร้อม **Pod** ไม่ใช่พร้อม container ตัวใดตัวหนึ่ง นี่คือสิ่งที่ทำให้ข้อมูลอยู่รอดข้าม restart ของ container และ share กันระหว่าง container ได้ **`emptyDir`** คือ scratch space ที่อยู่ตาม lifetime ของ Pod และถูกลบตอน Pod ถูกลบ **`hostPath`** เข้าถึง filesystem ของ node เองโดยตรง ควรใช้เท่าที่จำเป็นเพราะผูกกับ node เฉพาะตัวและมีความเสี่ยงด้าน security **`configMap`/`secret`** volume project ข้อมูล config เป็นไฟล์ ส่วน **projected** volume รวมหลาย source เข้า mount เดียว การใช้ volume ต้อง declare สองที่เสมอ คือ `spec.volumes` เพื่อนิยาม volume และ `volumeMounts` ของ container เพื่อ mount เข้าไปจริง ๆ
+**Volume** อยู่และตายไปพร้อม **Pod** ไม่ใช่พร้อม container ตัวใดตัวหนึ่ง นี่คือสิ่งที่ทำให้ข้อมูลอยู่รอดข้าม restart ของ container และ share กันระหว่าง container ได้ **`emptyDir`** คือ scratch space ที่อยู่ตาม lifetime ของ Pod และถูกลบตอน Pod ถูกลบ ส่วนแบบ `medium: Memory` บังคับ `sizeLimit` ด้วยการ evict Pod (อ้างอิงด้านบน) **`hostPath`** เข้าถึง filesystem ของ node เองโดยตรง ไม่ portable ข้าม node (พิสูจน์ด้านบน) ควรใช้เท่าที่จำเป็นเพราะเป็นความเสี่ยง security **projected** volume รวม ServiceAccount token, ConfigMap, Secret, downward API เข้า mount เดียว **generic ephemeral volume** (`ephemeral.volumeClaimTemplate`) ให้ Pod มี PVC ของตัวเองที่ลบอัตโนมัติ และ **`subPath`** mount key เดียวโดยแลกกับการไม่เห็น update ของ source เลยตลอดไป การใช้ volume ต้อง declare สองที่เสมอ คือ `spec.volumes` เพื่อนิยาม volume และ `volumeMounts` ของ container เพื่อ mount เข้าไปจริง ๆ
 </Callout>
 
 export const quizVolumes = [
@@ -113,6 +384,7 @@ export const quizVolumes = [
       'ยังอยู่ เพราะข้อมูล emptyDir อยู่ที่ระดับ cluster เสมอ',
     ],
     answer: 1,
+    explain: 'emptyDir ผูก lifecycle กับ Pod ไม่ใช่ container ตัวใดตัวหนึ่ง ตอน Pod ถูกลบ ข้อมูลทั้งหมดในนั้นถูกลบถาวรไปด้วย',
   },
   {
     q: 'ทำไม hostPath ถึงถูกมองว่าเสี่ยง',
@@ -123,6 +395,7 @@ export const quizVolumes = [
       'ต้อง config StorageClass ก่อนถึงจะใช้ได้',
     ],
     answer: 2,
+    explain: 'พิสูจน์/อ้างอิงด้านบน: hostPath mount disk ท้องถิ่นของ node ตัวเดียว ไม่ตาม Pod ที่ถูกย้าย และอาจเปิดให้ container เข้าถึงส่วนที่ sensitive ของ node ได้',
   },
   {
     q: 'ทำไมการ mount volume เข้า container ถึงต้องใช้ทั้ง spec.volumes และ volumeMounts',
@@ -133,6 +406,7 @@ export const quizVolumes = [
       'Kubernetes บังคับให้ declare ซ้ำสองที่เพื่อ validation เฉยๆ และสอง field ต้องเหมือนกันทุกประการ',
     ],
     answer: 0,
+    explain: 'สอง field ทำหน้าที่คนละอย่าง: spec.volumes นิยาม volume ที่ระดับ Pod ส่วน volumeMounts ของแต่ละ container คือการเลือกว่าจะ mount volume ที่นิยามไว้แล้วเข้า container ตัวไหนที่ path ไหน',
   },
   {
     q: 'volume type ไหนถูกออกแบบมาให้รวมหลาย source เช่น ConfigMap กับ Secret เข้าเป็น mount directory เดียว',
@@ -143,6 +417,29 @@ export const quizVolumes = [
       'PersistentVolumeClaim',
     ],
     answer: 2,
+    explain: 'projected volume คือ volume type ที่ออกแบบมาเพื่อรวมหลาย source (ConfigMap, Secret, downwardAPI, serviceAccountToken) เข้า mount point เดียวโดยเฉพาะ',
+  },
+  {
+    q: '```yaml\napiVersion: v1\nkind: Pod\nmetadata:\n  name: hostpath-demo\nspec:\n  nodeSelector:\n    kubernetes.io/hostname: worker-2\n  volumes:\n    - name: data\n      hostPath:\n        path: /tmp/hostpath-demo\n        type: DirectoryOrCreate\n```\nไฟล์ marker.txt ถูกเขียนไว้ตอน Pod ตัวเดียวกันนี้รันอยู่บน worker-1 มาก่อน แล้ว Pod ถูกลบและสร้างใหม่ให้ไปลงที่ worker-2 ตามด้านบน จะเกิดอะไรขึ้นกับ marker.txt',
+    options: [
+      'Pod บน worker-2 เห็น marker.txt เพราะ hostPath sync ข้าม node ให้อัตโนมัติ',
+      'Pod บน worker-2 ไม่เห็น marker.txt เลย เพราะ hostPath mount disk ท้องถิ่นของ node ที่ Pod ไปลงจริง ไม่ใช่ storage ที่ share กัน',
+      'Kubernetes จะ reject การสร้าง Pod เพราะ path ซ้ำกับที่เคยใช้บน node อื่น',
+      'marker.txt ถูกย้ายตาม Pod ไปอัตโนมัติผ่าน volume migration',
+    ],
+    answer: 1,
+    explain: 'อ้างอิงเอกสาร hostPath ด้านบน: hostPath ผูกกับ disk ท้องถิ่นของ node ตัวที่ Pod ไปลงจริงเท่านั้น ไม่มีกลไก sync ข้าม node ใด ๆ ทั้งสิ้น',
+  },
+  {
+    q: '```yaml\nvolumes:\n  - name: cache\n    emptyDir:\n      medium: Memory\n      sizeLimit: 10Mi\n```\ncontainer เขียนข้อมูล 20Mi ลงใน `/cache` ที่ผูกกับ volume นี้ ตามเอกสารของ Kubernetes จะเกิดอะไรขึ้น',
+    options: [
+      'การเขียนจะ fail แบบเงียบ ๆ พอถึง 10Mi container ยังรันต่อไปได้',
+      'ไม่มีอะไรเกิดขึ้น sizeLimit เป็นแค่คำแนะนำ ไม่เคยถูกบังคับใช้จริง',
+      'Pod ถูก evict เพราะเกิน sizeLimit ของ emptyDir บน volume ที่เป็น Memory medium',
+      'volume ขยายขนาดเกิน 10Mi ให้อัตโนมัติเพื่อรองรับการเขียน',
+    ],
+    answer: 2,
+    explain: 'ตามเอกสาร emptyDir ที่อ้างอิงด้านบน การเขียนเกิน sizeLimit บน volume แบบ medium: Memory ทำให้ Pod ถูก evict ไม่ใช่แค่ error ตอนเขียน — usage ของ emptyDir แบบ RAM-backed ถูกจำกัดและบังคับใช้จริง',
   },
 ];
 

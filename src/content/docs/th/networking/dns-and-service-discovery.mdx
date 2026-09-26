@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
@@ -71,6 +72,177 @@ nslookup web-0.cache.default.svc.cluster.local
 
 นี่คือสิ่งที่ระบบ stateful แบบ distributed ต้องการเป๊ะ ๆ database replica ต้องต่อกลับไปที่ peer *ตัวเดิม* ที่เคยต่อไว้ ไม่ใช่ตัวสุ่มที่ load balancer เลือกให้ ถ้าไม่มี headless Service DNS record รายตัวแบบนี้จะไม่มีทางเกิดขึ้นเลย
 
+## พิสูจน์จริง: `svc`, `svc.ns`, fqdn และ headless per-Pod record
+
+จาก Pod `dnsutils` จริง (`registry.k8s.io/e2e-test-images/jessie-dnsutils:1.7`) ยิงไปที่ Service `web-clusterip` จริง:
+
+```text
+$ nslookup web-clusterip.default.svc.cluster.local
+Server:		10.96.0.10
+Address:	10.96.0.10#53
+
+Name:	web-clusterip.default.svc.cluster.local
+Address: 10.96.196.12
+```
+
+per-Pod A record จาก headless Service จริง `web-headless` (`clusterIP: None`):
+
+```text
+$ nslookup web-headless.default.svc.cluster.local
+Server:		10.96.0.10
+Address:	10.96.0.10#53
+
+Name:	web-headless.default.svc.cluster.local
+Address: 10.244.147.20
+Name:	web-headless.default.svc.cluster.local
+Address: 10.244.138.135
+```
+
+query รูปแบบเดียวกัน แต่คำตอบคนละแบบสิ้นเชิง: Service ปกติคืน ClusterIP เดียว ส่วน headless Service คืน IP จริงของทุก Pod เบื้องหลังตรง ๆ ตรงตามกลไกของบทนี้เป๊ะ
+
+## `ndots:5` กับ `search`: `/etc/resolv.conf` จริง และ lookup ที่เพิ่มขึ้นมา
+
+```text
+$ cat /etc/resolv.conf
+search default.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+options ndots:5
+```
+
+`ndots:5` แปลว่า: ชื่อไหนก็ตามที่มีจุด **น้อยกว่า 5 จุด** จะถูกลอง suffix ทุกตัวใน `search` เรียงตามลำดับก่อน ก่อนที่ resolver จะลองชื่อตามที่พิมพ์มาจริง ๆ `web-clusterip` (0 จุด) เลยทำให้เกิดความพยายาม lookup เพิ่มอีกสามครั้ง (`web-clusterip.default.svc.cluster.local`, `.svc.cluster.local`, `.cluster.local`) ก่อนจะเจอตัวที่ถูกต้อง — มองไม่เห็นใน `nslookup` ที่สำเร็จครั้งเดียว แต่เป็น DNS round-trip เพิ่มจริงในทุก short-name lookup ทั่ว cluster ซึ่งเป็นเหตุผลที่ default นี้มักถูกปรับใน workload ที่ QPS สูง
+
+## `dnsPolicy`/`dnsConfig` แบบกำหนดเอง: `resolv.conf` จริงที่ต่างกัน
+
+```yaml
+# k8s/dns-and-service-discovery/custom-dnsconfig.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: custom-dns-demo
+spec:
+  dnsPolicy: None
+  dnsConfig:
+    nameservers:
+      - 10.96.0.10
+    searches:
+      - default.svc.cluster.local
+      - svc.cluster.local
+      - cluster.local
+    options:
+      - name: ndots
+        value: '2'
+  containers:
+    - name: app
+      image: registry.k8s.io/e2e-test-images/jessie-dnsutils:1.7
+      command: ['sleep', '3600']
+```
+
+```text
+$ kubectl exec custom-dns-demo -- cat /etc/resolv.conf
+search default.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+options ndots:2
+```
+
+`dnsPolicy: None` ยกการควบคุมทั้งหมดให้ `dnsConfig` — `resolv.conf` จริงของ Pod นี้แสดง `ndots:2` แทนค่า default ของ cluster ที่ `5` พิสูจน์ว่า override มีผลจริงตามที่ config ไว้เป๊ะ การลด `ndots` เป็นวิธีปรับแต่งจริงที่พบบ่อยสำหรับ workload ที่คุยกับชื่อภายนอกแบบ fully-qualified เป็นหลัก เพื่อตัดความพยายาม search ภายใน cluster ที่เสียเปล่าตามที่อธิบายด้านบน
+
+## `Corefile` ของ CoreDNS: ConfigMap จริง
+
+```text
+$ kubectl get configmap coredns -n kube-system -o jsonpath='{.data.Corefile}'
+.:53 {
+    errors
+    health {
+       lameduck 5s
+    }
+    ready
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+       pods insecure
+       fallthrough in-addr.arpa ip6.arpa
+       ttl 30
+    }
+    prometheus :9153
+    forward . /etc/resolv.conf {
+       max_concurrent 1000
+    }
+    cache 30 {
+       disable success cluster.local
+       disable denial cluster.local
+    }
+    loop
+    reload
+    loadbalance
+}
+```
+
+นี่คือ plugin chain จริงที่ตอบทุก query ในบทนี้: plugin `kubernetes` serve `cluster.local` (พร้อม `pods insecure` เปิดให้มี DNS name แบบอิง Pod IP กับ TTL 30 วินาที) `forward` ส่งอะไรก็ตามที่อยู่นอก `cluster.local` ขึ้นไปยัง `/etc/resolv.conf` ของ Pod CoreDNS เอง และ `cache 30` จำกัดว่าคำตอบถูก cache นานแค่ไหน
+
+## `ExternalName`: CNAME จริง พิสูจน์แล้ว
+
+```yaml
+# k8s/dns-and-service-discovery/externalname-svc.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-api
+spec:
+  type: ExternalName
+  externalName: kubernetes.io
+```
+
+```text
+$ nslookup external-api.default.svc.cluster.local
+Server:		10.96.0.10
+Address:	10.96.0.10#53
+
+external-api.default.svc.cluster.local	canonical name = kubernetes.io.
+Name:	kubernetes.io
+Address: 15.197.167.90
+Name:	kubernetes.io
+Address: 3.33.186.135
+```
+
+CoreDNS ตอบด้วย `CNAME` จริงไปที่ `kubernetes.io` ซึ่ง resolver ก็ตามไปจน resolve ได้ A record จริงและปัจจุบันของ `kubernetes.io` เอง นี่คือสิ่งที่ `ExternalName` เป็นเป๊ะ ๆ: DNS-level alias เฉย ๆ ไม่มีอะไรมากกว่านั้น ไม่มี Service selector ไม่มี Endpoints/EndpointSlice ไม่มี load balancing — แค่ชื่อชี้ไปหาอีกชื่อหนึ่ง
+
+## อ่านโค้ดที่ AI เขียน
+
+ตอนรีวิว manifest กับโค้ดที่เกี่ยวกับ DNS ที่ AI สร้าง ให้เช็ค
+
+- `ExternalName` ที่ชี้ไปที่ IP address ดิบแทนที่จะเป็น hostname — พิสูจน์ด้านบนแล้วว่า `ExternalName` สร้างแค่ `CNAME` เท่านั้น และ `CNAME` ไปหา IP address ไม่ใช่ DNS ที่ valid IP ที่ตายตัวต้องใช้กลไกอื่น (headless Service กับ `Endpoints`/`EndpointSlice` ที่จัดการเองไม่ใช่ `ExternalName`)
+- โค้ดที่คิดว่า `ndots`/`search` ของทุก Pod ตรงกับ default ของ cluster โดยไม่เช็คว่ามี override `dnsPolicy: None` / `dnsConfig` หรือเปล่า — พิสูจน์ด้านบนแล้วว่า `resolv.conf` จริงของ Pod ต่างจาก norm ของ cluster ได้เลยทั้งหมด
+- retry loop สำหรับ "DNS propagation delay" ที่ copy มาจากความเคยชินของ DNS สาธารณะ — คำตอบของ CoreDNS ถูกสร้างสดจาก state ของ EndpointSlice ทุกครั้งที่ query ไม่มี delay แบบ TTL-based propagation ที่ต้องรอแบบ DNS สาธารณะเลย
+- hardcode `10.96.0.10` เป็น "the" DNS server IP ของ cluster ใน application code แทนที่จะอ่านจาก `/etc/resolv.conf` ของ Pod เอง — เป็นของจริง (พิสูจน์ด้านบน) แต่เฉพาะ cluster นั้น ๆ (ClusterIP ของ Service `kube-dns`) ไม่ใช่ค่าคงที่ universal
+
+<SpotTheBug code={`# k8s/dns-and-service-discovery/pin-to-ip.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: legacy-db
+spec:
+  type: ExternalName
+  externalName: "10.20.30.40"`}>
+`externalName` ถูกตั้งเป็น IP address ดิบ `"10.20.30.40"` พิสูจน์ด้านบนแล้วว่า `ExternalName` ทำงานด้วยการให้ CoreDNS ตอบ record `CNAME` ที่ชี้ไปที่ค่าของ `externalName` — แต่ target ของ `CNAME` ต้องเป็น hostname เสมอ ไม่ใช่ IP address เลย DNS ไม่มีแนวคิด "alias ชื่อนี้ไปที่ IP นั้น" ผ่าน CNAME แล้วแต่เวอร์ชันของ CoreDNS/upstream resolver ก็จะ fail ตอน validate, resolve ไม่ได้เลย หรือพฤติกรรมไม่แน่นอน — ไม่มีอันไหนเลยที่เป็น "pin Service นี้ไปที่ IP ตายตัว" ซึ่งเกือบแน่นอนว่าคือสิ่งที่ผู้เขียนต้องการ ทางแก้: สำหรับ external dependency ที่มี IP ตายตัว ให้สร้าง **headless Service ที่ไม่มี selector** พร้อม `Endpoints`/`EndpointSlice` ที่จัดการเองชี้ไปที่ IP จริง — นั่นคือกลไกที่รองรับจริงสำหรับ "ให้ IP นี้มี DNS name ภายใน cluster ที่เสถียร"
+</SpotTheBug>
+
+## Mental Model
+
+ทุกคำตอบ DNS ใน cluster คือ "ถาม CoreDNS ซึ่งตัวมันเองก็แค่ Deployment ที่ watch Service/EndpointSlice" (พิสูจน์ด้านบนผ่าน `Corefile` จริง) — ไม่มี DNS control plane แยกต่างหากเลย `ndots`/`search` กำหนด *ชื่อไหนที่ client ถามจริง ๆ* (พิสูจน์ด้านบนด้วย `resolv.conf` จริงกับ lookup ที่เพิ่มขึ้นจากชื่อจุดน้อย) `dnsPolicy`/`dnsConfig` กำหนด *Pod ใช้ server กับ search list ไหนเลย* (พิสูจน์ด้านบนด้วยการ override ทั้งคู่) และ headless เทียบกับ Service ปกติกำหนด *CoreDNS ตอบอะไรกลับมา* (IP ของแต่ละ Pod เทียบกับ ClusterIP เดียว ทั้งคู่พิสูจน์ด้านบนด้วย `nslookup` จริง)
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ข้อดี | ต้นทุน |
+|---|---|---|
+| `ndots:5` + search list ของ cluster default | ชื่อสั้นภายใน namespace (`web-clusterip`) ใช้ได้เลย | FQDN ภายนอกที่มีจุดน้อยกว่า 5 เสีย lookup เพิ่มจากการลอง search suffix ของ cluster ก่อน พิสูจน์ด้านบน |
+| `dnsConfig` กำหนดเองที่ ndots ต่ำกว่า | ตัด lookup ภายใน cluster ที่เสียเปล่าสำหรับ workload ที่คุยกับภายนอกเยอะ พิสูจน์ด้านบน | ชื่อสั้นภายใน cluster ตอนนี้ต้องเขียนแบบ fully qualified ไม่งั้นอาจ resolve ไม่ได้ตามที่คาด |
+| Headless Service | DNS เสถียรต่อ Pod จำเป็นสำหรับ StatefulSet peer discovery พิสูจน์ด้านบน | ไม่มี load balancing ที่ชั้น DNS เลย — client ต้องจัดการ A record หลายตัวเอง |
+| `ExternalName` | ชื่อสะอาดภายใน cluster สำหรับ external dependency พิสูจน์ด้านบนด้วย CNAME จริง | แค่ CNAME — ไม่มี health check ไม่มี load balancing ต้องเป็น hostname ที่ resolve ได้จริง ไม่ใช่ IP (พิสูจน์ด้านบน) |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"DNS ต้องใช้เวลา propagate ภายใน cluster เหมือน DNS สาธารณะ"** คำตอบของ CoreDNS ถูกสร้างสดจาก state ของ EndpointSlice (พิสูจน์ด้านบนผ่าน plugin `kubernetes` ใน `Corefile` จริง) ไม่ได้ cache แบบ TTL propagation ของ DNS สาธารณะ
+- **"`ndots` มีผลแค่กับชื่อภายนอก"** พิสูจน์ด้านบนแล้ว — มันเปลี่ยนพฤติกรรม (และต้นทุน) การ lookup ของทุกชื่อ ไม่ว่าใน cluster หรือไม่ ที่มีจุดน้อยกว่าค่า `ndots`
+- **"`ExternalName` ชี้ไปที่ IP address ได้เพื่อ pin Service ไปที่ backend ตายตัว"** พิสูจน์ด้านบนแล้ว — ทำไม่ได้ `ExternalName` สร้างแค่ CNAME ไปหา hostname เท่านั้น การ pin IP ตายตัวต้องใช้ headless Service กับ `Endpoints`/`EndpointSlice` ที่จัดการเองแทน
+
 <Mermaid title="DNS query ของ Pod ที่ CoreDNS resolve ให้ ไปเป็น Service ClusterIP หรือ IP ของแต่ละ Pod สำหรับ headless Service" code={dnsResolutionDiagram} />
 
 export const dnsResolutionDiagram = `flowchart TB
@@ -81,7 +253,7 @@ export const dnsResolutionDiagram = `flowchart TB
   coredns -->|"headless Service"| p2["web-2 IP"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**CoreDNS** คือ DNS server ภายในของ cluster ให้ทุก Service มีชื่อในรูปแบบ `<service>.<namespace>.svc.cluster.local` (มีชื่อสั้นใช้ได้ใน namespace เดียวกัน) ซึ่งปกติ resolve ไปที่ ClusterIP ที่ load balance ของ Service **Headless Service** (`clusterIP: None`) ข้ามการ load balance แล้วคืน IP ของแต่ละ Pod โดยตรง นั่นคือสิ่งที่ **StatefulSet** ใช้เพื่อให้แต่ละ ordinal Pod มี DNS record เสถียรของตัวเองที่ `<pod-name>.<service>.<namespace>.svc.cluster.local`
+**CoreDNS** คือ DNS server ภายในของ cluster (Deployment จริงที่รัน `Corefile` ที่พิสูจน์ด้านบน) ให้ทุก Service มีชื่อในรูปแบบ `<service>.<namespace>.svc.cluster.local` (มีชื่อสั้นใช้ได้ใน namespace เดียวกัน) ซึ่งปกติ resolve ไปที่ ClusterIP ที่ load balance ของ Service **Headless Service** (`clusterIP: None`) ข้ามการ load balance แล้วคืน IP ของแต่ละ Pod โดยตรง (พิสูจน์ด้านบนด้วย `nslookup` จริง) นั่นคือสิ่งที่ **StatefulSet** ใช้เพื่อให้แต่ละ ordinal Pod มี DNS record เสถียรของตัวเอง `resolv.conf` จริงของทุก Pod (พิสูจน์ด้านบน) ตั้ง `ndots:5` กับ search list ของ cluster — override ได้ต่อ Pod ผ่าน `dnsPolicy`/`dnsConfig` (พิสูจน์ด้านบน) — และ **`ExternalName`** เป็นแค่ `CNAME` alias จริง (พิสูจน์ด้านบน) ไม่ใช่ทาง pin IP ตายตัว
 </Callout>
 
 export const quizDnsDiscovery = [
@@ -94,6 +266,7 @@ export const quizDnsDiscovery = [
       'Service ไม่ได้ DNS name อัตโนมัติ',
     ],
     answer: 1,
+    explain: 'พิสูจน์ด้านบนด้วย nslookup จริง: ชื่อเต็มคือ <service-name>.<namespace>.svc.cluster.local ส่วนชื่อสั้นใช้ได้แค่ใน namespace เดียวกันเพราะ search list',
   },
   {
     q: 'ทำไม StatefulSet ถึงต้องใช้ headless Service เพื่อ DNS',
@@ -104,6 +277,7 @@ export const quizDnsDiscovery = [
       'headless Service จำเป็นเพื่อให้ Pod ตัวไหนก็ตามมี DNS name ได้เลย',
     ],
     answer: 1,
+    explain: 'พิสูจน์ด้านบน: DNS query ของ headless Service คืน IP จริงของทุก Pod เบื้องหลังตรง ๆ แทนที่จะเป็น ClusterIP เดียวที่ load balance — ตรงตามที่ StatefulSet peer discovery ต้องการเป๊ะ',
   },
   {
     q: 'CoreDNS มีบทบาทอะไรใน cluster',
@@ -114,6 +288,7 @@ export const quizDnsDiscovery = [
       'ใช้แค่สำหรับ DNS lookup ที่ออกไปอินเทอร์เน็ตภายนอกเท่านั้น',
     ],
     answer: 1,
+    explain: 'พิสูจน์ด้านบนผ่าน Corefile จริง: CoreDNS คือ DNS server ภายใน cluster และ plugin kubernetes ของมันตอบ query ชื่อ Service/Pod แบบสดจาก state ของ cluster',
   },
   {
     q: 'headless Service (clusterIP: None) คืนอะไรตอนถูก query ด้วย DNS',
@@ -124,6 +299,29 @@ export const quizDnsDiscovery = [
       'error เพราะไม่มี ClusterIP ให้คืน',
     ],
     answer: 2,
+    explain: 'พิสูจน์ด้านบนด้วย nslookup จริงที่คืนสอง Address: บรรทัดแยกกัน ตัวละ Pod เบื้องหลัง แทนที่จะเป็น ClusterIP เดียว',
+  },
+  {
+    q: '```text\n$ cat /etc/resolv.conf\nsearch default.svc.cluster.local svc.cluster.local cluster.local\nnameserver 10.96.0.10\noptions ndots:5\n```\nนี่คือ resolv.conf จริงของ Pod การ lookup ชื่อดิบ `web-clusterip` (0 จุด) ตอน ndots:5 มีผลอยู่ จะทำอะไร',
+    options: [
+      'resolve ตรงกับ nameserver 10.96.0.10 โดยไม่มีความพยายามอื่นเลย เพราะ ndots มีผลแค่กับชื่อที่ qualify เต็มแล้ว',
+      'ลอง suffix ทุกตัวใน search list ก่อน (ต่อท้ายชื่อดิบ) เพราะชื่อนี้มีจุดน้อยกว่า ndots ก่อนจะลองชื่อตามที่พิมพ์มาจริง ๆ',
+      'fail ทันทีเพราะ ndots:5 ต้องการอย่างน้อย 5 จุดในทุก query',
+      'ไม่สนใจ search list เลย แล้ว query nameserver 5 ครั้งพร้อมกัน',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ด้านบน: ndots:5 แปลว่าชื่อที่มีจุดน้อยกว่า 5 จะถูกลอง search list ก่อน ต่อ suffix ทีละตัวตามลำดับ — lookup ที่เพิ่มขึ้นมองไม่เห็นใน nslookup ที่สำเร็จครั้งเดียว แต่เกิดขึ้นจริงในทุก short-name query',
+  },
+  {
+    q: '```yaml\napiVersion: v1\nkind: Service\nmetadata:\n  name: legacy-db\nspec:\n  type: ExternalName\n  externalName: "10.20.30.40"\n```\nอะไรผิดกับ Service นี้ ตามที่พิสูจน์ด้านบน',
+    options: [
+      'ไม่มีอะไรผิด ExternalName ใช้ได้ทั้ง hostname หรือ IP address ดิบ',
+      'ExternalName สร้างแค่ record CNAME เท่านั้น และ target ของ CNAME ต้องเป็น hostname — IP address ดิบไม่ใช่ CNAME target ที่ valid',
+      'ExternalName ต้องมี selector ซึ่งหายไปตรงนี้',
+      'Service แบบ ExternalName เป็น cluster-scoped ไม่มี namespace ได้',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ด้านบนด้วย CNAME จริงไปที่ kubernetes.io: ExternalName คือกลไก alias ระดับ DNS (CNAME) เท่านั้น IP ตายตัวต้องใช้ headless Service กับ Endpoints/EndpointSlice ที่จัดการเองแทน',
   },
 ];
 

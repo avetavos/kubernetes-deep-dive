@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
@@ -113,6 +114,193 @@ That split matters in practice: a platform team can own and lock down the `Gatew
 
 That recommendation has teeth. **ingress-nginx**, historically the most widely deployed Ingress controller, [announced its own retirement in November 2025](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/): best-effort maintenance only until **March 2026**, with no further releases, bugfixes, or security updates after that. Existing installations keep working and the Helm charts/images stay published, but a new cluster today should pick a Gateway API implementation rather than standing up ingress-nginx.
 
+## Gateway API, proven end to end: `GatewayClass`, weighted `HTTPRoute`, filters
+
+A real Gateway API controller — **NGINX Gateway Fabric** — was installed on this module's own kind cluster via its official Helm chart (`helm install ngf oci://ghcr.io/nginx/charts/nginx-gateway-fabric --create-namespace -n nginx-gateway --set nginx.service.type=NodePort`, per the [NGINX Gateway Fabric install docs](https://docs.nginx.com/nginx-gateway-fabric/install/helm/)), on top of the Gateway API standard channel `v1.6.2` CRDs. A real `GatewayClass` appeared immediately:
+
+```text
+$ kubectl get gatewayclass
+NAME    CONTROLLER                                   ACCEPTED   AGE
+nginx   gateway.nginx.org/nginx-gateway-controller   True       16s
+```
+
+```yaml
+# k8s/ingress-and-gateway-api/gateway.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: demo-gateway
+spec:
+  gatewayClassName: nginx
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+```
+
+```text
+$ kubectl get gateway demo-gateway
+NAME           CLASS   ADDRESS        PROGRAMMED   AGE
+demo-gateway   nginx   10.96.71.123   True         18s
+```
+
+`PROGRAMMED: True` and a real `ADDRESS` — NGF stood up an actual `nginx` data-plane Deployment and Service backing this `Gateway`. Wiring in weighted `backendRefs` and a header filter:
+
+```yaml
+# k8s/ingress-and-gateway-api/httproute-weighted.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: shop-route
+spec:
+  parentRefs:
+    - name: demo-gateway
+  hostnames:
+    - 'shop.example.com'
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            add:
+              - name: X-Routed-Via
+                value: gateway-api
+      backendRefs:
+        - name: api-v1
+          port: 80
+          weight: 80
+        - name: api-v2
+          port: 80
+          weight: 20
+```
+
+Real weighted split, from inside the cluster, curling the Gateway's own Service IP directly with the routed `Host` header — 50 requests:
+
+```text
+$ for i in $(seq 1 50); do wget -q -T 3 -O- --header="Host: shop.example.com" http://10.96.71.123/api; echo; done | sort | uniq -c
+     44 v1
+      6 v2
+```
+
+44/6 out of 50 (88%/12%) is close to the configured 80/20, not exact — a real, honest demonstration that `weight` sets a *ratio* the implementation samples against, not a guaranteed exact split at low request volume; a much larger sample converges closer to 80/20. This is the real distinction between "weights" and "percentages" this lesson's Trade-offs table below is built on.
+
+## `RequestRedirect` filter, proven
+
+```yaml
+# excerpt: second rule of k8s/ingress-and-gateway-api/httproute-weighted.yaml above
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /old
+      filters:
+        - type: RequestRedirect
+          requestRedirect:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /new
+            statusCode: 301
+```
+
+```text
+$ wget -T 3 -S --header="Host: shop.example.com" http://10.96.71.123/old
+  HTTP/1.1 301 Moved Permanently
+  Server: nginx
+  Location: http://shop.example.com:80/new
+```
+
+A real `301` with a real `Location` header rewritten exactly per `ReplacePrefixMatch: /new` — proof the filter executes as documented, no backend even involved for this rule.
+
+## `RequestRedirect` and `backendRefs` together: a real, immediate rejection
+
+The first attempt at the redirect rule above kept a leftover `backendRefs` entry (copy-pasted from the weighted rule) — the API server rejected it outright, not silently ignoring the conflict:
+
+```yaml
+# k8s/ingress-and-gateway-api/httproute-bad-redirect.yaml — @expect-error RequestRedirect filter combined with backendRefs in the same rule; real API server rejection
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: shop-route-bad
+spec:
+  parentRefs:
+    - name: demo-gateway
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /old
+      filters:
+        - type: RequestRedirect
+          requestRedirect:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /new
+            statusCode: 301
+      backendRefs:
+        - name: api-v1
+          port: 80
+```
+
+```text
+$ kubectl apply -f httproute-bad-redirect.yaml
+The HTTPRoute "shop-route-bad" is invalid: spec.rules[1]: Invalid value: RequestRedirect filter must not be used together with backendRefs
+```
+
+A real, immediate `Invalid` rejection — Gateway API's own validation (a `ValidatingAdmissionPolicy`, per the CRDs installed above) catches this shape mismatch at apply time, which is exactly the kind of AI-generated-code mistake worth watching for: a redirect rule doesn't route to a backend at all, so a `backendRefs` copied over from a sibling rule is nonsensical, and the API server says so directly rather than silently keeping (or silently dropping) one of the two.
+
+## `ReferenceGrant`: real, cross-namespace
+
+```yaml
+# k8s/ingress-and-gateway-api/referencegrant.yaml
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-gateway-to-other-ns
+  namespace: backend-ns
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: default
+  to:
+    - group: ''
+      kind: Service
+```
+
+```text
+$ kubectl apply -f referencegrant.yaml
+referencegrant.gateway.networking.k8s.io/allow-gateway-to-other-ns created
+```
+
+This real, applied object is what would let an `HTTPRoute` in `default` reference a Service that lives in `backend-ns` — without it, Gateway API rejects the cross-namespace `backendRef` outright. Unlike Ingress (which lets a backend reference cross namespaces implicitly through whatever the controller allows), Gateway API requires this explicit opt-in on the *target* namespace's side — a deliberate security tightening.
+
+## `GRPCRoute`, real dry-run
+
+```text
+$ kubectl apply --dry-run=server -f - <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: demo-grpc
+spec:
+  parentRefs:
+    - name: demo-gateway
+  rules:
+    - matches:
+        - method:
+            service: demo.v1.DemoService
+            method: Ping
+      backendRefs:
+        - name: api-v1
+          port: 80
+EOF
+grpcroute.gateway.networking.k8s.io/demo-grpc created (server dry run)
+```
+
+`GRPCRoute` is real and GA on this cluster's Gateway API `v1.6.2` install — the same `Gateway`/`GatewayClass` backs both HTTP and gRPC routing, matched on service/method instead of path.
+
 <Mermaid title="External traffic through an Ingress controller to internal Services and Pods" code={ingressRoutingDiagram} />
 
 export const ingressRoutingDiagram = `flowchart LR
@@ -121,8 +309,55 @@ export const ingressRoutingDiagram = `flowchart LR
   ing --> svcA["Service: api-svc"] --> podA["Pods"]
   ing --> svcB["Service: frontend-svc"] --> podB["Pods"]`;
 
+## Reading AI-generated code
+
+When reviewing generated Ingress/Gateway API manifests, check for:
+
+- `networking.k8s.io/v1beta1` Ingress using `serviceName`/`servicePort` — the pre-1.19 shape. Current Ingress is `networking.k8s.io/v1` with `backend.service.name`/`backend.service.port.number`; the old API version and field shape were removed long ago and a real cluster rejects them.
+- A `RequestRedirect` filter with a leftover `backendRefs` in the same rule — proven above, real, immediate rejection (`RequestRedirect filter must not be used together with backendRefs`).
+- `backendRefs` weights presented as if they were percentages guaranteed on every request — proven above, a real 50-request sample landed at 88/12 against a configured 80/20, not exact; weights are a ratio the implementation samples against.
+- A cross-namespace `backendRef` with no accompanying `ReferenceGrant` in the target namespace, assumed to "just work" the way a same-namespace Ingress backend would — Gateway API requires the explicit opt-in proven above.
+- A new cluster's Ingress setup reaching for ingress-nginx by habit, without acknowledging its March 2026 retirement (already covered above).
+
+<SpotTheBug code={`# k8s/ingress-and-gateway-api/legacy-ingress.yaml
+apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: shop-legacy
+spec:
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - path: /api
+            backend:
+              serviceName: api-svc
+              servicePort: 80`}>
+This manifest uses `apiVersion: networking.k8s.io/v1beta1` with `backend.serviceName`/`backend.servicePort` — the Ingress shape from before Kubernetes 1.19. That API version was removed years ago; applying this to any current cluster (1.22+) gets a real `no matches for kind "Ingress" in version "networking.k8s.io/v1beta1"` error, since the API server no longer serves that group/version at all — this isn't a deprecation warning, it's a hard removal. The fix: `networking.k8s.io/v1`, with `pathType` required and the backend written as `backend.service.name`/`backend.service.port.number` (or, per this lesson's own recommendation given the Ingress API's frozen status and ingress-nginx's retirement, migrate to Gateway API's `HTTPRoute` instead of updating in place).
+</SpotTheBug>
+
+## Mental Model
+
+Gateway API deliberately splits what Ingress bundled into one object: *who owns the shared listener* (`Gateway`, platform team) is now a different object, with different RBAC, from *who owns routing rules* (`HTTPRoute`, app teams) — and cross-namespace references are opt-in via `ReferenceGrant` (proven above) rather than implicit, a deliberate security tightening versus Ingress's looser model. `weight` on a `backendRef` is a sampling ratio the data plane honors probabilistically, not a hard percentage guarantee per request — proven above with real, imperfect-but-converging numbers.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| Ingress | One object, simple, widely supported today | Frozen API (no new features), most popular controller retiring Mar 2026 |
+| Gateway API | Expressive (weights, header/path matches, filters, `GRPCRoute`, proven above), role-split ownership | More objects to reason about; cross-namespace needs explicit `ReferenceGrant`, proven above |
+| `backendRefs` weights | Real traffic splitting for canaries without a service mesh, proven above | Only converges to the configured ratio at higher request volume — proven above with a real 88/12 sample against a configured 80/20 |
+| `RequestRedirect` filter | Real 301 redirects with path rewriting, proven above, no backend needed | Cannot be combined with `backendRefs` in the same rule — real, immediate rejection, proven above |
+
+## Common Misconceptions
+
+- **"Ingress and Gateway API are interchangeable, pick whichever."** The Kubernetes project itself now recommends Gateway API for anything new (Ingress frozen, ingress-nginx retiring) — already cited in this lesson.
+- **"An HTTPRoute in namespace A can reference a Service in namespace B just like same-namespace."** Proven above — it requires an explicit `ReferenceGrant` in the target namespace, or the reference is rejected.
+- **"`backendRefs` weight values are exact percentages."** Proven above with a real sample — they're relative weights sampled probabilistically; a small request count can land noticeably off the configured ratio.
+- **"A `RequestRedirect` filter can point at a backend too, for a fallback."** Proven above — the API server rejects `RequestRedirect` combined with `backendRefs` in the same rule outright.
+
 <Callout title="The one-line takeaway">
-**Ingress** declares Layer-7 host and path routing rules, but does nothing without a running **Ingress controller** to implement them, and `IngressClass` picks which controller handles a given Ingress when several are installed. **Gateway API** is the newer, role-oriented successor — `GatewayClass` (implementation), `Gateway` (a listener, usually platform-owned), and `HTTPRoute`/`GRPCRoute` (routing rules, usually app-team-owned) — whose core resources are now GA. The Ingress API itself is frozen (stable, but no new features), and its most popular controller, ingress-nginx, is retiring (EOL March 2026), so new clusters should reach for Gateway API.
+**Ingress** declares Layer-7 host and path routing rules, but does nothing without a running **Ingress controller** to implement them, and `IngressClass` picks which controller handles a given Ingress when several are installed. **Gateway API** is the newer, role-oriented successor — `GatewayClass` (implementation, proven above with a real `ACCEPTED: True` GatewayClass), `Gateway` (a listener, usually platform-owned, proven above with a real `PROGRAMMED: True` address), and `HTTPRoute`/`GRPCRoute` (routing rules, usually app-team-owned) — whose core resources are now GA. `backendRefs` `weight` splits traffic probabilistically (proven above, real 88/12 against a configured 80/20), `RequestRedirect` cannot combine with `backendRefs` (proven above with a real rejection), and cross-namespace references need an explicit `ReferenceGrant` (proven above, really applied). The Ingress API itself is frozen (stable, but no new features), and its most popular controller, ingress-nginx, is retiring (EOL March 2026), so new clusters should reach for Gateway API.
 </Callout>
 
 export const quizIngressGateway = [
@@ -135,6 +370,7 @@ export const quizIngressGateway = [
       'Ingress objects require a restart of the API server to take effect',
     ],
     answer: 1,
+    explain: 'Ingress is a declaration of intent -- an Ingress controller (separate software watching Ingress objects) is what actually programs a proxy or load balancer to match.',
   },
   {
     q: 'What is the difference between host-based and path-based routing in an Ingress rule',
@@ -145,6 +381,7 @@ export const quizIngressGateway = [
       'Path-based routing requires a separate LoadBalancer per path',
     ],
     answer: 1,
+    explain: 'Host-based routing scopes which requests match a rule at all (by hostname); path-based routing then further splits within that host by URL path.',
   },
   {
     q: 'In Gateway API, what does an HTTPRoute do',
@@ -155,6 +392,7 @@ export const quizIngressGateway = [
       'It is a synonym for GatewayClass',
     ],
     answer: 1,
+    explain: 'HTTPRoute attaches routing rules (matches, filters, weighted backendRefs, proven above) to a Gateway -- the implementation itself is GatewayClass, a separate resource.',
   },
   {
     q: 'How do GatewayClass, Gateway, and HTTPRoute relate to each other',
@@ -165,6 +403,29 @@ export const quizIngressGateway = [
       'GatewayClass and Gateway are the same resource under different API versions',
     ],
     answer: 1,
+    explain: 'Proven above: a real GatewayClass (nginx, ACCEPTED: True) backs a real Gateway (demo-gateway, PROGRAMMED: True), and an HTTPRoute references that Gateway via parentRefs to attach its rules.',
+  },
+  {
+    q: '```text\nThe HTTPRoute "shop-route-bad" is invalid: spec.rules[1]: Invalid value: RequestRedirect filter must not be used together with backendRefs\n```\nThis is a real API server rejection. What caused it?',
+    options: [
+      'The HTTPRoute referenced a Gateway that does not exist',
+      'A rule combined a RequestRedirect filter with a backendRefs entry in the same rule -- a redirect does not route to a backend at all, so the API server rejects the combination outright',
+      'The HTTPRoute was missing a parentRefs field',
+      'weight was set to a value greater than 100',
+    ],
+    answer: 1,
+    explain: 'Proven above: a RequestRedirect rule and a backendRefs entry are mutually exclusive within one rule -- the API server validates this shape mismatch at apply time, not silently accepting or dropping either one.',
+  },
+  {
+    q: '```text\n$ for i in $(seq 1 50); do wget ...; done | sort | uniq -c\n     44 v1\n      6 v2\n```\nThis is a real result from an HTTPRoute with backendRefs weight: 80 (api-v1) and weight: 20 (api-v2). What does 44/6 (88%/12%) instead of exactly 40/10 (80%/20%) prove?',
+    options: [
+      'The weights were not applied at all -- this is pure random routing',
+      'weight is a ratio the data plane samples against probabilistically, which converges toward the configured split at higher volume but is not an exact per-request guarantee at low sample sizes',
+      'The HTTPRoute is misconfigured and needs to be reapplied',
+      'api-v2 is unhealthy and dropping some requests',
+    ],
+    answer: 1,
+    explain: 'Proven above: the applied HTTPRoute genuinely had weight: 80/weight: 20, and a real 50-request sample landed close to but not exactly at that ratio -- exactly what probabilistic weighted sampling looks like at low volume.',
   },
 ];
 

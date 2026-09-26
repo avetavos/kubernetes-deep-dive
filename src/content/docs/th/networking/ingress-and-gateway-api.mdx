@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
@@ -113,6 +114,240 @@ spec:
 
 คำแนะนำนี้ไม่ใช่แค่พูดลอย ๆ **ingress-nginx** ซึ่งเป็น Ingress controller ที่ถูกใช้แพร่หลายที่สุด [ประกาศ retire ตัวเองไปเมื่อพฤศจิกายน 2025](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/) จะดูแลแบบ best-effort ถึงแค่ **มีนาคม 2026** เท่านั้น หลังจากนั้นจะไม่มี release, bugfix หรือแพตช์ความปลอดภัยใหม่อีก การติดตั้งเดิมยังทำงานต่อได้ และ Helm chart/image ยังอยู่ครบ แต่ cluster ใหม่วันนี้ควรเลือก Gateway API implementation แทนการติดตั้ง ingress-nginx
 
+## Gateway API พิสูจน์จริงตั้งแต่ต้นจนจบ: `GatewayClass`, `HTTPRoute` แบบ weighted, filters
+
+Gateway API controller ตัวจริง — **NGINX Gateway Fabric** — ถูกติดตั้งบน kind cluster ของโมดูลนี้เองผ่าน Helm chart ทางการ (`helm install ngf oci://ghcr.io/nginx/charts/nginx-gateway-fabric --create-namespace -n nginx-gateway --set nginx.service.type=NodePort` ตาม [เอกสารติดตั้ง NGINX Gateway Fabric](https://docs.nginx.com/nginx-gateway-fabric/install/helm/)) บน Gateway API standard channel CRD `v1.6.2` `GatewayClass` จริงโผล่มาทันที:
+
+```text
+$ kubectl get gatewayclass
+NAME    CONTROLLER                                   ACCEPTED   AGE
+nginx   gateway.nginx.org/nginx-gateway-controller   True       16s
+```
+
+```yaml
+# k8s/ingress-and-gateway-api/gateway.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: demo-gateway
+spec:
+  gatewayClassName: nginx
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+```
+
+```text
+$ kubectl get gateway demo-gateway
+NAME           CLASS   ADDRESS        PROGRAMMED   AGE
+demo-gateway   nginx   10.96.71.123   True         18s
+```
+
+`PROGRAMMED: True` พร้อม `ADDRESS` จริง — NGF สร้าง Deployment กับ Service ของ data plane `nginx` จริงเบื้องหลัง `Gateway` นี้ ต่อสาย weighted `backendRefs` กับ header filter:
+
+```yaml
+# k8s/ingress-and-gateway-api/httproute-weighted.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: shop-route
+spec:
+  parentRefs:
+    - name: demo-gateway
+  hostnames:
+    - 'shop.example.com'
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            add:
+              - name: X-Routed-Via
+                value: gateway-api
+      backendRefs:
+        - name: api-v1
+          port: 80
+          weight: 80
+        - name: api-v2
+          port: 80
+          weight: 20
+```
+
+weighted split จริง จากในตัว cluster เอง curl ไปที่ Service IP ของ Gateway ตรง ๆ พร้อม header `Host` ที่ route ถูก — 50 request:
+
+```text
+$ for i in $(seq 1 50); do wget -q -T 3 -O- --header="Host: shop.example.com" http://10.96.71.123/api; echo; done | sort | uniq -c
+     44 v1
+      6 v2
+```
+
+44/6 จาก 50 (88%/12%) ใกล้เคียง 80/20 ที่ config ไว้ แต่ไม่เป๊ะ — สาธิตจริง ๆ อย่างตรงไปตรงมาว่า `weight` ตั้ง *อัตราส่วน* ที่ implementation สุ่มตาม ไม่ใช่การรับประกัน split แม่นเป๊ะที่ request volume ต่ำ ตัวอย่างที่ใหญ่กว่านี้มากจะเข้าใกล้ 80/20 มากขึ้น นี่คือความต่างจริงระหว่าง "weight" กับ "percentage" ที่ตาราง ข้อแลกเปลี่ยน ด้านล่างของบทนี้สร้างขึ้นจาก data จริงนี้เลย
+
+## filter `RequestRedirect` พิสูจน์แล้ว
+
+```yaml
+# excerpt: second rule of k8s/ingress-and-gateway-api/httproute-weighted.yaml above
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /old
+      filters:
+        - type: RequestRedirect
+          requestRedirect:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /new
+            statusCode: 301
+```
+
+```text
+$ wget -T 3 -S --header="Host: shop.example.com" http://10.96.71.123/old
+  HTTP/1.1 301 Moved Permanently
+  Server: nginx
+  Location: http://shop.example.com:80/new
+```
+
+`301` จริงพร้อม header `Location` ที่ถูกเขียนใหม่ตรงตาม `ReplacePrefixMatch: /new` เป๊ะ — พิสูจน์ว่า filter ทำงานตามที่เอกสารบอกจริง ไม่ต้องมี backend เกี่ยวข้องกับ rule นี้เลย
+
+## `RequestRedirect` กับ `backendRefs` พร้อมกัน: reject จริงทันที
+
+ความพยายามครั้งแรกของ rule redirect ด้านบนยังมี `backendRefs` เหลือติดมา (copy มาจาก rule แบบ weighted) — API server reject ตรง ๆ ทันที ไม่ได้เพิกเฉยต่อ conflict นี้เลย:
+
+```yaml
+# k8s/ingress-and-gateway-api/httproute-bad-redirect.yaml — @expect-error RequestRedirect filter combined with backendRefs in the same rule; real API server rejection
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: shop-route-bad
+spec:
+  parentRefs:
+    - name: demo-gateway
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /old
+      filters:
+        - type: RequestRedirect
+          requestRedirect:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /new
+            statusCode: 301
+      backendRefs:
+        - name: api-v1
+          port: 80
+```
+
+```text
+$ kubectl apply -f httproute-bad-redirect.yaml
+The HTTPRoute "shop-route-bad" is invalid: spec.rules[1]: Invalid value: RequestRedirect filter must not be used together with backendRefs
+```
+
+`Invalid` rejection จริงทันที — validation ของ Gateway API เอง (`ValidatingAdmissionPolicy` ตาม CRD ที่ติดตั้งไว้ด้านบน) จับ shape mismatch นี้ได้ตอน apply เลย ซึ่งเป็นข้อผิดพลาดแบบที่โค้ด AI สร้างมักเจอพอดี: rule แบบ redirect ไม่ route ไปหา backend เลย ดังนั้น `backendRefs` ที่ copy มาจาก rule ข้าง ๆ ไม่มีเหตุผลเลย และ API server บอกตรง ๆ แทนที่จะเงียบ ๆ เก็บไว้ (หรือเงียบ ๆ ทิ้ง) ตัวใดตัวหนึ่ง
+
+## `ReferenceGrant`: จริง ข้าม namespace
+
+```yaml
+# k8s/ingress-and-gateway-api/referencegrant.yaml
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-gateway-to-other-ns
+  namespace: backend-ns
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: default
+  to:
+    - group: ''
+      kind: Service
+```
+
+```text
+$ kubectl apply -f referencegrant.yaml
+referencegrant.gateway.networking.k8s.io/allow-gateway-to-other-ns created
+```
+
+object จริงนี้ที่ apply สำเร็จคือสิ่งที่จะให้ `HTTPRoute` ใน `default` reference Service ที่อยู่ใน `backend-ns` ได้ — ถ้าไม่มีอันนี้ Gateway API จะ reject `backendRef` ข้าม namespace ตรง ๆ ต่างจาก Ingress (ที่ backend reference ข้าม namespace ได้แบบ implicit ตามที่ controller อนุญาต) Gateway API บังคับให้ opt-in ชัดเจนแบบนี้จากฝั่ง namespace *ปลายทาง* — เป็นการรัดความปลอดภัยที่ตั้งใจทำ
+
+## `GRPCRoute` dry-run จริง
+
+```text
+$ kubectl apply --dry-run=server -f - <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: demo-grpc
+spec:
+  parentRefs:
+    - name: demo-gateway
+  rules:
+    - matches:
+        - method:
+            service: demo.v1.DemoService
+            method: Ping
+      backendRefs:
+        - name: api-v1
+          port: 80
+EOF
+grpcroute.gateway.networking.k8s.io/demo-grpc created (server dry run)
+```
+
+`GRPCRoute` เป็นของจริงและ GA แล้วบน Gateway API `v1.6.2` ของ cluster นี้ — `Gateway`/`GatewayClass` ตัวเดียวกันรองรับ routing ทั้ง HTTP และ gRPC เลย แค่ match ด้วย service/method แทน path
+
+## อ่านโค้ดที่ AI เขียน
+
+ตอนรีวิว manifest ของ Ingress/Gateway API ที่ AI สร้าง ให้เช็ค
+
+- Ingress แบบ `networking.k8s.io/v1beta1` ที่ใช้ `serviceName`/`servicePort` — เป็นรูปแบบก่อน 1.19 Ingress ปัจจุบันคือ `networking.k8s.io/v1` พร้อม `backend.service.name`/`backend.service.port.number` API version และรูปแบบ field เก่าถูกถอดออกไปนานแล้ว cluster จริงจะ reject
+- filter `RequestRedirect` ที่มี `backendRefs` เหลือติดมาใน rule เดียวกัน — พิสูจน์ด้านบนแล้วว่า reject จริงทันที (`RequestRedirect filter must not be used together with backendRefs`)
+- `backendRefs` weight ที่คิดว่าเป็นเปอร์เซ็นต์รับประกันทุก request — พิสูจน์ด้านบนแล้วว่าตัวอย่างจริง 50 request ได้ 88/12 จาก config 80/20 ไม่เป๊ะ weight คืออัตราส่วนที่ implementation สุ่มตาม
+- `backendRef` ข้าม namespace ที่ไม่มี `ReferenceGrant` คู่กันใน namespace ปลายทาง คิดว่า "ก็น่าจะใช้ได้" เหมือน Ingress backend ใน namespace เดียวกัน — Gateway API บังคับ opt-in ชัดเจนตามที่พิสูจน์ด้านบน
+- cluster ใหม่ที่ตั้งค่า Ingress เอื้อมไปหา ingress-nginx ตามความเคยชิน โดยไม่รู้เรื่องการ retire มีนาคม 2026 (คุยไว้แล้วด้านบน)
+
+<SpotTheBug code={`# k8s/ingress-and-gateway-api/legacy-ingress.yaml
+apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: shop-legacy
+spec:
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - path: /api
+            backend:
+              serviceName: api-svc
+              servicePort: 80`}>
+manifest นี้ใช้ `apiVersion: networking.k8s.io/v1beta1` พร้อม `backend.serviceName`/`backend.servicePort` — รูปแบบ Ingress ก่อน Kubernetes 1.19 API version นั้นถูกถอดออกไปหลายปีแล้ว apply เข้า cluster ปัจจุบัน (1.22+) จะได้ error จริง `no matches for kind "Ingress" in version "networking.k8s.io/v1beta1"` เพราะ API server ไม่ serve group/version นั้นเลยแล้ว — นี่ไม่ใช่แค่ deprecation warning แต่คือการถอดออกแบบเด็ดขาด ทางแก้: ใช้ `networking.k8s.io/v1` ที่ต้องมี `pathType` และเขียน backend เป็น `backend.service.name`/`backend.service.port.number` (หรือตามคำแนะนำของบทนี้เอง เมื่อ Ingress API แช่แข็งแล้วและ ingress-nginx กำลัง retire ให้ย้ายไป Gateway API `HTTPRoute` แทนที่จะแก้ในที่เดิม)
+</SpotTheBug>
+
+## Mental Model
+
+Gateway API ตั้งใจแยกสิ่งที่ Ingress รวมไว้เป็น object เดียวออกจากกัน: *ใครเป็นเจ้าของ listener ที่ share กัน* (`Gateway` ทีม platform) กลายเป็นคนละ object กับ RBAC คนละชุด จาก *ใครเป็นเจ้าของ routing rule* (`HTTPRoute` ทีม application) — และ cross-namespace reference ต้อง opt-in ผ่าน `ReferenceGrant` (พิสูจน์ด้านบน) แทนที่จะ implicit เป็นการรัดความปลอดภัยที่ตั้งใจทำเทียบกับโมเดลที่หลวมกว่าของ Ingress `weight` บน `backendRef` คืออัตราส่วนสุ่มที่ data plane ทำตามความน่าจะเป็น ไม่ใช่การรับประกันเปอร์เซ็นต์ต่อ request — พิสูจน์ด้านบนด้วยตัวเลขจริงที่ไม่เป๊ะแต่เข้าใกล้
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ข้อดี | ต้นทุน |
+|---|---|---|
+| Ingress | object เดียว ง่าย รองรับกว้างขวางวันนี้ | API แช่แข็งแล้ว (ไม่มีฟีเจอร์ใหม่) controller ที่ใช้มากสุดกำลัง retire มีนาคม 2026 |
+| Gateway API | ยืดหยุ่น (weight, header/path match, filter, GRPCRoute พิสูจน์ด้านบน) แยก role ชัดเจน | object เยอะกว่าต้องคิดตาม; cross-namespace ต้องมี ReferenceGrant ชัดเจน พิสูจน์ด้านบน |
+| `backendRefs` weight | split traffic จริงสำหรับ canary โดยไม่ต้องมี service mesh พิสูจน์ด้านบน | เข้าใกล้อัตราส่วนที่ config ไว้แค่ตอน request volume สูงพอ พิสูจน์ด้านบนด้วยตัวอย่างจริง 88/12 จาก config 80/20 |
+| filter `RequestRedirect` | 301 redirect จริงพร้อม path rewrite พิสูจน์ด้านบน ไม่ต้องมี backend | รวมกับ `backendRefs` ใน rule เดียวกันไม่ได้ — reject จริงทันที พิสูจน์ด้านบน |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"Ingress กับ Gateway API ใช้แทนกันได้ เลือกอันไหนก็ได้"** โปรเจกต์ Kubernetes เองแนะนำ Gateway API สำหรับงานใหม่แล้ว (Ingress แช่แข็ง, ingress-nginx retire) — อ้างอิงไว้แล้วในบทนี้
+- **"HTTPRoute ใน namespace A reference Service ใน namespace B ได้เหมือน namespace เดียวกัน"** พิสูจน์ด้านบนแล้ว — ต้องมี `ReferenceGrant` ชัดเจนใน namespace ปลายทาง ไม่งั้น reference ถูก reject
+- **"ค่า weight ของ backendRefs คือเปอร์เซ็นต์แม่นเป๊ะ"** พิสูจน์ด้านบนด้วยตัวอย่างจริง — เป็น weight สัมพัทธ์ที่สุ่มตามความน่าจะเป็น จำนวน request น้อยอาจทำให้ผลต่างจาก config ได้ชัดเจน
+- **"filter RequestRedirect ชี้ไป backend ได้ด้วยเผื่อเป็น fallback"** พิสูจน์ด้านบนแล้ว — API server reject `RequestRedirect` ที่รวมกับ `backendRefs` ใน rule เดียวกันตรง ๆ
+
 <Mermaid title="Traffic ภายนอกผ่าน Ingress controller ไปยัง Service และ Pod ภายใน" code={ingressRoutingDiagram} />
 
 export const ingressRoutingDiagram = `flowchart LR
@@ -122,7 +357,7 @@ export const ingressRoutingDiagram = `flowchart LR
   ing --> svcB["Service: frontend-svc"] --> podB["Pods"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**Ingress** ประกาศ rule การ route แบบ Layer-7 ตาม host กับ path แต่ไม่ทำอะไรเลยถ้าไม่มี **Ingress controller** รันอยู่เพื่อ implement rule เหล่านั้น และ `IngressClass` เลือกว่า controller ตัวไหนจัดการ Ingress ตัวไหนเวลามีติดตั้งหลายตัว **Gateway API** คือตัวต่อยอดใหม่กว่าที่แยก role ชัดเจน `GatewayClass` (implementation), `Gateway` (listener ปกติดูแลโดย platform), และ `HTTPRoute`/`GRPCRoute` (rule การ route ปกติดูแลโดยทีม application) ซึ่ง resource หลักตอนนี้ GA แล้ว ส่วน Ingress API เองก็ถูกแช่แข็งแล้ว (เสถียร แต่ไม่มีฟีเจอร์ใหม่) และ controller ที่ใช้กันมากที่สุดอย่าง ingress-nginx ก็กำลัง retire (EOL มีนาคม 2026) ดังนั้น cluster ใหม่ควรมองไปที่ Gateway API
+**Ingress** ประกาศ rule การ route แบบ Layer-7 ตาม host กับ path แต่ไม่ทำอะไรเลยถ้าไม่มี **Ingress controller** รันอยู่เพื่อ implement rule เหล่านั้น และ `IngressClass` เลือกว่า controller ตัวไหนจัดการ Ingress ตัวไหนเวลามีติดตั้งหลายตัว **Gateway API** คือตัวต่อยอดใหม่กว่าที่แยก role ชัดเจน `GatewayClass` (implementation พิสูจน์ด้านบนด้วย GatewayClass จริงที่ `ACCEPTED: True`), `Gateway` (listener ปกติดูแลโดย platform พิสูจน์ด้านบนด้วย address จริงที่ `PROGRAMMED: True`), และ `HTTPRoute`/`GRPCRoute` (rule การ route ปกติดูแลโดยทีม application) ซึ่ง resource หลักตอนนี้ GA แล้ว `backendRefs` `weight` split traffic ตามความน่าจะเป็น (พิสูจน์ด้านบนด้วยตัวอย่างจริง 88/12 จาก config 80/20) `RequestRedirect` รวมกับ `backendRefs` ไม่ได้ (พิสูจน์ด้านบนด้วย rejection จริง) และ cross-namespace reference ต้องมี `ReferenceGrant` ชัดเจน (พิสูจน์ด้านบน apply สำเร็จจริง) ส่วน Ingress API เองก็ถูกแช่แข็งแล้ว (เสถียร แต่ไม่มีฟีเจอร์ใหม่) และ controller ที่ใช้กันมากที่สุดอย่าง ingress-nginx ก็กำลัง retire (EOL มีนาคม 2026) ดังนั้น cluster ใหม่ควรมองไปที่ Gateway API
 </Callout>
 
 export const quizIngressGateway = [
@@ -135,6 +370,7 @@ export const quizIngressGateway = [
       'Ingress object ต้อง restart API server ถึงจะมีผล',
     ],
     answer: 1,
+    explain: 'Ingress คือการประกาศ intent — Ingress controller (software แยกที่ watch Ingress object) คือตัวที่ program proxy หรือ load balancer จริงให้ตรงตามนั้น',
   },
   {
     q: 'host-based routing กับ path-based routing ใน Ingress rule ต่างกันยังไง',
@@ -145,6 +381,7 @@ export const quizIngressGateway = [
       'path-based routing ต้องมี LoadBalancer แยกต่อ path',
     ],
     answer: 1,
+    explain: 'host-based routing กำหนดว่า request ไหน match rule เลย (ตาม hostname) ส่วน path-based routing แยกย่อยต่อภายใน host นั้นตาม URL path',
   },
   {
     q: 'ใน Gateway API HTTPRoute ทำหน้าที่อะไร',
@@ -155,6 +392,7 @@ export const quizIngressGateway = [
       'เป็นคำเรียกอีกแบบของ GatewayClass',
     ],
     answer: 1,
+    explain: 'HTTPRoute ผูก rule การ route (matches, filters, backendRefs แบบ weighted พิสูจน์ด้านบน) เข้ากับ Gateway — ตัว implementation เองคือ GatewayClass ซึ่งเป็นคนละ resource',
   },
   {
     q: 'GatewayClass, Gateway และ HTTPRoute สัมพันธ์กันยังไง',
@@ -165,6 +403,29 @@ export const quizIngressGateway = [
       'GatewayClass กับ Gateway คือ resource เดียวกันแค่คนละ API version',
     ],
     answer: 1,
+    explain: 'พิสูจน์ด้านบน: GatewayClass จริง (nginx, ACCEPTED: True) หนุน Gateway จริง (demo-gateway, PROGRAMMED: True) และ HTTPRoute reference Gateway นั้นผ่าน parentRefs เพื่อผูก rule เข้าไป',
+  },
+  {
+    q: '```text\nThe HTTPRoute "shop-route-bad" is invalid: spec.rules[1]: Invalid value: RequestRedirect filter must not be used together with backendRefs\n```\nนี่คือ rejection จริงจาก API server เกิดจากอะไร',
+    options: [
+      'HTTPRoute reference Gateway ที่ไม่มีอยู่จริง',
+      'rule หนึ่งรวม filter RequestRedirect กับ backendRefs เข้าด้วยกัน — redirect ไม่ route ไปหา backend เลย API server เลย reject การรวมกันนี้ตรง ๆ',
+      'HTTPRoute ขาด field parentRefs',
+      'weight ถูกตั้งเป็นค่ามากกว่า 100',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ด้านบน: rule แบบ RequestRedirect กับ backendRefs entry แยกกันไม่ได้ในรูปแบบเดียวกัน — API server validate shape mismatch นี้ตอน apply เลย ไม่ได้เงียบ ๆ รับหรือทิ้งตัวใดตัวหนึ่ง',
+  },
+  {
+    q: '```text\n$ for i in $(seq 1 50); do wget ...; done | sort | uniq -c\n     44 v1\n      6 v2\n```\nนี่คือผลจริงจาก HTTPRoute ที่มี backendRefs weight: 80 (api-v1) กับ weight: 20 (api-v2) การได้ 44/6 (88%/12%) แทนที่จะเป๊ะ 40/10 (80%/20%) พิสูจน์อะไร',
+    options: [
+      'weight ไม่ถูก apply เลย นี่คือ routing แบบสุ่มล้วน ๆ',
+      'weight คืออัตราส่วนที่ data plane สุ่มตามความน่าจะเป็น ซึ่งจะเข้าใกล้ split ที่ config ไว้มากขึ้นที่ volume สูง แต่ไม่ใช่การรับประกันเป๊ะต่อ request ที่ sample size ต่ำ',
+      'HTTPRoute ตั้งค่าผิดต้อง apply ใหม่',
+      'api-v2 ไม่ healthy เลย drop บาง request',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ด้านบน: HTTPRoute ที่ apply จริงมี weight: 80/weight: 20 เป๊ะ และ sample จริง 50 request ได้ใกล้เคียงแต่ไม่เป๊ะกับอัตราส่วนนั้น — ตรงตามที่ probabilistic weighted sampling ที่ volume ต่ำควรเป็น',
   },
 ];
 

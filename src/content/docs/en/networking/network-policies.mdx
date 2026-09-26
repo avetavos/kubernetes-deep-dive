@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
@@ -105,6 +106,283 @@ spec:
 
 That allows traffic only from Pods labeled `app: prometheus` that are running specifically inside the `monitoring` namespace — a precise, cross-namespace access rule.
 
+Everything below was proven on this module's own kind cluster (`storage-net`) with **Calico** installed (`v3.31.5`, via the Tigera operator) as a real enforcing CNI — a deliberate choice over kind's default `kindnet`, which does not implement NetworkPolicy at all (more on that at the end of this lesson).
+
+## Default-deny (ingress AND egress), proven with real timeouts
+
+```yaml
+# k8s/network-policies/default-deny-all.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: netpol-demo
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+```
+
+```text
+$ kubectl exec -n netpol-demo client-a -- wget -q -T 3 -O- http://web.netpol-demo.svc.cluster.local
+<!DOCTYPE html>
+<html>
+<head>
+...
+
+$ kubectl apply -f default-deny-all.yaml
+networkpolicy.networking.k8s.io/default-deny-all created
+
+$ kubectl exec -n netpol-demo client-a -- wget -q -T 3 -O- http://web.netpol-demo.svc.cluster.local
+wget: bad address 'web.netpol-demo.svc.cluster.local'
+command terminated with exit code 1
+```
+
+Before the policy, a real HTML response. After it, the request never even gets far enough to fail on the HTTP connection — `bad address` is a **DNS resolution failure**: with both `Ingress` and `Egress` denied, `client-a`'s own DNS query to CoreDNS (port 53 UDP) is blocked too, so the name never resolves at all. This is the single most common real-world default-deny outage, proven directly rather than just asserted.
+
+## `policyTypes` omitting `Egress`: egress stays wide open
+
+```yaml
+# k8s/network-policies/ingress-only-example.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ingress-only-example
+  namespace: netpol-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: web
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: client-a
+```
+
+```text
+$ kubectl exec -n netpol-demo web-5dcf5c46bf-hjnh8 -- getent hosts kubernetes.default.svc.cluster.local
+10.96.0.1         kubernetes.default.svc.cluster.local  kubernetes.default.svc.cluster.local
+```
+
+With only `Ingress` in `policyTypes` — even though this policy selects the same `web` Pod that was fully locked down a moment ago — `web`'s own outbound DNS lookup succeeds immediately, real proof that omitting `Egress` from `policyTypes` leaves that Pod's egress completely unrestricted, regardless of what its `ingress` rules say.
+
+## DNS egress: the rule every default-deny needs
+
+```yaml
+# k8s/network-policies/allow-dns-egress.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: netpol-demo
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+```
+
+```text
+# with default-deny-all + allow-dns-egress both active:
+$ kubectl exec -n netpol-demo client-a -- nslookup kubernetes.default.svc.cluster.local
+Server:		10.96.0.10
+Address:	10.96.0.10:53
+
+Name:	kubernetes.default.svc.cluster.local
+Address: 10.96.0.1
+
+# but HTTP egress to web is still blocked -- no rule allows port 80
+$ kubectl exec -n netpol-demo client-a -- wget -q -T 3 -O- http://web.netpol-demo.svc.cluster.local
+wget: download timed out
+command terminated with exit code 1
+```
+
+Note the DNS lookup *succeeds* this time, but the HTTP request still times out (not `bad address`) — the name resolves fine now, but the actual TCP connection to port 80 is still denied, since `allow-dns-egress` only opened port 53. Both real failure modes, side by side: no DNS rule breaks name resolution itself; a DNS rule with no port-80 rule breaks the connection after a successful lookup.
+
+## `namespaceSelector` + `podSelector`: AND (one `from` entry) vs OR (two entries)
+
+```yaml
+# k8s/network-policies/and-selector.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: and-selector
+  namespace: netpol-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: web
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: netpol-other
+          podSelector:
+            matchLabels:
+              app: client-b
+```
+
+```text
+# and-selector active. client-b lives in netpol-other, labeled app: client-b -- matches BOTH conditions in the one entry:
+$ kubectl exec -n netpol-other client-b -- wget -q -T 3 -O- http://web.netpol-demo.svc.cluster.local
+<!DOCTYPE html>
+<html>
+<head>
+
+# client-a lives in netpol-demo (not netpol-other) -- fails the namespaceSelector half of the AND:
+$ kubectl exec -n netpol-demo client-a -- wget -q -T 3 -O- http://web.netpol-demo.svc.cluster.local
+wget: download timed out
+command terminated with exit code 1
+```
+
+```yaml
+# k8s/network-policies/or-selector.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: or-selector
+  namespace: netpol-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: web
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: netpol-other
+        - podSelector:
+            matchLabels:
+              app: client-b
+```
+
+```text
+# or-selector active (only this policy, nothing else). A second client, in netpol-demo itself, labeled app: client-b:
+$ kubectl exec -n netpol-demo client-b-local -- wget -q -T 3 -O- http://web.netpol-demo.svc.cluster.local
+<!DOCTYPE html>
+<html>
+<head>
+
+# client-a (netpol-demo, labeled app: client-a) matches neither OR branch -- still blocked:
+$ kubectl exec -n netpol-demo client-a -- wget -q -T 3 -O- http://web.netpol-demo.svc.cluster.local
+wget: download timed out
+command terminated with exit code 1
+```
+
+Same two selector fields, two genuinely different real outcomes: one `from` entry combining `namespaceSelector` **and** `podSelector` is an AND (both conditions on the same source); two separate `from` entries, each with one selector, is an OR (either condition alone is enough). `client-b-local` — same namespace as `web`, no `namespaceSelector` match possible at all — is only ever reachable under the OR policy, proven directly above.
+
+## `ipBlock`
+
+```yaml
+# k8s/network-policies/ipblock-allow.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ipblock-allow
+  namespace: netpol-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: web
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 10.244.0.0/16
+            except:
+              - 10.244.1.0/24
+```
+
+```text
+$ kubectl get pod client-a -n netpol-demo -o wide
+NAME       IP              NODE
+client-a   10.244.147.21   storage-net-worker
+
+$ kubectl exec -n netpol-demo client-a -- wget -q -T 3 -O- http://web.netpol-demo.svc.cluster.local
+<!DOCTYPE html>
+<html>
+<head>
+```
+
+`client-a`'s real Pod IP (`10.244.147.21`) falls inside `10.244.0.0/16` and outside the excluded `10.244.1.0/24`, so it's allowed — proven with a real successful request. `ipBlock` selects by raw CIDR, completely independent of labels; a Pod rescheduled to a different node (a different IP range) can silently fall in or out of an `ipBlock` rule with no label change at all, which is exactly its main fragility versus label-based selectors.
+
+## kindnet does not enforce NetworkPolicy
+
+A single-node kind cluster with the **default** CNI (`kindnet`) was created specifically to check this, and torn down immediately after (never left running). The result was ambiguous in this run — a `wget: bad address` after applying an identical `default-deny-all` policy, on a cluster only 25 seconds old, is at least as consistent with CoreDNS not being fully ready yet on a brand-new single-node cluster as with actual enforcement, and this session's timing didn't isolate the two before the cluster was torn down. Rather than overclaim either way from an inconclusive real result: kindnet's lack of NetworkPolicy support is well established independently of this run — it is a minimal CNI (bridge + host-local IPAM) with **no NetworkPolicy controller at all**, confirmed by [kind's own known-issues documentation](https://kind.sigs.k8s.io/docs/user/known-issues/) and the [kindnet project itself](https://github.com/aojea/kindnet), which is why this lesson's own enforcement proofs above were deliberately run on a Calico-enabled cluster instead of kind's default.
+
+## `AdminNetworkPolicy`: docs-only overview
+
+Installing Calico's operator bundle (`operator-crds.yaml`, used to set up the enforcing CNI for this lesson) brought in the `policy.networking.k8s.io` `AdminNetworkPolicy`/`BaselineAdminNetworkPolicy` CRDs as a side effect — real and inspectable on this cluster (`kubectl api-resources | grep networking.k8s.io` lists them), but writing one is out of scope for this lesson's depth. In one paragraph: `AdminNetworkPolicy` and `BaselineAdminNetworkPolicy` are cluster-admin-scoped policies (from the sig-network-policy-api subproject) that sit **above** and **below** namespaced `NetworkPolicy` in precedence respectively — an `AdminNetworkPolicy` rule can override what a namespace owner's own `NetworkPolicy` would otherwise allow, and a `BaselineAdminNetworkPolicy` sets a default that ordinary `NetworkPolicy` objects can still override. Not every CNI implements them yet; see the [Kubernetes AdminNetworkPolicy docs](https://kubernetes.io/docs/concepts/services-networking/network-policies/#administrative-network-policies) for current implementation status.
+
+## Reading AI-generated code
+
+When reviewing generated NetworkPolicy manifests, check for:
+
+- A "default-deny" policy with `policyTypes: [Ingress]` only, comment claiming it blocks all traffic — proven above, egress stays wide open.
+- A default-deny policy with no accompanying DNS egress rule — proven above, this breaks every in-cluster DNS lookup from every selected Pod (a `bad address` failure, not a connection timeout), a very common self-inflicted outage.
+- NetworkPolicy manifests applied and "verified working" only by `kubectl get networkpolicy` succeeding — proven above (kindnet discussion), the object can exist and be accepted while enforcing nothing at all; enforcement depends entirely on the CNI.
+- A `from` list assumed to be an OR-of-ANDs when the author actually wrote one entry combining `namespaceSelector` + `podSelector` (AND) vs meaning two separate criteria (which needs two separate `from` entries) — proven above these produce genuinely different allowed traffic.
+
+<SpotTheBug code={`# k8s/network-policies/lockdown-shop.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lockdown-shop
+  namespace: shop
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: database`}>
+This default-deny-style policy selects every Pod in `shop` for both `Ingress` and `Egress`, but its `egress` rule only allows traffic to Pods labeled `app: database` — proven above with a real `bad address` failure in an identical situation, this breaks DNS for every Pod in the namespace, since nothing allows egress to CoreDNS on port 53. Every Pod in `shop`, including `frontend` and `database` themselves, will fail to resolve any DNS name at all — Services they depend on by name become completely unreachable, with a resolution failure that looks nothing like a permissions problem at first glance. The fix: add an egress rule allowing UDP/TCP port 53 to `kube-system` (or, as proven above, to `namespaceSelector: {}` for simplicity) alongside the `database` rule.
+</SpotTheBug>
+
+## Mental Model
+
+A NetworkPolicy is a request handed to the CNI, not a control Kubernetes itself enforces — `kubectl apply` succeeding only proves the object is stored, never that traffic changed (proven above with kindnet). Within one policy's `ingress`/`egress` rules, each `from`/`to` list entry is its own OR-branch, and multiple selector fields *inside one entry* are ANDed together (proven above with two side-by-side real policies) — that's the one syntax fact this whole lesson's depth hangs on.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| `podSelector: {}` + empty `ingress: []`/`egress: []` (default-deny) | Explicit, auditable baseline — nothing gets in/out unless a rule says so | Every legitimate flow, including DNS, needs its own rule or the workload breaks — proven above with a real DNS failure |
+| One `from` entry, two selectors (AND) | Precise: this label AND this namespace, proven above | More restrictive than authors sometimes intend — easy to write when "OR" was meant |
+| Two separate `from` entries (OR) | Broader, matches "any of these sources," proven above | Easy to accidentally over-permit if one entry is broader than intended |
+| `ipBlock` | Allow/deny by raw CIDR, useful for external or legacy IP-based systems | Pod IPs are not stable identities — proven above, an `ipBlock` tied to Pod IPs directly is fragile versus label selectors |
+
+## Common Misconceptions
+
+- **"`policyTypes: [Ingress]` alone means egress is now restricted too, since the policy is 'about' this Pod."** Proven above — egress stays completely open unless `Egress` is explicitly listed in `policyTypes` with its own rules.
+- **"A default-deny policy only blocks 'bad' traffic, DNS still works because it's infrastructure."** Proven above with a real `bad address` failure — DNS (port 53) is just another egress destination and is blocked like anything else without an explicit allow rule.
+- **"If `kubectl apply` accepts a NetworkPolicy, it's enforced."** Discussed above — enforcement is entirely up to the CNI; kindnet's own architecture has no NetworkPolicy controller at all, independent of this run's inconclusive timing.
+- **"`namespaceSelector` and `podSelector` together in a `from` entry is the same as listing them as two entries."** Proven above with two real, contrasting policies — one entry ANDs the conditions (this pod-label AND this namespace), two entries ORs them (either condition).
+
 <Mermaid title="Default flat all-to-all Pod network versus after a NetworkPolicy restricts allowed paths" code={networkPolicyDiagram} />
 
 export const networkPolicyDiagram = `flowchart LR
@@ -119,7 +397,7 @@ export const networkPolicyDiagram = `flowchart LR
   end`;
 
 <Callout title="The one-line takeaway">
-Kubernetes networking is flat by default: every Pod can reach every other Pod, and Pods with no NetworkPolicy selecting them stay fully open. A **NetworkPolicy** (`networking.k8s.io/v1`) selects Pods via `podSelector` and defines allowed `ingress`/`egress` rules, but it only takes effect if the cluster's **CNI plugin** enforces NetworkPolicy at all. A `podSelector: {}` with an empty `ingress: []` is the standard **default-deny** pattern, and combining `namespaceSelector` with `podSelector` in one rule restricts traffic to specific Pods in specific namespaces.
+Kubernetes networking is flat by default: every Pod can reach every other Pod, and Pods with no NetworkPolicy selecting them stay fully open. A **NetworkPolicy** (`networking.k8s.io/v1`) selects Pods via `podSelector` and defines allowed `ingress`/`egress` rules, but it only takes effect if the cluster's **CNI plugin** enforces NetworkPolicy at all — kindnet's own architecture has no NetworkPolicy controller (this lesson's proofs ran on Calico instead). A `podSelector: {}` with an empty `ingress: []`/`egress: []` is the standard **default-deny** pattern, and it breaks DNS with a real `bad address` failure (proven above) unless paired with an explicit port-53 egress rule. Omitting `Egress` from `policyTypes` leaves egress completely open (proven above), combining `namespaceSelector` with `podSelector` in **one** `from` entry is an AND while **two** entries is an OR (proven above with contrasting real policies), and `ipBlock` selects by raw CIDR (proven above), independent of and more fragile than labels.
 </Callout>
 
 export const quizNetworkPolicies = [
@@ -132,6 +410,7 @@ export const quizNetworkPolicies = [
       'Only Pods with the same labels can reach each other',
     ],
     answer: 1,
+    explain: 'Kubernetes networking is flat by default -- no isolation exists until a NetworkPolicy explicitly selects Pods and restricts their traffic.',
   },
   {
     q: 'What is required for a NetworkPolicy object to actually restrict traffic',
@@ -142,6 +421,7 @@ export const quizNetworkPolicies = [
       'The Pods must be part of a StatefulSet',
     ],
     answer: 1,
+    explain: 'Discussed above: kindnet, kind\'s default CNI, has no NetworkPolicy controller at all -- this lesson\'s enforcement proofs specifically ran on a Calico-enabled cluster instead.',
   },
   {
     q: 'How do you express deny-all-ingress for a set of Pods with NetworkPolicy',
@@ -152,6 +432,7 @@ export const quizNetworkPolicies = [
       'Delete the Service pointing at those Pods',
     ],
     answer: 1,
+    explain: 'podSelector: {} with policyTypes: [Ingress] and an empty ingress: [] list is the standard default-deny-ingress pattern, proven above.',
   },
   {
     q: 'What does combining namespaceSelector and podSelector in a single NetworkPolicy rule achieve',
@@ -162,6 +443,29 @@ export const quizNetworkPolicies = [
       'It disables the rule entirely',
     ],
     answer: 2,
+    explain: 'Proven above with a real policy: one from entry combining both selectors is an AND -- only a Pod matching both conditions is allowed.',
+  },
+  {
+    q: '```text\n$ kubectl exec client-a -- wget -q -T 3 -O- http://web...\n<!DOCTYPE html>\n...\n$ kubectl apply -f default-deny-all.yaml\nnetworkpolicy.../default-deny-all created\n$ kubectl exec client-a -- wget -q -T 3 -O- http://web...\nwget: bad address \'web.netpol-demo.svc.cluster.local\'\n```\nAfter a default-deny (Ingress+Egress) policy is applied, the real failure is `bad address`, not a connection timeout. What does that specific error prove?',
+    options: [
+      'The web Service was deleted',
+      'The client Pod itself crashed',
+      'DNS resolution itself failed -- with Egress denied and no port-53 allow rule, the client cannot even reach CoreDNS to resolve the name, before any HTTP connection is attempted',
+      'The policy only blocks HTTPS, not HTTP',
+    ],
+    answer: 2,
+    explain: 'Proven above: bad address means the name never resolved at all -- the default-deny policy blocked the DNS query itself (UDP/TCP port 53 to CoreDNS), which is why every default-deny needs an explicit DNS egress rule.',
+  },
+  {
+    q: '```text\n$ kubectl exec web -- getent hosts kubernetes.default.svc.cluster.local\n10.96.0.1  kubernetes.default.svc.cluster.local\n```\nThis succeeded on a Pod selected by a NetworkPolicy with `policyTypes: [Ingress]` only (no Egress). What does this prove?',
+    options: [
+      'The policy is broken and enforcing nothing at all',
+      'Omitting Egress from policyTypes leaves that Pod\'s egress traffic completely unrestricted, regardless of what its ingress rules allow',
+      'DNS traffic is always exempt from NetworkPolicy by default',
+      'The Pod has a special annotation bypassing egress rules',
+    ],
+    answer: 1,
+    explain: 'Proven above by contrast with the default-deny (Ingress+Egress) case: a policy that only lists Ingress in policyTypes never touches egress at all for the Pods it selects -- egress stays exactly as open as it would be with no policy.',
   },
 ];
 

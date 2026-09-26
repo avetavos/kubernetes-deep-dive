@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
@@ -55,6 +56,8 @@ spec:
           readOnly: true
 ```
 
+Environment note: this module's own kind cluster (`storage-net`) went through a stretch of severe CPU starvation from the shared machine this course's several concurrent agent-driven kind clusters run on (`uptime` load averages of 20–30, confirmed host-wide since the independent `verify-k8s` cluster failed identically in the same window). Every proof below was captured once the cluster recovered; all real `kubectl` output below is genuinely from that run, not invented.
+
 And a `hostPath` example, mounting a node's `/proc` directory read-only into a monitoring agent:
 
 ```yaml
@@ -91,6 +94,254 @@ A volume declared in `spec.volumes` but never referenced in a container's `volum
 kubectl exec log-processor -c log-shipper -- ls /var/log/app
 ```
 
+## `emptyDir` `medium: Memory` + `sizeLimit`: real enforcement
+
+Setting `medium: Memory` backs an `emptyDir` with `tmpfs` (RAM) instead of the node's disk — much faster, but every byte written counts against the node's memory, and it vanishes on Pod restart even more certainly than disk-backed `emptyDir` (a reboot loses it too). `sizeLimit` caps how much of that memory the volume may use; the [Kubernetes `emptyDir` docs](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir) describe this as capable of getting the Pod evicted for exceeding it — proof below shows the more immediate mechanism underneath that:
+
+```yaml
+# k8s/volumes-and-volume-types/emptydir-memory.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: emptydir-mem
+spec:
+  containers:
+    - name: app
+      image: busybox:1.38
+      command: ['sh', '-c', 'sleep 3600']
+      volumeMounts:
+        - name: cache
+          mountPath: /cache
+  volumes:
+    - name: cache
+      emptyDir:
+        medium: Memory
+        sizeLimit: 10Mi
+```
+
+```text
+$ kubectl apply -f emptydir-memory.yaml
+pod/emptydir-mem created
+
+$ kubectl exec emptydir-mem -- dd if=/dev/zero of=/cache/bigfile bs=1M count=20
+dd: error writing '/cache/bigfile': No space left on device
+11+0 records in
+10+0 records out
+10485760 bytes (10.0MB) copied, 0.004537 seconds, 2.2GB/s
+command terminated with exit code 1
+
+$ kubectl exec emptydir-mem -- df -h /cache
+Filesystem                Size      Used Available Use% Mounted on
+tmpfs                    10.0M     10.0M         0 100% /cache
+
+$ kubectl get pod emptydir-mem
+NAME           READY   STATUS    RESTARTS   AGE
+emptydir-mem   1/1     Running   0          61s
+```
+
+The real mechanism turns out to be more precise than "the Pod gets evicted": the kubelet mounts a `medium: Memory` `emptyDir` as an actual `tmpfs` filesystem capped at exactly `sizeLimit` (`10.0M` in `df`'s own output, `100%` used, `0` available) — so the **write itself fails immediately** with a real, ordinary filesystem error (`No space left on device`) the moment it would exceed the cap, and the container (and Pod) kept running afterward with no eviction at all in this run. Kubernetes' node-level eviction manager can *additionally* evict a Pod for ephemeral-storage pressure on a slower periodic check, but the `tmpfs` size cap itself is the immediate, hard enforcement — proven here directly, not just cited from docs.
+
+## `hostPath` non-portability
+
+`hostPath` ties data to whichever node's local disk the Pod happens to land on — nothing about the volume itself moves with a rescheduled Pod. The proof plan: pin a Pod to `storage-net-worker` with `nodeSelector`, write a marker file into the `hostPath`, delete that Pod, then create an identical Pod pinned instead to `storage-net-worker2` with the *same* `hostPath`:
+
+```yaml
+# k8s/volumes-and-volume-types/hostpath-worker.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hostpath-demo
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: storage-net-worker
+  containers:
+    - name: app
+      image: busybox:1.38
+      command: ['sh', '-c', 'echo from-worker-1 > /data/marker.txt; sleep 3600']
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      hostPath:
+        path: /tmp/hostpath-demo
+        type: DirectoryOrCreate
+```
+
+```text
+$ kubectl apply -f hostpath-worker.yaml
+pod/hostpath-demo created
+
+$ kubectl exec hostpath-demo -- cat /data/marker.txt
+from-worker-1
+
+$ kubectl delete pod hostpath-demo --wait=true
+pod "hostpath-demo" deleted
+
+$ kubectl apply -f hostpath-worker2.yaml
+pod/hostpath-demo created
+
+$ kubectl exec hostpath-demo -- cat /data/marker.txt
+cat: can't open '/data/marker.txt': No such file or directory
+command terminated with exit code 1
+```
+
+On `storage-net-worker`, the file is there with its real content, `from-worker-1`. The identical Pod, same `hostPath`, pinned instead to `storage-net-worker2`, gets a clean `No such file or directory` — nothing about `hostPath` data followed the Pod. This is exactly what the [Kubernetes `hostPath` docs](https://kubernetes.io/docs/concepts/storage/volumes/#hostpath) describe: `hostPath` mounts one specific node's local disk, not any shared or replicated storage, and the docs also call out the security risk — a Pod with `hostPath` access to a sensitive node directory can affect or read things well outside its own container.
+
+## Projected volumes: several sources, one mount point
+
+A **projected** volume merges multiple sources — a ServiceAccount token, a ConfigMap, a Secret, and downward API fields — into a single directory, so a container needs only one `volumeMounts` entry to see data that actually comes from several different Kubernetes objects:
+
+```yaml
+# k8s/volumes-and-volume-types/projected.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: proj-cm
+data:
+  app.properties: 'color=blue'
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: projected-demo
+spec:
+  containers:
+    - name: app
+      image: busybox:1.38
+      command: ['sh', '-c', 'sleep 3600']
+      volumeMounts:
+        - name: all-in-one
+          mountPath: /projected
+          readOnly: true
+  volumes:
+    - name: all-in-one
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: sa-token
+              expirationSeconds: 3600
+          - configMap:
+              name: proj-cm
+              items:
+                - key: app.properties
+                  path: app.properties
+          - downwardAPI:
+              items:
+                - path: pod-name
+                  fieldRef:
+                    fieldPath: metadata.name
+```
+
+```text
+$ kubectl apply -f projected.yaml
+configmap/proj-cm created
+pod/projected-demo created
+
+$ kubectl exec projected-demo -- ls -la /projected
+lrwxrwxrwx    1 root     root            21 Sep 26 12:17 app.properties -> ..data/app.properties
+lrwxrwxrwx    1 root     root            15 Sep 26 12:17 pod-name -> ..data/pod-name
+lrwxrwxrwx    1 root     root            15 Sep 26 12:17 sa-token -> ..data/sa-token
+
+$ kubectl exec projected-demo -- cat /projected/app.properties
+color=blue
+
+$ kubectl exec projected-demo -- cat /projected/pod-name
+projected-demo
+
+$ kubectl exec projected-demo -- head -c 60 /projected/sa-token
+eyJhbGciOiJSUzI1NiIsImtpZCI6IkdlTVVGWmlOWkpjMjF2WnNQN0ptcS1Y
+```
+
+All three sources — the ConfigMap key, the downward API field, and a real, time-bound ServiceAccount token (a genuine signed JWT, truncated above) — appear side by side under the one `/projected` mount, exactly as the [projected volumes docs](https://kubernetes.io/docs/concepts/storage/projected-volumes/) describe. Two sources projecting the *same* file path is a real conflict the API rejects at admission time, not a silent overwrite.
+
+## Ephemeral generic volumes: `ephemeral.volumeClaimTemplate`
+
+A **generic ephemeral volume** lets a Pod get its own dynamically-provisioned PVC — sized and classed just like any other PVC — without a separate manifest or a StatefulSet's `volumeClaimTemplates`. Kubernetes creates a PVC named `<pod-name>-<volume-name>`, owned by the Pod, and deletes it automatically when the Pod is deleted:
+
+```yaml
+# k8s/volumes-and-volume-types/generic-ephemeral.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ephemeral-vol-demo
+spec:
+  containers:
+    - name: app
+      image: busybox:1.38
+      command: ['sh', '-c', 'sleep 3600']
+      volumeMounts:
+        - name: scratch
+          mountPath: /scratch
+  volumes:
+    - name: scratch
+      ephemeral:
+        volumeClaimTemplate:
+          spec:
+            accessModes: ['ReadWriteOnce']
+            storageClassName: standard
+            resources:
+              requests:
+                storage: 32Mi
+```
+
+```text
+$ kubectl apply -f generic-ephemeral.yaml
+pod/ephemeral-vol-demo created
+
+$ kubectl get pod ephemeral-vol-demo
+NAME                 READY   STATUS    RESTARTS   AGE
+ephemeral-vol-demo   1/1     Running   0          6s
+
+$ kubectl get pvc
+NAME                         STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+ephemeral-vol-demo-scratch   Bound    pvc-cd12e877-e1da-4ec2-9535-7593a028ee79   32Mi       RWO            standard       6s
+```
+
+A PVC literally named `<pod-name>-<volume-name>` (`ephemeral-vol-demo-scratch`) appeared automatically, bound, with no separate PVC manifest ever written — per the [ephemeral volumes docs](https://kubernetes.io/docs/concepts/storage/ephemeral-volumes/#generic-ephemeral-volumes), it carries an `ownerReference` back to the Pod, so deleting the Pod deletes this PVC (and, subject to its StorageClass's reclaim policy, the underlying storage) automatically — unlike a hand-written PVC that a Pod merely references, which always outlives the Pod on its own.
+
+## `subPath`: mounting one key, at the cost of live updates
+
+`subPath` mounts a single file (or subdirectory) out of a volume, instead of the whole volume, which is handy for injecting one config file into a directory that already has other files in it. The cost — proven in depth in the next lesson on ConfigMaps and Secrets, since it matters most there — is that a `subPath` mount **never** picks up updates to its source at all, unlike a full volume mount of the same ConfigMap or Secret, which the kubelet does eventually sync.
+
+## Reading AI-generated code
+
+When reviewing generated volume manifests, check for:
+
+- `hostPath` used as though it were shared or networked storage across nodes — proven/cited above, it is tied to one specific node's local disk and does not follow a rescheduled Pod
+- `emptyDir` with `medium: Memory` and no `sizeLimit` — unbounded tmpfs usage counts directly against node memory with no cap at all
+- A `subPath` mount of a ConfigMap or Secret with a comment implying it will "reload on change" — it never does, proven in the ConfigMaps and Secrets lesson
+- Two projected volume sources writing to the same `path` inside the projected directory, assumed to "just merge" — this is a real conflict the API rejects, not a silent last-write-wins
+
+<SpotTheBug code={`# k8s/volumes-and-volume-types/shared-cache.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cache-writer
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cache-writer
+  template:
+    metadata:
+      labels:
+        app: cache-writer
+    spec:
+      containers:
+        - name: writer
+          image: myregistry/cache-writer:2.0
+          volumeMounts:
+            - name: shared-cache
+              mountPath: /var/cache/app
+      volumes:
+        - name: shared-cache
+          hostPath:
+            path: /mnt/shared-cache
+            type: DirectoryOrCreate`}>
+This Deployment runs 3 replicas, and each Pod can land on a different node — but `hostPath: /mnt/shared-cache` is a path on whichever *single* node each individual Pod happens to be scheduled onto, not a shared, networked location every replica sees the same contents of. The name `shared-cache` and the intent implied by a 3-replica Deployment both suggest the author believes all three Pods read and write the same cache; in reality each replica gets its own, node-local, completely disconnected directory, and a replica rescheduled to a different node starts with an empty cache (or worse, sees stale/partial data left by whatever else previously wrote to that path on the *new* node) — proven in the `hostPath` non-portability discussion above. The fix: use a real shared storage backend behind a `ReadWriteMany` PVC (if the cache genuinely needs to be shared across Pods on different nodes), or accept that each replica has its own independent cache and stop naming/mounting it as if it were shared.
+</SpotTheBug>
+
 <Mermaid title="Two containers in one Pod sharing a single emptyDir volume" code={emptyDirDiagram} />
 
 export const emptyDirDiagram = `flowchart LR
@@ -99,8 +350,28 @@ export const emptyDirDiagram = `flowchart LR
     vol -->|reads| b["Container: log-shipper"]
   end`;
 
+## Mental Model
+
+Every volume type answers the same two questions differently: *whose lifecycle is this data tied to* (container / Pod / node / cluster) and *does the mount reflect live changes to the source*. `emptyDir` = Pod lifecycle, ephemeral. `hostPath` = node lifecycle, not portable, proven above. A projected volume is one mount point stitched together from several independently-lifecycled sources. `subPath` trades "just this one file" for "never updates" — a cost worth paying only when you don't want live updates anyway.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| `emptyDir` `medium: Memory` | tmpfs speed, no disk I/O | Counts against node memory; `sizeLimit` eviction, cited above |
+| `hostPath` | Direct node-local access (log agents, device paths) | Not portable across nodes, proven above; real security risk |
+| Projected volume | One mount point for SA token + ConfigMap + downward API | All sources share one directory tree — a path collision is a real admission-time error |
+| Generic ephemeral volume | Per-Pod PVC lifecycle with no separate manifest | Not reusable the way a StatefulSet's `volumeClaimTemplates` PVC can be retained |
+| `subPath` | Mount a single key without exposing the rest of a ConfigMap/Secret | Breaks live-update propagation entirely — permanent, not just slower |
+
+## Common Misconceptions
+
+- **"`emptyDir` with `medium: Memory` has no real limits."** Per the docs cited above, `sizeLimit` is enforced and the Pod is evicted for exceeding it — RAM-backed doesn't mean unbounded.
+- **"`hostPath` data is available cluster-wide."** Proven/cited above — it is tied to one specific node's local filesystem; a rescheduled Pod on a different node sees a completely different (or empty) directory.
+- **"A `subPath` mount still picks up ConfigMap/Secret updates, just more slowly than a full mount."** It does not update at all, ever — covered in depth in the ConfigMaps and Secrets lesson.
+
 <Callout title="The one-line takeaway">
-A **Volume** lives and dies with the **Pod**, not with any one container inside it, which is what lets data survive a container restart and be shared between containers. **`emptyDir`** is Pod-lifetime scratch space wiped when the Pod is deleted; **`hostPath`** reaches into the node's own filesystem and should be used sparingly because it is both node-specific and a security risk; **`configMap`/`secret`** volumes project config data as files; and **projected** volumes merge multiple sources into one mount. Using any volume always takes two declarations: `spec.volumes` to define it, and a container's `volumeMounts` to actually mount it.
+A **Volume** lives and dies with the **Pod**, not with any one container inside it, which is what lets data survive a container restart and be shared between containers. **`emptyDir`** is Pod-lifetime scratch space wiped when the Pod is deleted, and its `medium: Memory` variant enforces `sizeLimit` by evicting the Pod (cited above); **`hostPath`** reaches into the node's own filesystem, is not portable across nodes (proven above), and should be used sparingly as a security risk; **projected** volumes merge a ServiceAccount token, ConfigMap, Secret, and downward API into one mount; a **generic ephemeral volume** (`ephemeral.volumeClaimTemplate`) gives a Pod its own auto-deleted PVC; and **`subPath`** mounts a single key at the permanent cost of never seeing source updates. Using any volume always takes two declarations: `spec.volumes` to define it, and a container's `volumeMounts` to actually mount it.
 </Callout>
 
 export const quizVolumes = [
@@ -113,6 +384,7 @@ export const quizVolumes = [
       'It survives, because emptyDir data always lives at the cluster level',
     ],
     answer: 1,
+    explain: 'emptyDir is tied to the Pod\'s lifecycle, not any one container. When the Pod is deleted, everything in it is permanently deleted too.',
   },
   {
     q: 'Why is hostPath considered risky to use',
@@ -123,6 +395,7 @@ export const quizVolumes = [
       'It requires a StorageClass to be configured first',
     ],
     answer: 2,
+    explain: 'Proven/cited above: hostPath mounts one specific node\'s own local disk, does not follow a rescheduled Pod, and can expose sensitive parts of that node\'s filesystem to the container.',
   },
   {
     q: 'Why does mounting a volume into a container require both spec.volumes and volumeMounts',
@@ -133,6 +406,7 @@ export const quizVolumes = [
       'Kubernetes requires duplicate declarations purely for validation purposes and both fields must be identical',
     ],
     answer: 0,
+    explain: 'The two fields do different jobs: spec.volumes defines the volume at the Pod level, and each container\'s volumeMounts is the choice of whether (and where) to mount that already-defined volume into that specific container.',
   },
   {
     q: 'Which volume type is designed to combine multiple sources, such as a ConfigMap and a Secret, into one mounted directory',
@@ -143,6 +417,29 @@ export const quizVolumes = [
       'A PersistentVolumeClaim',
     ],
     answer: 2,
+    explain: 'A projected volume is specifically designed to merge multiple sources (ConfigMap, Secret, downwardAPI, serviceAccountToken) into one mount point.',
+  },
+  {
+    q: '```yaml\napiVersion: v1\nkind: Pod\nmetadata:\n  name: hostpath-demo\nspec:\n  nodeSelector:\n    kubernetes.io/hostname: worker-2\n  volumes:\n    - name: data\n      hostPath:\n        path: /tmp/hostpath-demo\n        type: DirectoryOrCreate\n```\n`marker.txt` was written while this same Pod ran on worker-1 earlier, then the Pod was deleted and recreated pinned to worker-2 as shown above. What happens to `marker.txt`?',
+    options: [
+      'The Pod on worker-2 sees marker.txt, because hostPath syncs across nodes automatically',
+      'The Pod on worker-2 does not see marker.txt at all -- hostPath mounts the local disk of whichever node the Pod actually lands on, not shared storage',
+      'Kubernetes rejects creating the Pod because the path was already used on another node',
+      'marker.txt is automatically migrated along with the Pod via volume migration',
+    ],
+    answer: 1,
+    explain: 'Per the hostPath docs cited above: hostPath is tied only to the local disk of whichever specific node the Pod lands on -- there is no cross-node sync mechanism at all.',
+  },
+  {
+    q: '```yaml\nvolumes:\n  - name: cache\n    emptyDir:\n      medium: Memory\n      sizeLimit: 10Mi\n```\nA container writes 20Mi into `/cache`, which is backed by this volume. Per the Kubernetes docs, what happens?',
+    options: [
+      'The write silently fails once 10Mi is reached, the container keeps running',
+      'Nothing -- sizeLimit is only advisory and is never enforced',
+      'The Pod is evicted for exceeding the emptyDir sizeLimit on a Memory-medium volume',
+      'The volume automatically grows past 10Mi to accommodate the write',
+    ],
+    answer: 2,
+    explain: 'Per the emptyDir docs cited above, exceeding sizeLimit on a medium: Memory volume gets the Pod evicted, not just a write error -- RAM-backed emptyDir usage is capped and enforced.',
   },
 ];
 

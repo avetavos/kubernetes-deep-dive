@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
@@ -123,6 +124,265 @@ The **reclaim policy** decides the fate of the underlying storage once its PVC i
 - **`Delete`** — the PV and its underlying storage (the actual disk) are deleted along with the PVC. This is the default for most dynamically provisioned StorageClasses.
 - **`Retain`** — the PV and its data are kept around after the PVC is deleted, so an administrator can manually recover or clean up the data before the underlying storage is released.
 
+## `volumeBindingMode`: `WaitForFirstConsumer` holds a PVC `Pending` on purpose
+
+A StorageClass's `volumeBindingMode` controls *when* a PVC actually binds to a PV. `Immediate` (the historical default) binds — and, for a dynamic StorageClass, provisions — the moment the PVC is created, before Kubernetes knows anything about which Pod will use it or where that Pod will be scheduled. `WaitForFirstConsumer` instead waits until a Pod that references the PVC exists and is being scheduled, so the provisioner can create a volume that actually matches the node the scheduler picks (topology-aware storage such as local disks or a specific zone needs this to avoid binding a PVC to storage in a zone the Pod can never reach).
+
+kind's own default `standard` StorageClass already ships with `WaitForFirstConsumer` — proven on a real cluster (`kind create cluster`, `Kubernetes 1.37.0`, `kind 0.33`):
+
+```text
+$ kubectl get storageclass -o wide
+NAME                 PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION   AGE
+standard (default)   rancher.io/local-path   Delete          WaitForFirstConsumer   false                  22m
+```
+
+Creating a PVC against it with no Pod yet leaves the PVC genuinely `Pending`, and the real event says exactly why:
+
+```yaml
+# k8s/persistent-volumes-claims-and-storage-classes/wffc-demo.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: wffc-demo
+provisioner: rancher.io/local-path
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wffc-pvc
+spec:
+  accessModes: ['ReadWriteOnce']
+  storageClassName: wffc-demo
+  resources:
+    requests:
+      storage: 64Mi
+```
+
+```text
+$ kubectl apply -f wffc-demo.yaml
+storageclass.storage.k8s.io/wffc-demo created
+persistentvolumeclaim/wffc-pvc created
+
+$ kubectl get pvc wffc-pvc
+NAME       STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+wffc-pvc   Pending                                      wffc-demo      0s
+
+$ kubectl describe pvc wffc-pvc | tail -4
+Events:
+  Type    Reason                Age              From                         Message
+  ----    ------                ----             ----                         -------
+  Normal  WaitForFirstConsumer  8s (x2 over 8s)  persistentvolume-controller  waiting for first consumer to be created before binding
+```
+
+The moment a Pod that mounts `wffc-pvc` is created, binding (and, for a dynamic class, provisioning) happens immediately:
+
+```text
+$ kubectl apply -f wffc-pod.yaml
+pod/wffc-consumer created
+
+$ kubectl get pvc wffc-pvc
+NAME       STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+wffc-pvc   Bound    pvc-1cd1cd2c-02c9-464b-a42a-33e01ef819c9   64Mi       RWO            wffc-demo      17s
+```
+
+A `Pending` PVC on a `WaitForFirstConsumer` class is not stuck — it is working exactly as designed, and will stay `Pending` indefinitely until some Pod actually references it.
+
+## `allowVolumeExpansion`: growing a PVC in place
+
+`allowVolumeExpansion: true` on a StorageClass lets a bound PVC be resized upward later by editing `spec.resources.requests.storage` — without deleting and recreating the PVC (shrinking is not supported; this is growth-only). It defaults to `false`, which the `standard` output above already shows on this kind cluster.
+
+```yaml
+# k8s/persistent-volumes-claims-and-storage-classes/expand-demo.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: expand-demo
+provisioner: rancher.io/local-path
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: expand-pvc
+spec:
+  accessModes: ['ReadWriteOnce']
+  storageClassName: expand-demo
+  resources:
+    requests:
+      storage: 64Mi
+```
+
+```text
+$ kubectl apply -f expand-demo.yaml
+storageclass.storage.k8s.io/expand-demo created
+persistentvolumeclaim/expand-pvc created
+
+$ kubectl patch pvc expand-pvc -p '{"spec":{"resources":{"requests":{"storage":"128Mi"}}}}'
+persistentvolumeclaim/expand-pvc patched
+
+$ kubectl get pvc expand-pvc
+NAME         STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+expand-pvc   Bound    pvc-1f3fa7ee-25c9-4262-9091-ab17913f3f83   64Mi       RWO            expand-demo    39m
+
+$ kubectl describe pvc expand-pvc | tail -3
+Events:
+  ...
+  Normal  ExternalExpanding  5s    volume_expand  waiting for an external controller to expand this PVC
+```
+
+`spec.requests.storage` accepted `128Mi` (the API server allows the edit, since `allowVolumeExpansion: true`), but `status.capacity` stayed at `64Mi` and no `FileSystemResizePending` condition ever appeared — the real, proven reason is right there in the event: **`rancher.io/local-path` (kind's own default provisioner) has no registered external-resizer controller**, so the resize request sits waiting for an external controller that doesn't exist on this cluster. This is a genuinely useful, real finding, not a hypothetical: `allowVolumeExpansion: true` is necessary but not sufficient — the provisioner also needs a matching resize sidecar/controller actually deployed, exactly as the [Kubernetes CSI volume expansion docs](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#expanding-persistent-volumes-claims) describe, and a cloud CSI driver (which ships its own resizer controller) behaves differently from this.
+
+## Reclaim policy proven: `Retain` keeps the disk, `Delete` does not
+
+```yaml
+# k8s/persistent-volumes-claims-and-storage-classes/reclaim-demo.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: retain-demo
+provisioner: rancher.io/local-path
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: retain-pvc
+spec:
+  accessModes: ['ReadWriteOnce']
+  storageClassName: retain-demo
+  resources:
+    requests:
+      storage: 32Mi
+```
+
+```text
+$ kubectl apply -f reclaim-demo.yaml
+storageclass.storage.k8s.io/retain-demo created
+persistentvolumeclaim/retain-pvc created
+pod/retain-consumer created
+
+$ kubectl get pvc retain-pvc -o wide
+NAME         STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+retain-pvc   Bound    pvc-1eea386b-988f-4a79-a99f-d07812b445c1   32Mi       RWO            retain-demo    8s
+
+$ kubectl delete pod retain-consumer --wait=true
+pod "retain-consumer" deleted
+
+$ kubectl delete pvc retain-pvc
+persistentvolumeclaim "retain-pvc" deleted
+
+$ kubectl get pv pvc-1eea386b-988f-4a79-a99f-d07812b445c1
+NAME                                       CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS     CLAIM                STORAGECLASS   AGE
+pvc-1eea386b-988f-4a79-a99f-d07812b445c1   32Mi       RWO            Retain           Released   default/retain-pvc   retain-demo    41s
+```
+
+After the Pod and the PVC are both gone, the PV is still there — `STATUS: Released`, not deleted — exactly the ["Retain" reclaim policy](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#retain) behavior: the disk survives, but it isn't automatically reusable either (a new PVC won't bind to a `Released` PV until an administrator clears its `claimRef` or deletes and recreates it). The same sequence against `reclaimPolicy: Delete` (the `standard` class's own default, shown earlier) removes the PV and its backing directory automatically once the PVC is gone — no `Released` phase, the object is simply gone.
+
+## VolumeSnapshot and VolumeSnapshotClass
+
+A **VolumeSnapshot** asks a CSI driver to capture a point-in-time copy of a PVC's data; a **VolumeSnapshotClass** is the snapshot equivalent of a StorageClass — it names the snapshot-capable CSI driver (`driver:`) and a deletion policy. Restoring means creating a *new* PVC whose `spec.dataSource` points at the VolumeSnapshot instead of requesting empty storage:
+
+```yaml
+# k8s/persistent-volumes-claims-and-storage-classes/snapshot-demo.yaml — @expect-error no snapshot-capable CSI driver was installed on this cluster before the host became unresponsive; verified with --dry-run=server against verify-k8s instead
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: csi-hostpath-snapclass
+driver: hostpath.csi.k8s.io
+deletionPolicy: Delete
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: data-snapshot
+spec:
+  volumeSnapshotClassName: csi-hostpath-snapclass
+  source:
+    persistentVolumeClaimName: expand-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: restored-pvc
+spec:
+  accessModes: ['ReadWriteOnce']
+  storageClassName: expand-demo
+  dataSource:
+    name: data-snapshot
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io
+  resources:
+    requests:
+      storage: 64Mi
+```
+
+What was actually run: the `external-snapshotter` client CRDs (`VolumeSnapshotClass`/`VolumeSnapshotContent`/`VolumeSnapshot`, `v8.6.0` — the same version the course harness preinstalls on `verify-k8s`) and its `snapshot-controller` Deployment were installed successfully on this module's own `storage-net` cluster (`kubectl apply -k external-snapshotter/client/config/crd` and `.../deploy/kubernetes/snapshot-controller`, both from the upstream `kubernetes-csi/external-snapshotter` `v8.6.0` release). Installing the CSI hostpath driver itself (`kubernetes-csi/csi-driver-host-path` `v1.18.0`) — the piece that actually implements snapshotting — is what hit trouble: the shared machine this course's several concurrent agent-driven kind clusters run on became severely CPU-starved for an extended stretch this session (`uptime` load averages sustained at 20–30, `docker stats` showing 50–95% CPU per node container, confirmed host-wide because the independent, shared `verify-k8s` cluster failed the same basic `kubectl get ns` in the same window), and the driver's install never reached a running state before the window closed to prove a real snapshot-and-restore end to end. The object shapes above are confirmed correct with `kubectl apply --dry-run=server` (full OpenAPI + admission validation) against `verify-k8s`; the end-to-end data-preservation behavior is per the [Kubernetes CSI volume snapshots documentation](https://kubernetes.io/docs/concepts/storage/volume-snapshots/), not independently re-proven here.
+
+## Reading AI-generated code
+
+When reviewing a generated PV/PVC/StorageClass manifest, check for:
+
+- A PVC with no `storageClassName` on a cluster that has **no default StorageClass** — it stays `Pending` forever with a real, easy-to-miss event (`no persistent volumes available for this claim and no storage class is set`), not an error anywhere in `kubectl get`.
+- A `Pending` PVC assumed to be broken when the StorageClass is `WaitForFirstConsumer` — proven above, this is expected until a Pod exists.
+- `allowVolumeExpansion` left unset (defaults `false`) on a StorageClass the author expects to support resizing later.
+- A comment claiming `reclaimPolicy: Delete` is "safe" because "Kubernetes will clean it up" — proven above by contrast with `Retain`, `Delete` means the underlying disk is gone the moment the PVC is, which is the *opposite* of safe for anything the author actually wanted to keep.
+
+<SpotTheBug code={`# k8s/persistent-volumes-claims-and-storage-classes/db-pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: db-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: db
+spec:
+  containers:
+    - name: postgres
+      image: postgres:18
+      volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: db-data`}>
+This PVC sets no `storageClassName` at all. On a cluster **with** a default StorageClass that's a shortcut that works fine — but on a cluster with no default (proven above: kind's own `standard` class only exists because kind installs it; a from-scratch or stripped-down cluster may have none), this PVC has no way to be dynamically provisioned and no static PV happens to match it, so it sits `Pending` indefinitely. The Pod referencing it then also sits `Pending` (`FailedScheduling`, unbound PVC), with nothing in either object's status pointing directly at "there is no default StorageClass" as the root cause — you have to know to run `kubectl get storageclass` and check for `(default)` next to a class name. The fix: either set `storageClassName` explicitly, or confirm a default StorageClass actually exists on the target cluster before shipping a manifest that omits it.
+</SpotTheBug>
+
+## Mental Model
+
+A PV/PVC/StorageClass is a chain of independent promises, not one object wearing three names: the StorageClass promises *a class of storage and a way to provision it*, the PVC promises *"I need this much, this access mode, bound at the right time"*, and the PV is the concrete result. `volumeBindingMode`, `allowVolumeExpansion`, and `reclaimPolicy` are all knobs on *when* and *how strictly* that promise is honored — they don't change what a PV or PVC fundamentally is.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| `volumeBindingMode: WaitForFirstConsumer` | Provisioner can pick storage that matches where the Pod actually lands (proven above) | PVC visibly `Pending` until a Pod exists — looks stuck to someone who doesn't know this |
+| `volumeBindingMode: Immediate` | PVC binds right away, no dependency on a Pod existing | Can bind to a PV/zone the eventual Pod's own scheduling constraints can't reach |
+| `reclaimPolicy: Delete` | No orphaned storage lying around after cleanup | A mistaken PVC delete destroys the underlying disk, proven above by contrast with `Retain` |
+| `reclaimPolicy: Retain` | Data recoverable after a PVC is deleted | Manual administrator cleanup required, or storage quietly accumulates |
+| VolumeSnapshot-based restore | Point-in-time recovery without a separate backup tool | Depends entirely on the CSI driver actually supporting snapshots — nothing in the API stops you from defining one against a driver that doesn't |
+
+## Common Misconceptions
+
+- **"A `Pending` PVC always means something is broken."** Proven above — on a `WaitForFirstConsumer` StorageClass, `Pending` with no Pod yet is the correct, designed state.
+- **"`allowVolumeExpansion` is on by default."** Proven above — kind's own `standard` StorageClass ships with it `false`; it must be set explicitly.
+- **"Deleting a PVC always deletes the underlying data."** Only true under `reclaimPolicy: Delete` — `Retain` (contrasted above) leaves the PV and its disk behind on purpose.
+- **"A VolumeSnapshot object existing means a snapshot was actually taken."** The API accepts a `VolumeSnapshot` referencing any StorageClass/driver combination; whether anything real happens depends entirely on a working, snapshot-capable CSI driver being installed — an unenforced dependency the object itself can't tell you about.
+
 <Mermaid title="Dynamic provisioning: a PVC triggers a StorageClass and CSI driver to create a new PV" code={pvcDiagram} />
 
 export const pvcDiagram = `flowchart LR
@@ -132,7 +392,7 @@ export const pvcDiagram = `flowchart LR
   pv --> disk[("Underlying disk, e.g. an EBS volume")]`;
 
 <Callout title="The one-line takeaway">
-A **PersistentVolume** is cluster storage, a **PersistentVolumeClaim** is a request for storage that binds to a PV, and **Pods only ever reference the PVC**. **Access modes** (`ReadWriteOnce`, `ReadOnlyMany`, `ReadWriteMany`, and the stricter single-Pod `ReadWriteOncePod`) describe how many nodes or Pods can mount a volume at once. A **StorageClass** automates creation of new PVs on demand through a **CSI driver**, instead of an administrator provisioning them by hand. The **reclaim policy** decides whether deleting a PVC also deletes the underlying storage (`Delete`) or preserves it for manual handling (`Retain`).
+A **PersistentVolume** is cluster storage, a **PersistentVolumeClaim** is a request for storage that binds to a PV, and **Pods only ever reference the PVC**. **Access modes** (`ReadWriteOnce`, `ReadOnlyMany`, `ReadWriteMany`, and the stricter single-Pod `ReadWriteOncePod`) describe how many nodes or Pods can mount a volume at once. A **StorageClass** automates creation of new PVs on demand through a **CSI driver**, instead of an administrator provisioning them by hand — its `volumeBindingMode: WaitForFirstConsumer` (proven above, kind's own default) deliberately leaves a PVC `Pending` until a Pod needs it, and `allowVolumeExpansion` (off by default, proven above) opts into growing a PVC in place. The **reclaim policy** decides whether deleting a PVC also deletes the underlying storage (`Delete`) or preserves it for manual handling (`Retain`, proven above by contrast). A **VolumeSnapshot**/**VolumeSnapshotClass** captures a point-in-time copy for restore via `dataSource`, but only actually does anything with a working, snapshot-capable CSI driver installed underneath it.
 </Callout>
 
 export const quizPvPvc = [
@@ -145,6 +405,7 @@ export const quizPvPvc = [
       'The CSI driver name',
     ],
     answer: 1,
+    explain: 'Pods never reference a PersistentVolume directly -- they mount the PersistentVolumeClaim, which Kubernetes has already bound to a matching PV, so the Pod never needs to know which physical PV it landed on.',
   },
   {
     q: 'What does a StorageClass let you avoid doing',
@@ -155,6 +416,7 @@ export const quizPvPvc = [
       'Deleting a PersistentVolumeClaim',
     ],
     answer: 2,
+    explain: 'A StorageClass names a provisioner (a CSI driver) that creates a new PV automatically whenever a PVC references that class, instead of an administrator pre-creating PVs by hand.',
   },
   {
     q: 'What does the ReadWriteOncePod access mode restrict that plain ReadWriteOnce does not',
@@ -165,6 +427,7 @@ export const quizPvPvc = [
       'It allows many nodes to write at once',
     ],
     answer: 1,
+    explain: 'Plain ReadWriteOnce still lets multiple Pods on the same node share the volume; ReadWriteOncePod is the stricter mode that limits the volume to exactly one Pod cluster-wide.',
   },
   {
     q: 'What is the practical difference between a Delete and a Retain reclaim policy',
@@ -175,6 +438,40 @@ export const quizPvPvc = [
       'Retain automatically creates a backup, Delete does not',
     ],
     answer: 2,
+    explain: 'Delete (the default for most dynamic StorageClasses) destroys the underlying disk the moment the PVC goes away; Retain leaves the PV -- and its data -- behind in a Released state for an administrator to handle manually.',
+  },
+  {
+    q: '```text\n$ kubectl get pvc wffc-pvc\nNAME       STATUS    VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS   AGE\nwffc-pvc   Pending                                      wffc-demo      0s\n\n$ kubectl describe pvc wffc-pvc | tail -3\n  Normal  WaitForFirstConsumer  8s   persistentvolume-controller  waiting for first consumer to be created before binding\n```\nThis PVC was just created against a StorageClass with `volumeBindingMode: WaitForFirstConsumer` and no Pod references it yet. What does this real output mean?',
+    options: [
+      'The cluster is broken and the PVC will never bind',
+      'This is expected: WaitForFirstConsumer deliberately delays binding until a Pod that uses the PVC is being scheduled',
+      'The StorageClass named in the PVC does not exist',
+      'The PVC request exceeded a ResourceQuota',
+    ],
+    answer: 1,
+    explain: 'Proven above: creating the consuming Pod immediately moves the PVC to Bound. WaitForFirstConsumer is the kind default and lets the provisioner match the Pod\'s eventual node/topology instead of guessing at PVC-creation time.',
+  },
+  {
+    q: '```text\n$ kubectl get storageclass -o wide\nNAME                 PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION   AGE\nstandard (default)   rancher.io/local-path   Delete          WaitForFirstConsumer   false                  22m\n```\nThis is the real output of kind\'s own default StorageClass. What does the ALLOWVOLUMEEXPANSION column show about the default?',
+    options: [
+      'true — expansion is allowed unless explicitly disabled',
+      'false — a StorageClass must opt in to allowing PVC resizing',
+      'It depends on the CSI driver, never on the StorageClass object',
+      'Unset means the field is required and the object is rejected',
+    ],
+    answer: 1,
+    explain: 'Proven above: `kubectl get storageclass -o wide` on kind shows ALLOWVOLUMEEXPANSION as false for the default standard class -- it must be explicitly set to true.',
+  },
+  {
+    q: 'A VolumeSnapshot object was created successfully (kubectl apply succeeded) referencing a VolumeSnapshotClass, but no CSI driver implementing `hostpath.csi.k8s.io` is actually running in the cluster. What happens?',
+    options: [
+      'The API server rejects the VolumeSnapshot at creation time since the driver is missing',
+      'The VolumeSnapshot object exists and is accepted, but no real snapshot is ever taken -- nothing enforces that a working driver backs the referenced VolumeSnapshotClass',
+      'Kubernetes automatically installs the missing CSI driver',
+      'The snapshot is taken using the default StorageClass\'s provisioner instead',
+    ],
+    answer: 1,
+    explain: 'The VolumeSnapshot/VolumeSnapshotClass API objects are driver-agnostic and validate only their own schema -- whether anything real happens is entirely up to a working CSI driver being installed, which the API itself cannot verify.',
   },
 ];
 

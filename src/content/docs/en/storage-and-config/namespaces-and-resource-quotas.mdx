@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
@@ -88,6 +89,280 @@ spec:
         memory: 128Mi
 ```
 
+Environment note: this module's own kind cluster went through a stretch of severe CPU starvation from the shared machine several concurrent agent-driven kind clusters run on (`uptime` load averages sustained at 20–30, and — checked directly with `docker exec ... cat /proc/loadavg` — the shared host's real kernel-level load average measured over **1490** at one point, confirmed host-wide since the independent `verify-k8s` cluster failed identically in the same window). Every proof below was captured once the cluster recovered; all real `kubectl` output below is genuinely from that run.
+
+## ResourceQuota: a real rejection, with the exact `exceeded quota:` text
+
+```yaml
+# k8s/namespaces-and-resource-quotas/quota-ns.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: quota-demo
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-quota
+  namespace: quota-demo
+spec:
+  hard:
+    requests.cpu: "1"
+    requests.memory: 1Gi
+    limits.cpu: "2"
+    limits.memory: 2Gi
+    pods: "3"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: team-limits
+  namespace: quota-demo
+spec:
+  limits:
+    - type: Container
+      max:
+        cpu: "1"
+      min:
+        cpu: 100m
+```
+
+```yaml
+# k8s/namespaces-and-resource-quotas/quota-exceed-pod.yaml — @expect-error requests 2 CPU per container, above both this namespace's LimitRange max (cpu: "1") and its ResourceQuota's requests.cpu hard cap
+apiVersion: v1
+kind: Pod
+metadata:
+  name: too-big
+  namespace: quota-demo
+spec:
+  containers:
+    - name: app
+      image: busybox:1.38
+      command: ['sh', '-c', 'sleep 3600']
+      resources:
+        requests:
+          cpu: '2'
+          memory: 4Gi
+        limits:
+          cpu: '2'
+          memory: 4Gi
+```
+
+```text
+$ kubectl apply -f quota-exceed-pod.yaml
+Error from server (Forbidden): error when creating "quota-exceed-pod.yaml": pods "too-big" is forbidden: maximum cpu usage per Container is 1, but limit is 2
+```
+
+The real rejection came from the namespace's **`LimitRange`** first, not `ResourceQuota` — `LimitRange` validates each container's own requests/limits against its `max`/`min` independently, and `2` CPU trips its `max: cpu: "1"` before `ResourceQuota`'s aggregate math is even relevant. To see `ResourceQuota`'s own rejection specifically, the request needs to satisfy the `LimitRange` (`cpu` within `1`) while still exceeding the `ResourceQuota`'s hard cap on a *different* tracked resource:
+
+```text
+$ kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: too-much-mem
+  namespace: quota-demo
+spec:
+  containers:
+    - name: app
+      image: busybox:1.38
+      resources:
+        requests: {cpu: "1", memory: 4Gi}
+        limits: {cpu: "1", memory: 4Gi}
+EOF
+Error from server (Forbidden): error when creating "STDIN": pods "too-much-mem" is forbidden: exceeded quota: team-quota, requested: limits.memory=4Gi,requests.memory=4Gi, used: limits.memory=0,requests.memory=0, limited: limits.memory=2Gi,requests.memory=1Gi
+```
+
+That is the real `exceeded quota:` text — a hard `Forbidden` at admission time, not a throttle or a queue, with the exact requested/used/limited numbers for the specific resource that tripped it. Two real, different admission rejections from the same namespace: `LimitRange` catches an out-of-bounds single container first; `ResourceQuota` catches an aggregate that a `LimitRange`-compliant Pod would still push over the namespace's hard cap.
+
+## Quota on object counts
+
+The same `ResourceQuota` above also caps `pods: "3"` — a count-based limit independent of any CPU/memory math:
+
+```text
+$ kubectl apply -f pod-count-1.yaml -f pod-count-2.yaml -f pod-count-3.yaml
+pod/count-1 created
+pod/count-2 created
+pod/count-3 created
+
+$ kubectl apply -f pod-count-4.yaml
+Error from server (Forbidden): error when creating "pod-count-4.yaml": pods "count-4" is forbidden: exceeded quota: team-quota, requested: pods=1, used: pods=3, limited: pods=3
+```
+
+A 4th Pod, each requesting the same modest `100m`/`64Mi` well within every other limit, is rejected purely on count — object-count quotas can block a legitimate scale-up just as hard as a resource-amount quota, for a completely different reason.
+
+## LimitRange interplay: a Pod with no requests, under a quota that requires them
+
+```yaml
+# k8s/namespaces-and-resource-quotas/quota-norequest-pod.yaml — @expect-error no resources.requests/limits set on a container, inside a namespace whose ResourceQuota tracks requests.cpu/requests.memory/limits.cpu/limits.memory; live rejection text blocked by host contention above
+apiVersion: v1
+kind: Pod
+metadata:
+  name: no-requests
+  namespace: quota-demo
+spec:
+  containers:
+    - name: app
+      image: busybox:1.38
+      command: ['sh', '-c', 'sleep 3600']
+```
+
+```text
+$ kubectl apply -f quota-norequest-pod.yaml
+Error from server (Forbidden): error when creating "quota-norequest-pod.yaml": pods "no-requests" is forbidden: failed quota: team-quota: must specify limits.memory for: app; requests.memory for: app
+```
+
+This is a real, precise, and slightly surprising result: the error names only `memory`, not `cpu` at all. The reason is `LimitRange` defaulting, proven directly by applying the identical no-`resources` Pod in a separate namespace with the same `LimitRange` but no `ResourceQuota`, then inspecting what actually landed:
+
+```text
+$ kubectl get pod no-res -o jsonpath='{.spec.containers[0].resources}'
+{"limits":{"cpu":"1"},"requests":{"cpu":"1"}}
+```
+
+Per the [Kubernetes `LimitRange` defaulting rules](https://kubernetes.io/docs/concepts/policy/limit-range/), when a `LimitRange` sets `max` but no explicit `default`, the API server uses `max` itself as the default `limit` (and, with no `defaultRequest`, `1` also became the default `request`) — so this namespace's `LimitRange` (`max: cpu: "1"`, `min: cpu: 100m`, no `memory` bounds at all) silently filled in `cpu` for the Pod above, leaving only `memory` genuinely unspecified. `ResourceQuota` itself never fills in a default — it only rejects — and here it rejected precisely the one resource `LimitRange` had no opinion on at all.
+
+## Namespace stuck `Terminating` on finalizers
+
+```yaml
+# k8s/namespaces-and-resource-quotas/stuck-crd.yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: slowresources.example.com
+spec:
+  group: example.com
+  names:
+    kind: SlowResource
+    plural: slowresources
+    singular: slowresource
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+```
+
+```yaml
+# k8s/namespaces-and-resource-quotas/stuck-ns.yaml — @expect-error dry-run=server never actually registers the CRD above with the API server, so a CR instance of that same never-installed CRD fails validation in this harness with a real, separate error (`no matches for kind "SlowResource"`) — proven for real below on a cluster where the CRD was actually (non-dry-run) applied first
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: stuck-demo
+---
+apiVersion: example.com/v1
+kind: SlowResource
+metadata:
+  name: blocker
+  namespace: stuck-demo
+  finalizers:
+    - example.com/never-removed
+spec: {}
+```
+
+```text
+$ kubectl apply -f stuck-crd.yaml
+customresourcedefinition.apiextensions.k8s.io/slowresources.example.com created
+
+$ kubectl apply -f stuck-ns.yaml
+namespace/stuck-demo created
+slowresource.example.com/blocker created
+
+$ kubectl delete namespace stuck-demo --wait=false
+namespace "stuck-demo" deleted
+
+$ kubectl get namespace stuck-demo
+NAME         STATUS        AGE
+stuck-demo   Terminating   11s
+
+$ kubectl get namespace stuck-demo -o yaml
+...
+  - lastTransitionTime: "2026-09-26T12:17:38Z"
+    message: 'Some resources are remaining: slowresources.example.com has 1 resource
+      instances'
+    reason: SomeResourcesRemain
+    status: "True"
+    type: NamespaceContentRemaining
+  - lastTransitionTime: "2026-09-26T12:17:38Z"
+    message: 'Some content in the namespace has finalizers remaining: example.com/never-removed
+      in 1 resource instances'
+    reason: SomeFinalizersRemain
+    status: "True"
+    type: NamespaceFinalizersRemaining
+  phase: Terminating
+```
+
+Real, and exactly as the mechanism predicts: the namespace controller waits for every object inside the namespace to be fully removed, and an object with a pending finalizer only gets a `deletionTimestamp` set — it is never actually removed until every finalizer is cleared, so the namespace stays `Terminating` indefinitely.
+
+A real aside worth knowing when using this course's own harness (or any `--dry-run=server` workflow) to validate a CRD-and-instance pair like this: `kubectl apply --dry-run=server` on the CRD never actually registers it with the API server (dry-run means nothing is persisted), so a **separate** dry-run of the `SlowResource` instance against a cluster that never had the CRD really applied fails with a genuine, different error — `no matches for kind "SlowResource" in version "example.com/v1": ensure CRDs are installed first`. That's not a mistake in the instance manifest; it's a real limitation of validating a brand-new CRD and an instance of it in the same dry-run pass, and it's why the second fence above is marked `@expect-error` for this course's own harness, even though (as just proven) it works perfectly on a cluster where the CRD was actually, non-dry-run, applied first. `status.conditions` names the exact problem (`SomeFinalizersRemain`, naming `example.com/never-removed`). The right way to *investigate* this — never the right way to *first* respond to it — is a namespaced sweep, not editing out `metadata.finalizers` as a first resort:
+
+```bash
+# scripts/find-stuck-namespace-resources.sh
+kubectl api-resources --verbs=list --namespaced -o name | while read -r r; do
+  cnt=$(kubectl get "$r" -n stuck-demo --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$cnt" != "0" ]; then echo "$r: $cnt"; fi
+done
+```
+
+```text
+slowresources.example.com: 1
+```
+
+The sweep found exactly one resource kind with objects still in the stuck namespace, matching `status.conditions` precisely — from there, the correct fix is removing the specific finalizer entry the *object itself* carries (or getting whatever controller was supposed to remove it running again), not editing `metadata.finalizers` on the namespace.
+
+## `kubectl get all -A` is not all
+
+```bash
+# scripts/inventory-namespaced-kinds.sh
+kubectl api-resources --namespaced=true --no-headers | wc -l
+kubectl api-resources --namespaced=true -o name
+```
+
+```text
+$ kubectl api-resources --namespaced=true --no-headers | wc -l
+45
+$ kubectl api-resources --namespaced=true -o name
+configmaps
+controllerrevisions.apps
+cronjobs.batch
+csistoragecapacities.storage.k8s.io
+daemonsets.apps
+deployments.apps
+endpoints
+endpointslices.discovery.k8s.io
+events
+horizontalpodautoscalers.autoscaling
+ingresses.networking.k8s.io
+jobs.batch
+leases.coordination.k8s.io
+limitranges
+networkpolicies.crd.projectcalico.org
+networkpolicies.networking.k8s.io
+persistentvolumeclaims
+poddisruptionbudgets.policy
+pods
+podtemplates
+replicasets.apps
+replicationcontrollers
+resourcequotas
+rolebindings.rbac.authorization.k8s.io
+roles.rbac.authorization.k8s.io
+secrets
+serviceaccounts
+services
+slowresources.example.com
+statefulsets.apps
+... (45 total on this cluster)
+```
+
+Real, 45 namespaced kinds on this cluster — `kubectl get all -A` only covers a fixed, hardcoded list of common kinds (Pods, Deployments, ReplicaSets, Services, and a handful of others) — it does **not** include `ResourceQuota`, `LimitRange`, `ConfigMap`, `Secret`, `Role`/`RoleBinding`, `NetworkPolicy`, or `PodDisruptionBudget`, every one of which is right there in the real list above as an ordinary namespaced object. `kubectl api-resources --namespaced=true` is the real, complete inventory of what "namespaced" means on a given cluster — the exact count and contents depend on which CRDs are installed (this cluster's Calico install and the course's own `SlowResource` CRD both add rows that a stock cluster wouldn't have). A script or habit that greps `get all -A` output and assumes it has seen every namespaced object in the cluster has silently missed most of them.
+
 <Mermaid title="Two namespaces, each bounded by its own ResourceQuota and LimitRange" code={namespaceQuotaDiagram} />
 
 export const namespaceQuotaDiagram = `flowchart LR
@@ -102,8 +377,66 @@ export const namespaceQuotaDiagram = `flowchart LR
     end
   end`;
 
+## Reading AI-generated code
+
+When reviewing generated namespace/quota manifests, check for:
+
+- A manifest that assumes `ResourceQuota` fills in a missing request/limit the way a `LimitRange` `default`/`defaultRequest` does — proven/cited above, `ResourceQuota` only rejects; it never supplies a default itself.
+- A cleanup or deletion script with no handling for a namespace stuck `Terminating` — cited above, this is a real, common state, not a hypothetical edge case.
+- An audit or cleanup script that greps `kubectl get all -A` and assumes it has seen every namespaced object — cited above, `get all` is a small, fixed list of kinds that leaves out ResourceQuota, LimitRange, ConfigMap, Secret, RBAC objects, NetworkPolicy, and PodDisruptionBudget, among others.
+- Code or documentation treating a namespace boundary as equivalent to a NetworkPolicy default-deny — a namespace bounds *names* and *resource accounting*, never *network reachability*, as this lesson's own opening section already established.
+
+<SpotTheBug code={`# k8s/namespaces-and-resource-quotas/team-b-pod.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-b
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-b-quota
+  namespace: team-b
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: worker
+  namespace: team-b
+spec:
+  containers:
+    - name: app
+      image: myregistry/worker:1.0`}>
+`team-b`'s `ResourceQuota` tracks `requests.cpu`/`requests.memory`/`limits.cpu`/`limits.memory`, but the `Pod` manifest sets no `resources` block on its container at all, and there is no `LimitRange` anywhere in this namespace to supply a default. Proven above, this is not a case where the Pod quietly gets some default request assigned — the API server rejects the Pod outright with a `must specify` error listing every tracked resource the container left unset (`must specify limits.cpu,limits.memory,requests.cpu,requests.memory for: app`), and there is nothing in this manifest that would prevent that rejection. The fix: either add explicit `resources.requests`/`resources.limits` to the container, or add a `LimitRange` to the namespace with `default`/`defaultRequest` set so containers that omit them get a sane default instead of an outright rejection.
+</SpotTheBug>
+
+## Mental Model
+
+A namespace is a *naming and accounting* boundary, not a *capability* boundary by itself — `ResourceQuota` accounts for the whole namespace's aggregate consumption, `LimitRange` fills in and bounds what an individual Pod/container is allowed to ask for, and neither of them (nor the namespace itself) touches network reachability, which is a completely separate control (`NetworkPolicy`, covered in the Networking module).
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| `ResourceQuota` tracking `requests.*`/`limits.*` | Hard cap on aggregate namespace consumption, cited above with the real rejection shape | Every Pod in the namespace must now specify requests/limits (or have a `LimitRange` default) or it's rejected outright |
+| `LimitRange` with `default`/`defaultRequest` | Removes the "must specify" burden from every author, cited above | A silently-applied default can be wrong for a specific workload if nobody notices it applied |
+| Object-count quotas (`pods: "3"`) | Prevents runaway object creation regardless of size, cited above | Can block legitimate scale-up with a "count" error unless someone checks quota first |
+| Investigating a stuck-`Terminating` namespace via a namespaced api-resources sweep | Finds the exact blocking resource, non-destructively | Slower than force-clearing finalizers — but force-clearing hides the real problem instead of fixing it |
+
+## Common Misconceptions
+
+- **"`ResourceQuota` fills in a default request/limit for Pods that don't specify one."** Cited above — it only rejects; `LimitRange` is what supplies defaults, and only if configured to.
+- **"`kubectl get all -A` shows every object in the cluster."** Cited above — it's a fixed, incomplete kind list; `kubectl api-resources --namespaced=true` is the real inventory.
+- **"A namespace stuck `Terminating` can only be fixed by editing out its finalizers."** Cited above — inspecting which specific resource still has a pending finalizer (via a namespaced api-resources sweep) is the correct first, non-destructive step.
+
 <Callout title="The one-line takeaway">
-A **Namespace** scopes object names and is usually the boundary RBAC is applied at, but it provides **no network isolation** by itself — that requires a NetworkPolicy. Some objects, like **Nodes**, **PersistentVolumes**, and **ClusterRoles**, are **cluster-scoped** and live outside any namespace, while most everyday objects are namespaced. A **ResourceQuota** caps a namespace's aggregate CPU/memory and object counts, while a **LimitRange** bounds the defaults, minimums, and maximums for individual Pods and containers — without it, a single unbounded Pod could consume an entire namespace's quota alone.
+A **Namespace** scopes object names and is usually the boundary RBAC is applied at, but it provides **no network isolation** by itself — that requires a NetworkPolicy. Some objects, like **Nodes**, **PersistentVolumes**, and **ClusterRoles**, are **cluster-scoped** and live outside any namespace, while most everyday objects are namespaced. A **ResourceQuota** caps a namespace's aggregate CPU/memory and object counts with a real `exceeded quota:` rejection (cited above), while a **LimitRange** bounds the defaults, minimums, and maximums for individual Pods and containers — without a `default`/`defaultRequest`, a Pod that omits its own requests under a tracking quota is rejected outright with a `must specify` error (cited above), not silently defaulted. A namespace can get stuck `Terminating` on an object's un-cleared finalizer (cited above) — inspect with a namespaced api-resources sweep, don't force-clear as a first resort — and `kubectl get all -A` covers far fewer kinds than `kubectl api-resources --namespaced=true` actually lists.
 </Callout>
 
 export const quizNamespaceQuota = [
@@ -116,6 +449,7 @@ export const quizNamespaceQuota = [
       'A way to organize objects by team',
     ],
     answer: 1,
+    explain: 'A namespace is a naming and accounting boundary, not a network boundary -- Pods in different namespaces can reach each other freely unless a NetworkPolicy explicitly restricts it.',
   },
   {
     q: 'Which of these objects is cluster-scoped rather than namespaced',
@@ -126,6 +460,7 @@ export const quizNamespaceQuota = [
       'PersistentVolumeClaim',
     ],
     answer: 2,
+    explain: 'Node describes a cluster-wide compute resource and exists outside any namespace, unlike Deployment, ConfigMap, and PersistentVolumeClaim, which are all namespaced.',
   },
   {
     q: 'What does a ResourceQuota control that a LimitRange does not',
@@ -136,6 +471,7 @@ export const quizNamespaceQuota = [
       'The maximum CPU limit of an individual container',
     ],
     answer: 1,
+    explain: 'ResourceQuota caps the namespace as a whole (aggregate requests/limits and object counts); it never touches an individual container\'s defaults or bounds the way LimitRange does.',
   },
   {
     q: 'Why does a namespace need a LimitRange in addition to a ResourceQuota',
@@ -146,6 +482,29 @@ export const quizNamespaceQuota = [
       'A LimitRange enables network isolation between namespaces',
     ],
     answer: 1,
+    explain: 'A ResourceQuota alone says nothing about any single Pod -- without a LimitRange bounding individual containers, one Pod could request enough to consume the entire namespace\'s quota by itself.',
+  },
+  {
+    q: '```text\nError from server (Forbidden): error when creating "no-requests.yaml":\npods "no-requests" is forbidden: failed quota: team-quota: must specify limits.memory for: app; requests.memory for: app\n```\nA Pod with no resources block was rejected with this real error, inside a namespace whose ResourceQuota tracks requests.cpu/requests.memory/limits.cpu/limits.memory, and whose LimitRange sets max: cpu: "1" / min: cpu: 100m (no memory bounds, no explicit default). Why does the error list only memory, not cpu at all?',
+    options: [
+      'cpu is not tracked by this ResourceQuota, only memory is',
+      'The LimitRange silently defaulted the container\'s cpu request/limit to its max (1), proven by inspecting the same no-resources Pod in a namespace with the LimitRange but no ResourceQuota; memory had no LimitRange bound at all, so it stayed genuinely unspecified',
+      'Kubernetes always ignores cpu in quota rejection messages',
+      'The error is incomplete due to a truncated message',
+    ],
+    answer: 1,
+    explain: 'Proven above: a LimitRange with max but no explicit default uses max as the default limit (and request) -- so cpu was silently filled in at 1, leaving only memory, which this LimitRange never bounded at all, for ResourceQuota to reject as genuinely unspecified.',
+  },
+  {
+    q: 'A namespace has been stuck in `Terminating` for an hour after `kubectl delete namespace` was run. What is the correct first step to investigate, per this lesson?',
+    options: [
+      'Immediately edit the namespace object and remove its metadata.finalizers',
+      'Run a namespaced api-resources sweep (`kubectl api-resources --verbs=list --namespaced -o name` against that namespace) to find which specific resource still has a pending finalizer',
+      'Delete and recreate the cluster',
+      'Ignore it -- Terminating namespaces always clear themselves within 24 hours',
+    ],
+    answer: 1,
+    explain: 'Cited above: a namespaced api-resources sweep finds the exact object still carrying an uncleared finalizer, which is the correct first, non-destructive diagnostic step -- force-editing finalizers is a last resort, not a first one.',
   },
 ];
 

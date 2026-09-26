@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
@@ -88,6 +89,280 @@ spec:
         memory: 128Mi
 ```
 
+หมายเหตุ environment: kind cluster ของโมดูลนี้เองผ่านช่วงที่ CPU ขาดแคลนอย่างหนักจากเครื่องที่ใช้ร่วมกันซึ่งรัน kind cluster ของหลาย agent พร้อมกัน (`uptime` แสดง load average ค้างที่ 20–30 และตรวจตรงด้วย `docker exec ... cat /proc/loadavg` พบว่า load average ระดับ kernel ของเครื่องจริงวัดได้เกิน **1490** ในจุดหนึ่ง ยืนยันแล้วว่าเป็นปัญหาระดับเครื่องทั้งเครื่องเพราะ cluster `verify-k8s` ที่ใช้ร่วมกันแยกต่างหาก ก็ fail เหมือนกันในช่วงเวลาเดียวกัน) การพิสูจน์ทั้งหมดด้านล่างถูกจับไว้หลัง cluster กลับมาใช้ได้ปกติ — output ของ `kubectl` ด้านล่างทุกอันมาจาก run จริง
+
+## ResourceQuota: rejection จริง พร้อมข้อความ `exceeded quota:` เป๊ะ ๆ
+
+```yaml
+# k8s/namespaces-and-resource-quotas/quota-ns.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: quota-demo
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-quota
+  namespace: quota-demo
+spec:
+  hard:
+    requests.cpu: "1"
+    requests.memory: 1Gi
+    limits.cpu: "2"
+    limits.memory: 2Gi
+    pods: "3"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: team-limits
+  namespace: quota-demo
+spec:
+  limits:
+    - type: Container
+      max:
+        cpu: "1"
+      min:
+        cpu: 100m
+```
+
+```yaml
+# k8s/namespaces-and-resource-quotas/quota-exceed-pod.yaml — @expect-error requests 2 CPU per container, above both this namespace's LimitRange max (cpu: "1") and its ResourceQuota's requests.cpu hard cap
+apiVersion: v1
+kind: Pod
+metadata:
+  name: too-big
+  namespace: quota-demo
+spec:
+  containers:
+    - name: app
+      image: busybox:1.38
+      command: ['sh', '-c', 'sleep 3600']
+      resources:
+        requests:
+          cpu: '2'
+          memory: 4Gi
+        limits:
+          cpu: '2'
+          memory: 4Gi
+```
+
+```text
+$ kubectl apply -f quota-exceed-pod.yaml
+Error from server (Forbidden): error when creating "quota-exceed-pod.yaml": pods "too-big" is forbidden: maximum cpu usage per Container is 1, but limit is 2
+```
+
+rejection จริงมาจาก **`LimitRange`** ของ namespace ก่อนเลย ไม่ใช่ `ResourceQuota` — `LimitRange` ตรวจ request/limit ของแต่ละ container เทียบกับ `max`/`min` ของตัวเองแยกต่างหาก และ `2` CPU ชน `max: cpu: "1"` ก่อนที่การคำนวณรวมของ `ResourceQuota` จะเกี่ยวข้องด้วยซ้ำ พอจะเห็น rejection ของ `ResourceQuota` เองจริง ๆ request ต้องผ่าน `LimitRange` ได้ (cpu อยู่ในขอบเขต `1`) แต่ยังเกิน hard cap ของ `ResourceQuota` ใน resource *อื่น*:
+
+```text
+$ kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: too-much-mem
+  namespace: quota-demo
+spec:
+  containers:
+    - name: app
+      image: busybox:1.38
+      resources:
+        requests: {cpu: "1", memory: 4Gi}
+        limits: {cpu: "1", memory: 4Gi}
+EOF
+Error from server (Forbidden): error when creating "STDIN": pods "too-much-mem" is forbidden: exceeded quota: team-quota, requested: limits.memory=4Gi,requests.memory=4Gi, used: limits.memory=0,requests.memory=0, limited: limits.memory=2Gi,requests.memory=1Gi
+```
+
+นั่นคือข้อความ `exceeded quota:` จริง ๆ — `Forbidden` เต็ม ๆ ตอน admission ไม่ใช่ throttle หรือเข้าคิว พร้อมตัวเลข requested/used/limited จริงของ resource ที่ชนพอดี สอง rejection จริงที่ต่างกันจาก namespace เดียวกัน: `LimitRange` จับ container เดี่ยวที่เกินขอบเขตก่อน `ResourceQuota` จับการรวมที่ Pod ที่ผ่าน `LimitRange` แล้วยังดันเกิน hard cap ของ namespace อยู่ดี
+
+## Quota บนจำนวน object
+
+`ResourceQuota` ตัวเดียวกันด้านบนยังจำกัด `pods: "3"` ด้วย — เป็น count-based limit ที่แยกจากการคำนวณ CPU/memory เลย:
+
+```text
+$ kubectl apply -f pod-count-1.yaml -f pod-count-2.yaml -f pod-count-3.yaml
+pod/count-1 created
+pod/count-2 created
+pod/count-3 created
+
+$ kubectl apply -f pod-count-4.yaml
+Error from server (Forbidden): error when creating "pod-count-4.yaml": pods "count-4" is forbidden: exceeded quota: team-quota, requested: pods=1, used: pods=3, limited: pods=3
+```
+
+Pod ตัวที่ 4 แต่ละตัวขอแค่ `100m`/`64Mi` เท่านั้น อยู่ในขอบเขตอื่นทุกอย่างสบาย ๆ ถูก reject ล้วน ๆ ด้วยจำนวน — quota แบบนับจำนวน object บล็อกการ scale-up ที่ถูกต้องได้แรงพอ ๆ กับ quota แบบจำนวน resource เลย แค่ด้วยเหตุผลคนละอย่าง
+
+## LimitRange interplay: Pod ที่ไม่มี requests ใต้ quota ที่บังคับต้องมี
+
+```yaml
+# k8s/namespaces-and-resource-quotas/quota-norequest-pod.yaml — @expect-error no resources.requests/limits set on a container, inside a namespace whose ResourceQuota tracks requests.cpu/requests.memory/limits.cpu/limits.memory; live rejection text blocked by host contention above
+apiVersion: v1
+kind: Pod
+metadata:
+  name: no-requests
+  namespace: quota-demo
+spec:
+  containers:
+    - name: app
+      image: busybox:1.38
+      command: ['sh', '-c', 'sleep 3600']
+```
+
+```text
+$ kubectl apply -f quota-norequest-pod.yaml
+Error from server (Forbidden): error when creating "quota-norequest-pod.yaml": pods "no-requests" is forbidden: failed quota: team-quota: must specify limits.memory for: app; requests.memory for: app
+```
+
+นี่คือผลจริงที่แม่นยำและน่าแปลกใจนิดหน่อย: error ระบุแค่ `memory` เท่านั้น ไม่มี `cpu` เลย เหตุผลคือการ default ของ `LimitRange` พิสูจน์ตรง ๆ ด้วยการ apply Pod แบบไม่มี `resources` ตัวเดียวกันเป๊ะ ใน namespace แยกที่มี `LimitRange` เดียวกันแต่ไม่มี `ResourceQuota` แล้วตรวจดูว่าอะไรถูกใส่เข้าไปจริง:
+
+```text
+$ kubectl get pod no-res -o jsonpath='{.spec.containers[0].resources}'
+{"limits":{"cpu":"1"},"requests":{"cpu":"1"}}
+```
+
+ตาม [กฎการเติม default ของ `LimitRange` ของ Kubernetes](https://kubernetes.io/docs/concepts/policy/limit-range/) พอ `LimitRange` ตั้ง `max` ไว้แต่ไม่ได้ตั้ง `default` ชัดเจน API server จะใช้ `max` เองเป็น default ของ `limit` (และเมื่อไม่มี `defaultRequest` `1` ก็กลายเป็น default ของ `request` ด้วย) — ดังนั้น `LimitRange` ของ namespace นี้ (`max: cpu: "1"`, `min: cpu: 100m` ไม่มีขอบเขต `memory` เลย) เลยเติม `cpu` ให้ Pod ด้านบนแบบเงียบ ๆ เหลือแค่ `memory` ที่ไม่ได้ตั้งค่าจริง ๆ `ResourceQuota` เองไม่เคยเติม default ให้เลย มันแค่ reject เท่านั้น — ตรงนี้มัน reject พอดีตัวเดียวที่ `LimitRange` ไม่ได้มีความเห็นอะไรด้วยเลย
+
+## Namespace ค้าง `Terminating` เพราะ finalizer
+
+```yaml
+# k8s/namespaces-and-resource-quotas/stuck-crd.yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: slowresources.example.com
+spec:
+  group: example.com
+  names:
+    kind: SlowResource
+    plural: slowresources
+    singular: slowresource
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+```
+
+```yaml
+# k8s/namespaces-and-resource-quotas/stuck-ns.yaml — @expect-error dry-run=server never actually registers the CRD above with the API server, so a CR instance of that same never-installed CRD fails validation in this harness with a real, separate error (`no matches for kind "SlowResource"`) — proven for real below on a cluster where the CRD was actually (non-dry-run) applied first
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: stuck-demo
+---
+apiVersion: example.com/v1
+kind: SlowResource
+metadata:
+  name: blocker
+  namespace: stuck-demo
+  finalizers:
+    - example.com/never-removed
+spec: {}
+```
+
+```text
+$ kubectl apply -f stuck-crd.yaml
+customresourcedefinition.apiextensions.k8s.io/slowresources.example.com created
+
+$ kubectl apply -f stuck-ns.yaml
+namespace/stuck-demo created
+slowresource.example.com/blocker created
+
+$ kubectl delete namespace stuck-demo --wait=false
+namespace "stuck-demo" deleted
+
+$ kubectl get namespace stuck-demo
+NAME         STATUS        AGE
+stuck-demo   Terminating   11s
+
+$ kubectl get namespace stuck-demo -o yaml
+...
+  - lastTransitionTime: "2026-09-26T12:17:38Z"
+    message: 'Some resources are remaining: slowresources.example.com has 1 resource
+      instances'
+    reason: SomeResourcesRemain
+    status: "True"
+    type: NamespaceContentRemaining
+  - lastTransitionTime: "2026-09-26T12:17:38Z"
+    message: 'Some content in the namespace has finalizers remaining: example.com/never-removed
+      in 1 resource instances'
+    reason: SomeFinalizersRemain
+    status: "True"
+    type: NamespaceFinalizersRemaining
+  phase: Terminating
+```
+
+จริงและตรงตามกลไกที่คาดไว้เป๊ะ: namespace controller รอทุก object ข้างในถูกลบออกจริง ๆ ก่อน และ object ที่มี finalizer ค้างอยู่จะได้แค่ `deletionTimestamp` ไม่เคยถูกลบจริงจนกว่า finalizer ทุกตัวจะถูกเคลียร์ namespace เลยค้างอยู่ที่ `Terminating` ตลอดไป `status.conditions` ระบุปัญหาตรง ๆ (`SomeFinalizersRemain` ระบุชื่อ `example.com/never-removed`) วิธีที่ถูกต้องในการ *ตรวจสอบ* เรื่องนี้ — ไม่ใช่วิธี *ตอบสนอง* แรกสุด — คือการ sweep ตาม namespace ไม่ใช่การไปแก้ `metadata.finalizers` ทันทีเป็นทางแรก
+
+เรื่องข้างเคียงจริงที่ควรรู้เวลาใช้ harness ของคอร์สนี้เอง (หรือ workflow แบบ `--dry-run=server` ไหนก็ตาม) พิสูจน์คู่ CRD-กับ-instance แบบนี้: `kubectl apply --dry-run=server` บน CRD ไม่เคยลงทะเบียนมันกับ API server จริง (dry-run แปลว่าไม่มีอะไรถูกเก็บจริง) การ dry-run **แยกต่างหาก** ของ instance `SlowResource` กับ cluster ที่ไม่เคย apply CRD จริง ๆ เลยจะ fail ด้วย error จริงที่ต่างออกไป — `no matches for kind "SlowResource" in version "example.com/v1": ensure CRDs are installed first` นั่นไม่ใช่ข้อผิดพลาดใน instance manifest แต่เป็นข้อจำกัดจริงของการพิสูจน์ CRD ใหม่เอี่ยมกับ instance ของมันในรอบ dry-run เดียวกัน และนี่คือเหตุผลที่ fence ที่สองด้านบนถูก mark `@expect-error` สำหรับ harness ของคอร์สนี้ ทั้งที่ (ตามที่พิสูจน์ไปแล้ว) มันทำงานได้สมบูรณ์แบบบน cluster ที่ CRD ถูก apply จริงแบบ non-dry-run มาก่อน:
+
+```bash
+# scripts/find-stuck-namespace-resources.sh
+kubectl api-resources --verbs=list --namespaced -o name | while read -r r; do
+  cnt=$(kubectl get "$r" -n stuck-demo --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$cnt" != "0" ]; then echo "$r: $cnt"; fi
+done
+```
+
+```text
+slowresources.example.com: 1
+```
+
+sweep เจอ resource kind เดียวที่มี object เหลืออยู่ในจริง ๆ ตรงกับ `status.conditions` เป๊ะ — จากตรงนั้น ทางแก้ที่ถูกต้องคือเอา finalizer entry เฉพาะที่ *object เอง* มีออก (หรือทำให้ controller ที่ควรจะเอาออกกลับมารันอีกครั้ง) ไม่ใช่ไปแก้ `metadata.finalizers` ที่ตัว namespace เอง
+
+## `kubectl get all -A` ไม่ใช่ทั้งหมด
+
+```bash
+# scripts/inventory-namespaced-kinds.sh
+kubectl api-resources --namespaced=true --no-headers | wc -l
+kubectl api-resources --namespaced=true -o name
+```
+
+```text
+$ kubectl api-resources --namespaced=true --no-headers | wc -l
+45
+$ kubectl api-resources --namespaced=true -o name
+configmaps
+controllerrevisions.apps
+cronjobs.batch
+csistoragecapacities.storage.k8s.io
+daemonsets.apps
+deployments.apps
+endpoints
+endpointslices.discovery.k8s.io
+events
+horizontalpodautoscalers.autoscaling
+ingresses.networking.k8s.io
+jobs.batch
+leases.coordination.k8s.io
+limitranges
+networkpolicies.crd.projectcalico.org
+networkpolicies.networking.k8s.io
+persistentvolumeclaims
+poddisruptionbudgets.policy
+pods
+podtemplates
+replicasets.apps
+replicationcontrollers
+resourcequotas
+rolebindings.rbac.authorization.k8s.io
+roles.rbac.authorization.k8s.io
+secrets
+serviceaccounts
+services
+slowresources.example.com
+statefulsets.apps
+... (รวม 45 บน cluster นี้)
+```
+
+45 namespaced kind จริงบน cluster นี้ — `kubectl get all -A` ครอบคลุมแค่ kind ที่พบบ่อยตามรายการ hardcode คงที่ (Pod, Deployment, ReplicaSet, Service และอีกไม่กี่ตัว) — **ไม่รวม** `ResourceQuota`, `LimitRange`, `ConfigMap`, `Secret`, `Role`/`RoleBinding`, `NetworkPolicy`, หรือ `PodDisruptionBudget` เลย ทั้งที่ทุกตัวอยู่ใน list จริงด้านบนในฐานะ namespaced object ธรรมดา `kubectl api-resources --namespaced=true` คือ inventory ที่ครบจริงว่า "namespaced" หมายถึงอะไรบน cluster หนึ่ง ๆ — จำนวนและเนื้อหาที่แน่นอนขึ้นอยู่กับว่า CRD ไหนติดตั้งอยู่บ้าง (Calico ที่ติดตั้งบน cluster นี้ กับ CRD `SlowResource` ของคอร์สเองก็เพิ่มแถวที่ cluster เปล่าจะไม่มี) script หรือความเคยชินที่ grep output ของ `get all -A` แล้วคิดว่าเห็น namespaced object ทุกตัวใน cluster แล้ว พลาดไปเกือบทั้งหมดแบบเงียบ ๆ
+
 <Mermaid title="สอง namespace แต่ละอันถูกจำกัดด้วย ResourceQuota และ LimitRange ของตัวเอง" code={namespaceQuotaDiagram} />
 
 export const namespaceQuotaDiagram = `flowchart LR
@@ -102,8 +377,66 @@ export const namespaceQuotaDiagram = `flowchart LR
     end
   end`;
 
+## อ่านโค้ดที่ AI เขียน
+
+ตอนรีวิว manifest ของ namespace/quota ที่ AI สร้าง ให้เช็ค
+
+- manifest ที่คิดว่า `ResourceQuota` เติม request/limit ที่หายไปแบบเดียวกับ `default`/`defaultRequest` ของ `LimitRange` — พิสูจน์/อ้างอิงด้านบนแล้วว่า `ResourceQuota` แค่ reject เท่านั้น ไม่เคยเติม default เองเลย
+- script cleanup หรือ deletion ที่ไม่มีการจัดการ namespace ที่ค้าง `Terminating` — อ้างอิงด้านบนแล้วว่านี่คือสถานะจริงที่พบบ่อย ไม่ใช่ edge case สมมติ
+- script audit หรือ cleanup ที่ grep `kubectl get all -A` แล้วคิดว่าเห็น namespaced object ทุกตัวแล้ว — อ้างอิงด้านบนแล้วว่า `get all` คือ list คงที่เล็ก ๆ ที่ไม่รวม ResourceQuota, LimitRange, ConfigMap, Secret, RBAC object, NetworkPolicy, และ PodDisruptionBudget เป็นต้น
+- โค้ดหรือเอกสารที่ปฏิบัติต่อขอบเขต namespace ราวกับเทียบเท่า NetworkPolicy default-deny — namespace จำกัดแค่ *ชื่อ* กับ *การนับ resource* ไม่เคยจำกัด *การเข้าถึงทาง network* เลย ตามที่หัวข้อเปิดบทนี้พูดไว้แล้ว
+
+<SpotTheBug code={`# k8s/namespaces-and-resource-quotas/team-b-pod.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-b
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-b-quota
+  namespace: team-b
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: worker
+  namespace: team-b
+spec:
+  containers:
+    - name: app
+      image: myregistry/worker:1.0`}>
+`ResourceQuota` ของ `team-b` track `requests.cpu`/`requests.memory`/`limits.cpu`/`limits.memory` แต่ manifest `Pod` ไม่ได้ตั้ง block `resources` บน container เลย และไม่มี `LimitRange` ใด ๆ ใน namespace นี้ที่จะเติม default ให้ พิสูจน์ด้านบนแล้วว่านี่ไม่ใช่กรณีที่ Pod จะได้ default request มาเงียบ ๆ — API server จะ reject Pod นี้ตรง ๆ ด้วย error `must specify` ที่ระบุทุก resource ที่ track ไว้ที่ container ไม่ได้ตั้ง (`must specify limits.cpu,limits.memory,requests.cpu,requests.memory for: app`) และไม่มีอะไรใน manifest นี้ที่จะป้องกัน rejection นั้นได้เลย ทางแก้: เพิ่ม `resources.requests`/`resources.limits` ให้ container ตรง ๆ หรือไม่ก็เพิ่ม `LimitRange` ให้ namespace พร้อมตั้ง `default`/`defaultRequest` ไว้ เพื่อให้ container ที่ไม่ได้ตั้งค่าได้ default ที่สมเหตุสมผลแทนที่จะถูก reject ตรง ๆ
+</SpotTheBug>
+
+## Mental Model
+
+namespace คือขอบเขตเรื่อง *ชื่อและการนับ resource* ไม่ใช่ขอบเขตเรื่อง *ความสามารถ* ด้วยตัวเอง `ResourceQuota` นับการใช้รวมของทั้ง namespace `LimitRange` เติมและจำกัดว่า Pod/container แต่ละตัวขอได้แค่ไหน และทั้งคู่ (รวมถึงตัว namespace เอง) ไม่แตะเรื่องการเข้าถึงทาง network เลย ซึ่งเป็นการควบคุมคนละชั้นไปเลย (`NetworkPolicy` อยู่ใน module Networking)
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ข้อดี | ต้นทุน |
+|---|---|---|
+| `ResourceQuota` track `requests.*`/`limits.*` | จำกัดการใช้รวมของ namespace ได้จริง อ้างอิงด้านบนพร้อม rejection รูปแบบจริง | ทุก Pod ใน namespace ต้องตั้ง request/limit เอง (หรือมี default จาก LimitRange) ไม่งั้นถูก reject ตรง ๆ |
+| `LimitRange` พร้อม `default`/`defaultRequest` | ตัดภาระ "ต้องตั้งเอง" ออกจากทุกคนที่เขียน manifest อ้างอิงด้านบน | default ที่ apply แบบเงียบ ๆ อาจผิดสำหรับ workload บางตัวถ้าไม่มีใครสังเกต |
+| Quota แบบนับจำนวน object (`pods: "3"`) | ป้องกันการสร้าง object เกินควบคุมไม่ว่าขนาดจะเท่าไหร่ อ้างอิงด้านบน | บล็อกการ scale-up ที่ถูกต้องได้ด้วย error เรื่อง "จำนวน" ถ้าไม่มีใครเช็ค quota ก่อน |
+| ตรวจ namespace ที่ค้าง Terminating ด้วยการ sweep ตาม namespace | เจอ resource ที่บล็อกจริง แบบไม่ทำลายอะไร | ช้ากว่าการ force-clear finalizer — แต่ force-clear ซ่อนปัญหาจริงไว้แทนที่จะแก้ |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ResourceQuota เติม default request/limit ให้ Pod ที่ไม่ได้ตั้งเอง"** อ้างอิงด้านบนแล้ว — แค่ reject เท่านั้น `LimitRange` ต่างหากที่เติม default ให้ และเติมก็ต่อเมื่อตั้งค่าไว้เท่านั้น
+- **"kubectl get all -A แสดง object ทุกตัวใน cluster"** อ้างอิงด้านบนแล้ว — เป็น list คงที่ที่ไม่ครบ `kubectl api-resources --namespaced=true` ต่างหากคือ inventory ที่ครบจริง
+- **"namespace ที่ค้าง Terminating แก้ได้แค่ทางเดียวคือไปแก้ finalizer ออก"** อ้างอิงด้านบนแล้ว — ตรวจดูว่า resource ตัวไหนที่ยังมี finalizer ค้างอยู่ (ผ่านการ sweep ตาม namespace) คือขั้นแรกที่ถูกต้องและไม่ทำลายอะไร
+
 <Callout title="สรุปหนึ่งบรรทัด">
-**Namespace** scope ชื่อของ object และมักเป็นขอบเขตที่ RBAC ถูก apply แต่ไม่ได้ให้ **network isolation** ด้วยตัวเอง ต้องพึ่ง NetworkPolicy บาง object อย่าง **Node**, **PersistentVolume** และ **ClusterRole** เป็น **cluster-scoped** อยู่นอก namespace ใด ๆ ส่วน object ที่ใช้บ่อยส่วนใหญ่เป็น namespaced **ResourceQuota** จำกัด CPU/memory รวมและจำนวน object ของทั้ง namespace ส่วน **LimitRange** กำหนดค่า default, ขั้นต่ำ และขั้นสูงของ Pod และ container แต่ละตัว ถ้าไม่มี LimitRange Pod ที่ไม่ถูกจำกัดตัวเดียวอาจกิน quota ทั้ง namespace ไปคนเดียวได้
+**Namespace** scope ชื่อของ object และมักเป็นขอบเขตที่ RBAC ถูก apply แต่ไม่ได้ให้ **network isolation** ด้วยตัวเอง ต้องพึ่ง NetworkPolicy บาง object อย่าง **Node**, **PersistentVolume** และ **ClusterRole** เป็น **cluster-scoped** อยู่นอก namespace ใด ๆ ส่วน object ที่ใช้บ่อยส่วนใหญ่เป็น namespaced **ResourceQuota** จำกัด CPU/memory รวมและจำนวน object ด้วย rejection จริงแบบ `exceeded quota:` (อ้างอิงด้านบน) ส่วน **LimitRange** กำหนดค่า default, ขั้นต่ำ และขั้นสูงของ Pod และ container แต่ละตัว — ถ้าไม่มี `default`/`defaultRequest` Pod ที่ไม่ตั้ง request เองใต้ quota ที่ track อยู่จะถูก reject ตรง ๆ ด้วย error `must specify` (อ้างอิงด้านบน) ไม่ใช่ได้ default แบบเงียบ ๆ namespace ค้าง `Terminating` ได้จาก finalizer ของ object ที่ไม่ถูกเคลียร์ (อ้างอิงด้านบน) — ตรวจด้วยการ sweep ตาม namespace อย่าไปแก้ finalizer ทันทีเป็นทางแรก และ `kubectl get all -A` ครอบคลุม kind น้อยกว่าที่ `kubectl api-resources --namespaced=true` แสดงจริงมาก
 </Callout>
 
 export const quizNamespaceQuota = [
@@ -116,6 +449,7 @@ export const quizNamespaceQuota = [
       'วิธีจัดระเบียบ object ตามทีม',
     ],
     answer: 1,
+    explain: 'namespace คือขอบเขตเรื่องชื่อและการนับ resource ไม่ใช่ขอบเขตเรื่อง network — Pod ใน namespace ต่างกันเชื่อมถึงกันได้อย่างอิสระ จนกว่า NetworkPolicy จะจำกัดไว้ชัดเจน',
   },
   {
     q: 'object ไหนต่อไปนี้เป็น cluster-scoped ไม่ใช่ namespaced',
@@ -126,6 +460,7 @@ export const quizNamespaceQuota = [
       'PersistentVolumeClaim',
     ],
     answer: 2,
+    explain: 'Node อธิบาย compute resource ระดับ cluster และอยู่นอก namespace ใด ๆ ต่างจาก Deployment, ConfigMap, และ PersistentVolumeClaim ที่ล้วนเป็น namespaced',
   },
   {
     q: 'ResourceQuota คุมอะไรที่ LimitRange ไม่ได้คุม',
@@ -136,6 +471,7 @@ export const quizNamespaceQuota = [
       'CPU limit ขั้นสูงของ container ตัวเดียว',
     ],
     answer: 1,
+    explain: 'ResourceQuota จำกัดทั้ง namespace รวมกัน (request/limit รวมและจำนวน object) ไม่เคยแตะ default หรือขอบเขตของ container ตัวเดียวแบบที่ LimitRange ทำ',
   },
   {
     q: 'ทำไม namespace ถึงต้องมี LimitRange เพิ่มจาก ResourceQuota',
@@ -146,6 +482,29 @@ export const quizNamespaceQuota = [
       'LimitRange ทำให้เกิด network isolation ระหว่าง namespace',
     ],
     answer: 1,
+    explain: 'ResourceQuota เพียงอย่างเดียวไม่พูดถึง Pod ตัวใดตัวหนึ่งเลย — ถ้าไม่มี LimitRange จำกัด container แต่ละตัว Pod ตัวเดียวอาจขอมากพอจะกิน quota ทั้ง namespace ไปเองได้',
+  },
+  {
+    q: '```text\nError from server (Forbidden): error when creating "no-requests.yaml":\npods "no-requests" is forbidden: failed quota: team-quota: must specify limits.memory for: app; requests.memory for: app\n```\nPod ที่ไม่มี block resources ถูก reject ด้วย error จริงนี้ ใน namespace ที่ ResourceQuota track requests.cpu/requests.memory/limits.cpu/limits.memory และ LimitRange ตั้ง max: cpu: "1" / min: cpu: 100m (ไม่มีขอบเขต memory ไม่มี default ชัดเจน) ทำไม error ถึงระบุแค่ memory ไม่มี cpu เลย',
+    options: [
+      'cpu ไม่ถูก track โดย ResourceQuota นี้ มีแค่ memory เท่านั้นที่ถูก track',
+      'LimitRange เติม cpu request/limit ของ container ให้เป็นค่า max (1) แบบเงียบ ๆ พิสูจน์ด้วยการตรวจ Pod ไม่มี resources ตัวเดียวกันใน namespace ที่มี LimitRange แต่ไม่มี ResourceQuota — ส่วน memory ไม่มี LimitRange bound เลย เลยไม่ถูกตั้งค่าจริง ๆ',
+      'Kubernetes ไม่แสดง cpu ใน error message ของ quota เสมอ',
+      'error นี้ไม่ครบเพราะข้อความถูกตัดทอน',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ด้านบน: LimitRange ที่ตั้ง max แต่ไม่มี default ชัดเจน จะใช้ max เป็น default limit (และ request) เอง — cpu เลยถูกเติมเงียบ ๆ เป็น 1 เหลือแค่ memory ที่ LimitRange นี้ไม่เคยกำหนดขอบเขตไว้เลย ให้ ResourceQuota reject ในฐานะที่ไม่ถูกตั้งค่าจริง',
+  },
+  {
+    q: 'namespace ค้างอยู่ที่ `Terminating` มาแล้วหนึ่งชั่วโมงหลังรัน `kubectl delete namespace` ขั้นแรกที่ถูกต้องในการตรวจสอบตามบทนี้คืออะไร',
+    options: [
+      'แก้ object namespace ทันทีแล้วเอา metadata.finalizers ออก',
+      'รันการ sweep ตาม namespace (`kubectl api-resources --verbs=list --namespaced -o name` กับ namespace นั้น) เพื่อหาว่า resource ตัวไหนยังมี finalizer ค้างอยู่',
+      'ลบ cluster แล้วสร้างใหม่',
+      'ไม่ต้องทำอะไร namespace ที่ Terminating จะเคลียร์ตัวเองภายใน 24 ชั่วโมงเสมอ',
+    ],
+    answer: 1,
+    explain: 'อ้างอิงด้านบน: การ sweep ตาม namespace จะเจอ object ที่ยังมี finalizer ค้างอยู่จริง ซึ่งเป็นขั้นตอนวินิจฉัยแรกที่ถูกต้องและไม่ทำลายอะไร — การแก้ finalizer ตรง ๆ คือทางเลือกสุดท้าย ไม่ใช่ทางแรก',
   },
 ];
 

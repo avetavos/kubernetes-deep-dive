@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียในหนึ่งประโยค
 
@@ -69,6 +70,231 @@ kubectl get svc payments-public
 # EXTERNAL-IP column is populated once the cloud provider finishes provisioning
 ```
 
+## EndpointSlice จริง เทียบกับ Endpoints API ที่ deprecated แล้ว
+
+พิสูจน์การ deprecate จริง — แค่ `kubectl get endpoints` ธรรมดาบน Kubernetes 1.37 ก็ขึ้น warning แล้ว:
+
+```yaml
+# k8s/services-clusterip-nodeport-loadbalancer/svc-demo.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web-svc-demo
+  template:
+    metadata:
+      labels:
+        app: web-svc-demo
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-clusterip
+spec:
+  selector:
+    app: web-svc-demo
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 60
+  ports:
+    - port: 80
+      targetPort: 80
+```
+
+```text
+$ kubectl get endpoints web-clusterip
+Warning: v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice
+NAME            ENDPOINTS                            AGE
+web-clusterip   10.244.138.135:80,10.244.147.20:80   10s
+
+$ kubectl get endpointslices -l kubernetes.io/service-name=web-clusterip
+NAME                  ADDRESSTYPE   PORTS   ENDPOINTS                      AGE
+web-clusterip-ftr9n   IPv4          80      10.244.147.20,10.244.138.135   11s
+```
+
+ทั้งสอง API ยังถูก serve อยู่และตอบ Pod IP เบื้องหลังเดียวกันเป๊ะ แต่ server เองบอกตรง ๆ ว่าอันไหน deprecated แล้ว `EndpointSlice` จริงมีมากกว่าลิสต์ IP แบนราบ — มี condition `ready`/`serving`/`terminating` จริงต่อ address และมี `nodeName` ซึ่ง `Endpoints` แบบเก่าไม่เคยมี:
+
+```text
+$ kubectl get endpointslices -l kubernetes.io/service-name=web-clusterip -o yaml
+...
+  endpoints:
+  - addresses: ["10.244.147.20"]
+    conditions: {ready: true, serving: true, terminating: false}
+    nodeName: storage-net-worker
+    targetRef: {kind: Pod, name: web-5b685b6556-c2b7l, namespace: default}
+  - addresses: ["10.244.138.135"]
+    conditions: {ready: true, serving: true, terminating: false}
+    nodeName: storage-net-worker2
+    targetRef: {kind: Pod, name: web-5b685b6556-n5rqk, namespace: default}
+```
+
+## Headless Service: EndpointSlice จริง ไม่มี ClusterIP
+
+```text
+$ kubectl get svc web-headless
+NAME           TYPE        CLUSTER-IP   EXTERNAL-IP   PORT(S)   AGE
+web-headless   ClusterIP   None         <none>        80/TCP    11s
+
+$ kubectl get endpointslices -l kubernetes.io/service-name=web-headless
+NAME                 ADDRESSTYPE   PORTS   ENDPOINTS                      AGE
+web-headless-wx6fm   IPv4          80      10.244.147.20,10.244.138.135   11s
+```
+
+headless Service (`clusterIP: None`) ยังได้ EndpointSlice ปกติที่ track Pod อยู่ดี — ความต่างอยู่ที่ CoreDNS เอาไปทำอะไรต่อทั้งหมด (อยู่ในบท DNS) ไม่ใช่ที่กลไก Endpoints/EndpointSlice เอง
+
+## `sessionAffinity: ClientIP`
+
+```text
+$ kubectl get svc web-clusterip -o jsonpath='{.spec.sessionAffinity}{" "}{.spec.sessionAffinityConfig}'
+ClientIP {"clientIP":{"timeoutSeconds":60}}
+```
+
+ตั้ง `sessionAffinity: ClientIP` แล้ว rule ที่ kube-proxy program ไว้จะ route client IP เดิมไปที่ Pod เบื้องหลังตัวเดิมตลอด `timeoutSeconds` ที่กำหนด (60s ที่นี่) แทนที่จะ load balance ทุก connection ใหม่แยกกัน
+
+## ช่วง NodePort: ยอมรับจริงและ reject จริง
+
+```text
+$ kubectl expose deployment web --name=web-nodeport --type=NodePort --port=80 --target-port=80 --dry-run=server -o yaml | grep -A2 ports:
+  ports:
+  - nodePort: 32769
+    port: 80
+    protocol: TCP
+```
+
+ไม่ระบุเอง API server จะเลือก NodePort ให้อัตโนมัติจากช่วง default — `32769` ในที่นี้ อยู่ใน `30000`-`32767` อย่างปลอดภัย บังคับให้ใช้ port นอกช่วงนี้คือ reject จริงทันที:
+
+```yaml
+# k8s/services-clusterip-nodeport-loadbalancer/nodeport-out-of-range.yaml — @expect-error nodePort 1080 is outside the default 30000-32767 range
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-badport
+spec:
+  type: NodePort
+  selector:
+    app: web-svc-demo
+  ports:
+    - port: 80
+      targetPort: 80
+      nodePort: 1080
+```
+
+```text
+$ kubectl apply -f nodeport-out-of-range.yaml
+The Service "web-badport" is invalid: spec.ports[0].nodePort: Invalid value: 1080: provided port is not in the valid range. The range of valid ports is 30000-32767
+```
+
+## LoadBalancer ค้าง `<pending>` บน kind และ `externalTrafficPolicy: Local`
+
+```yaml
+# k8s/services-clusterip-nodeport-loadbalancer/svc-lb.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-lb
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app: web-svc-demo
+  ports:
+    - port: 80
+      targetPort: 80
+```
+
+```text
+$ kubectl get svc web-lb
+NAME     TYPE           CLUSTER-IP      EXTERNAL-IP   PORT(S)        AGE
+web-lb   LoadBalancer   10.96.139.218   <pending>     80:31953/TCP   10s
+
+$ kubectl describe svc web-lb
+...
+External Traffic Policy:  Local
+HealthCheck NodePort:     31312
+Endpoints:                10.244.138.135:80,10.244.147.20:80
+```
+
+`EXTERNAL-IP` ค้าง `<pending>` ตลอดไปบน kind ธรรมดา — จริง และคาดไว้แล้ว: ไม่มีอะไร watch Service แบบ `LoadBalancer` เพื่อ provision อะไรให้เลย สองวิธีจริงที่แก้ได้บนเครื่อง: **MetalLB** (mode BGP หรือ L2 แจก IP จริงจาก pool ที่ config ไว้ให้ Service `LoadBalancer` ตัวไหนก็ได้) หรือ **cloud-provider-kind** (โปรเจกต์ Kubernetes SIG ที่จำลอง cloud provider ให้ kind โดยเฉพาะ ทำให้ `LoadBalancer` resolve เหมือนอยู่บน cloud จริง) แยกออกมา `externalTrafficPolicy: Local` (ตั้งไว้ด้านบน) คือเหตุผลที่ `HealthCheck NodePort: 31312` มีอยู่เลย — field นี้โผล่มาแค่ตอนใช้ `Local` เท่านั้น เพราะ `Local` forward traffic ไปแค่ Pod บนโหนดที่รับ traffic เข้ามาจริง (รักษา client source IP จริงไว้ ไม่มี hop เพิ่ม) แทนที่จะ forward ข้ามโหนดได้แบบ policy default `Cluster` แต่ละโหนดเลยต้องมีวิธีรายงานว่าตัวเองมี backend ที่ healthy อยู่ในเครื่องจริงไหม
+
+## `kube-proxy` mode: จริง จาก ConfigMap ของ cluster นี้เอง
+
+```text
+$ kubectl -n kube-system get configmap kube-proxy -o yaml | grep -A2 "mode:"
+    mode: iptables
+    nftables:
+      masqueradeAll: false
+```
+
+kube-proxy ของ kind 0.33 / Kubernetes 1.37 cluster นี้รันอยู่ใน mode `iptables` จริง ๆ (ยังเป็น default เหนือ `ipvs`/`nftables` ที่นี่) — ต้องเช็ค ConfigMap ของ cluster นั้น ๆ เองเสมอ อย่าเดา mode เพราะเป็น configuration ต่อ cluster ไม่ใช่พฤติกรรมตายตัวของ Kubernetes
+
+## อ่านโค้ดที่ AI เขียน
+
+ตอนรีวิว Service manifest กับโค้ดที่ query มัน ให้เช็ค
+
+- โค้ดที่ยังเรียก API `Endpoints` คิดว่าเป็นวิธีสมัยใหม่ในการดู backend — พิสูจน์ด้านบนแล้วว่าทั้งสอง API ยังใช้ได้ แต่ server เองก็ flag `Endpoints` ว่า deprecated ไปทาง `EndpointSlice` แล้ว
+- NodePort ที่ hardcode ไว้นอก `30000`-`32767` คิดว่า "ก็น่าจะใช้ได้" — พิสูจน์ด้านบนแล้วว่า reject จริงทันที
+- คิดว่า Service `type: LoadBalancer` จะได้ `EXTERNAL-IP` บน cluster ไหนก็ได้ รวมถึง kind local — พิสูจน์ด้านบนแล้วว่าค้าง `<pending>` ถ้าไม่ติดตั้ง MetalLB/cloud-provider-kind
+- เพิ่ม `externalTrafficPolicy: Local` "เพื่อ performance" โดยไม่เข้าใจว่ามันเปลี่ยนการกระจาย traffic ข้ามโหนดด้วย (มีแค่โหนดที่มี backend healthy ในเครื่องเท่านั้นที่ได้ traffic เลย) ไม่ใช่แค่เรื่อง client IP และมันเพิ่ม `HealthCheck NodePort` จริงตามที่พิสูจน์ด้านบน
+
+<SpotTheBug code={`# k8s/services-clusterip-nodeport-loadbalancer/legacy-endpoints-watch.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: endpoint-watcher
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: endpoint-watcher
+rules:
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: endpoint-watcher
+subjects:
+  - kind: ServiceAccount
+    name: endpoint-watcher
+roleRef:
+  kind: Role
+  name: endpoint-watcher
+  apiGroup: rbac.authorization.k8s.io`}>
+RBAC นี้ให้สิทธิ์ `get`/`list`/`watch` แค่กับ resource `endpoints` เท่านั้น — API เก่าที่ deprecated แล้ว พิสูจน์ด้านบนด้วย warning จริงบน Kubernetes 1.37 controller หรือ tool ที่สร้างมาโดยพึ่ง Role นี้จะอ่าน object `EndpointSlice` ไม่ได้เลยตรง ๆ (คนละ resource กัน คือ `discovery.k8s.io/v1` ที่ rule นี้ไม่ครอบคลุมเลย) — วันนี้ยังทำงานได้ (ทั้งสอง API ยัง serve อยู่) แต่ติดอยู่กับ API ที่ตัวโปรเจกต์เองกำลังย้ายออกจาก และจะไม่เห็น condition `ready`/`serving`/`terminating` ต่อ address หรือ `nodeName` ต่อ address ที่มีแค่ `EndpointSlice` เท่านั้น ทางแก้: ให้สิทธิ์ `apiGroups: ["discovery.k8s.io"]`, `resources: ["endpointslices"]` แทน (หรือเพิ่มเข้าไปด้วยระหว่างช่วง migration)
+</SpotTheBug>
+
+## Mental Model
+
+Service คือ *address* ที่เสถียร `EndpointSlice` คือ *ลิสต์สมาชิกที่ sharded และเป็นสด* เบื้องหลัง `kube-proxy` คือ *กลไก* ที่ทำให้ address นั้นใช้งานได้จริง ไม่ว่า cluster หนึ่ง ๆ จะรันอยู่ใน mode ไหน (`iptables` พิสูจน์ด้านบน) Service สามแบบต่อยอดกันเป็นบันไดที่เข้มงวด (`ClusterIP` → `NodePort` → `LoadBalancer`) แต่ละชั้นเพิ่มการเข้าถึงจากภายนอกอีกชั้น ไม่เคยแทนที่ชั้นก่อนหน้า — และทุกชั้นยังต้องพึ่งอะไรบางอย่างภายนอก (cloud provider, MetalLB, cloud-provider-kind) ถึงจะใช้งานได้จริงนอก cluster พิสูจน์ด้านบนด้วย `LoadBalancer` ที่ค้าง `<pending>` ถ้าไม่มี
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ข้อดี | ต้นทุน |
+|---|---|---|
+| `sessionAffinity: ClientIP` | client เดิม hit Pod เบื้องหลังตัวเดิมตลอด พิสูจน์ด้านบนด้วย spec จริง | load ไม่เท่ากันถ้า client ตัวเดียวส่ง traffic เยอะผิดปกติ |
+| `externalTrafficPolicy: Local` | รักษา client source IP จริง ไม่มี hop เพิ่ม พิสูจน์ด้านบน | traffic ไปถึงแค่โหนดที่มี backend healthy ในเครื่องเท่านั้น — อาจไม่เท่ากันมาก และต้องมี `HealthCheck NodePort` จริงตามที่พิสูจน์ด้านบน |
+| NodePort | ใช้งานได้โดยไม่ต้องมี cloud integration | ทุกโหนดเปิด port เดียวกัน ไม่มี cloud LB มาไว้หน้า อึดอัดที่ scale จริง |
+| LoadBalancer | จุดเข้าจากภายนอกที่สะอาดที่สุด | ต้องมี cloud provider หรืออะไรอย่าง MetalLB/cloud-provider-kind บนเครื่อง — พิสูจน์ด้านบนแล้วว่า kind เปล่า ๆ ค้าง `<pending>` ตลอดไป |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"Endpoints กับ EndpointSlice คือ API เดียวกัน แค่เปลี่ยนชื่อ"** ทั้งคู่ยังใช้ query ได้บน 1.37 (พิสูจน์ด้านบน) แต่ Endpoints deprecated แล้วพร้อม warning จริงจาก server — EndpointSlice คือตัวแทนที่ scale ได้ (sharded, มี condition ต่อ address ที่ละเอียดกว่า)
+- **"NodePort จะเป็น port ไหนก็ได้ตามใจ"** พิสูจน์ด้านบนแล้ว — API server บังคับช่วง default `30000`-`32767` จริง reject นอกช่วงด้วย error จริง
+- **"Service แบบ LoadBalancer ยังไงก็ได้ external IP ในที่สุด"** พิสูจน์ด้านบนแล้ว — บน kind ธรรมดาค้าง `<pending>` ตลอดไปถ้าไม่มี MetalLB หรือ cloud-provider-kind
+
 ## kube-proxy คือตัวที่ทำให้ virtual IP ใช้งานได้จริง
 
 ClusterIP ของ Service ไม่ได้มี network interface จริงอยู่ที่ไหนเลย เป็นแค่ address เสมือน **kube-proxy** ที่รันอยู่บนทุกโหนดคอย watch API server ดู Service กับ Endpoints/EndpointSlice แล้วเขียน rule ในเครื่อง (ปกติเป็น `iptables` หรือ `IPVS` แล้วแต่ mode ที่ตั้งไว้) เพื่อให้ packet ที่ส่งไปหา virtual IP ถูก rewrite แล้วส่งต่อไปยัง Pod ตัวใดตัวหนึ่งที่อยู่เบื้องหลังโดยอัตโนมัติ นี่คือเหตุผลที่ Service ทำงานเหมือนกันไม่ว่า client Pod จะอยู่โหนดไหน
@@ -83,7 +309,7 @@ export const serviceRoutingDiagram = `flowchart LR
   kp --> p3["Pod 3"]`;
 
 <Callout title="สรุปหนึ่งบรรทัด">
-**Service** ให้กลุ่ม Pod ที่เกิดดับตลอดเวลามี virtual IP กับ DNS name ที่เสถียร เลือกสมาชิกด้วย **label selector** และติดตามผ่าน **Endpoints/EndpointSlice** **ClusterIP** ใช้ได้แค่ภายใน **NodePort** เพิ่มการเปิด port (30000-32767) บนทุกโหนด และ **LoadBalancer** เพิ่ม external cloud load balancer มาไว้หน้า NodePort **kube-proxy** บนทุกโหนดคือตัวที่ทำให้ virtual IP ใช้งานได้จริง ด้วย rule แบบ iptables หรือ IPVS ที่ route ไปยัง Pod เบื้องหลัง
+**Service** ให้กลุ่ม Pod ที่เกิดดับตลอดเวลามี virtual IP กับ DNS name ที่เสถียร เลือกสมาชิกด้วย **label selector** และติดตามผ่าน **EndpointSlice** (API จริงที่ใช้กันตอนนี้ — `Endpoints` ยังใช้ได้แต่ deprecated แล้ว พิสูจน์ด้านบนด้วย warning จริงจาก server) **ClusterIP** ใช้ได้แค่ภายใน **NodePort** เพิ่มการเปิด port (`30000`-`32767` บังคับด้วย rejection จริง พิสูจน์ด้านบน) บนทุกโหนด และ **LoadBalancer** เพิ่มการขอ external load balancer — ค้าง `<pending>` ตลอดไปบน kind เปล่า ๆ ถ้าไม่มี MetalLB หรือ cloud-provider-kind พิสูจน์ด้านบน **kube-proxy** บนทุกโหนดคือตัวที่ทำให้ virtual IP ใช้งานได้จริง (mode `iptables` บน cluster นี้ พิสูจน์ด้านบนจาก ConfigMap เอง) และ `externalTrafficPolicy: Local` (พิสูจน์ด้านบน) แลกการกระจาย load ที่เท่ากันกับ client source IP ที่รักษาไว้ได้
 </Callout>
 
 export const quizServiceTypes = [
@@ -96,6 +322,7 @@ export const quizServiceTypes = [
       'Service มาแทนที่การใช้ label บน Pod',
     ],
     answer: 1,
+    explain: 'Pod เป็นของใช้แล้วทิ้งและได้ IP ใหม่ตอน reschedule Service ให้ virtual IP กับ DNS name ที่เสถียรซึ่งอยู่รอดการเปลี่ยน Pod ได้',
   },
   {
     q: 'ความต่างในทางปฏิบัติระหว่าง NodePort กับ ClusterIP คืออะไร',
@@ -106,6 +333,7 @@ export const quizServiceTypes = [
       'ClusterIP ต้องมี cloud provider ส่วน NodePort ไม่ต้อง',
     ],
     answer: 1,
+    explain: 'NodePort ต่อยอดจาก ClusterIP ล้วน ๆ — ยังได้ virtual IP ภายในเหมือนเดิม บวก port จริงที่บังคับช่วง (30000-32767 พิสูจน์ด้านบน) เปิดบนทุกโหนด',
   },
   {
     q: 'Service ตัดสินใจยังไงว่าตอนนี้มี Pod ตัวไหนอยู่เบื้องหลังบ้าง',
@@ -116,6 +344,7 @@ export const quizServiceTypes = [
       'ดูจากโหนดที่ Pod ถูก schedule ไป',
     ],
     answer: 1,
+    explain: 'พิสูจน์ด้านบนด้วย output จริง: label selector กำหนด membership และ EndpointSlice (หรือ Endpoints ที่ deprecated แล้ว) track แบบสด อัปเดตอัตโนมัติเมื่อ Pod เกิดหรือหาย',
   },
   {
     q: 'component ไหนที่ทำให้ Service ClusterIP กลายเป็น traffic ที่เข้าถึงได้จริงบนแต่ละโหนด',
@@ -126,6 +355,29 @@ export const quizServiceTypes = [
       'scheduler',
     ],
     answer: 2,
+    explain: 'พิสูจน์ด้านบนจาก ConfigMap ของ kube-proxy ของ cluster นี้เอง (mode: iptables): kube-proxy program rule ที่ rewrite packet จริง ๆ ที่ทำให้ ClusterIP เข้าถึงได้',
+  },
+  {
+    q: '```text\n$ kubectl get endpoints web-clusterip\nWarning: v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice\nNAME            ENDPOINTS\nweb-clusterip   10.244.138.135:80,10.244.147.20:80\n```\nwarning จริงนี้ขึ้นบน Kubernetes 1.37 cluster ควรเปลี่ยนวิธีที่โค้ดใหม่ query backend ของ Service ยังไง',
+    options: [
+      'ไม่ต้องเปลี่ยนอะไร warning นี้เป็นแค่ cosmetic Endpoints จะไม่ถูกลบจริง ๆ หรอก',
+      'โค้ดใหม่ควร query discovery.k8s.io/v1 EndpointSlice แทน เพราะ Endpoints deprecated แล้ว และ EndpointSlice มีข้อมูลต่อ address ที่ละเอียดกว่า (ready/serving/terminating, nodeName) ที่ Endpoints ไม่เคยมี',
+      'Service เองพังต้องสร้างใหม่',
+      'ต้องลบทั้ง Endpoints และ EndpointSlice เก็บไว้แค่ Deployment',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ด้านบน: ทั้งสอง API ยังใช้ได้วันนี้ แต่ server เอง flag Endpoints ว่า deprecated แล้ว EndpointSlice คือตัวแทนที่ sharded และข้อมูลละเอียดกว่าที่ tool ใหม่ควรเล็ง',
+  },
+  {
+    q: '```text\n$ kubectl get svc web-lb\nNAME     TYPE           CLUSTER-IP      EXTERNAL-IP   PORT(S)\nweb-lb   LoadBalancer   10.96.139.218   <pending>     80:31953/TCP\n```\nนี่คือ output จริงบน kind cluster ธรรมดา ทำไม EXTERNAL-IP ถึงค้างที่ `<pending>`',
+    options: [
+      'Service manifest มี syntax error',
+      'kind ไม่มี LoadBalancer implementation มาให้ default — ไม่มีอะไร watch Service แบบ LoadBalancer เพื่อ provision external IP จริง ต้องติดตั้งอะไรอย่าง MetalLB หรือ cloud-provider-kind เอง',
+      'Service แบบ LoadBalancer ใช้ได้แค่กับ externalTrafficPolicy: Cluster เท่านั้น',
+      'Pod เบื้องหลัง Service ยังไม่ ready',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ด้านบน: kind ธรรมดาไม่มี cloud provider integration สำหรับ LoadBalancer เลย — EXTERNAL-IP ค้าง <pending> ตลอดไปถ้าไม่ติดตั้งอะไรอย่าง MetalLB หรือ cloud-provider-kind',
   },
 ];
 

@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
@@ -71,6 +72,177 @@ nslookup web-0.cache.default.svc.cluster.local
 
 This is exactly what distributed, stateful systems need: a database replica has to reconnect to the *same* peer it had before, not a random one a load balancer happens to pick. Without a headless Service, that per-Pod DNS record would not exist at all.
 
+## Real proof: `svc`, `svc.ns`, fqdn, and headless per-Pod records
+
+From a real `dnsutils` Pod (`registry.k8s.io/e2e-test-images/jessie-dnsutils:1.7`) against a real `web-clusterip` Service:
+
+```text
+$ nslookup web-clusterip.default.svc.cluster.local
+Server:		10.96.0.10
+Address:	10.96.0.10#53
+
+Name:	web-clusterip.default.svc.cluster.local
+Address: 10.96.196.12
+```
+
+Headless per-Pod A records, real, from `web-headless` (`clusterIP: None`):
+
+```text
+$ nslookup web-headless.default.svc.cluster.local
+Server:		10.96.0.10
+Address:	10.96.0.10#53
+
+Name:	web-headless.default.svc.cluster.local
+Address: 10.244.147.20
+Name:	web-headless.default.svc.cluster.local
+Address: 10.244.138.135
+```
+
+Same query shape, completely different answer shape: the normal Service returns one ClusterIP; the headless Service returns every backing Pod's real IP directly, exactly as this lesson's mechanism describes.
+
+## `ndots:5` and `search`: the real `/etc/resolv.conf`, and the extra lookups it causes
+
+```text
+$ cat /etc/resolv.conf
+search default.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+options ndots:5
+```
+
+`ndots:5` means: any name with **fewer than 5 dots** gets every entry in `search` tried, in order, before the resolver ever tries the name as given. `web-clusterip` (0 dots) triggers up to three extra lookup attempts (`web-clusterip.default.svc.cluster.local`, `.svc.cluster.local`, `.cluster.local`) before landing on the right one — invisible in a single successful `nslookup`, but real extra DNS round-trips on every short-name lookup in the cluster, which is exactly why this default is a frequent target for tuning on high-QPS workloads.
+
+## Custom `dnsPolicy`/`dnsConfig`: real, different `resolv.conf`
+
+```yaml
+# k8s/dns-and-service-discovery/custom-dnsconfig.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: custom-dns-demo
+spec:
+  dnsPolicy: None
+  dnsConfig:
+    nameservers:
+      - 10.96.0.10
+    searches:
+      - default.svc.cluster.local
+      - svc.cluster.local
+      - cluster.local
+    options:
+      - name: ndots
+        value: '2'
+  containers:
+    - name: app
+      image: registry.k8s.io/e2e-test-images/jessie-dnsutils:1.7
+      command: ['sleep', '3600']
+```
+
+```text
+$ kubectl exec custom-dns-demo -- cat /etc/resolv.conf
+search default.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+options ndots:2
+```
+
+`dnsPolicy: None` hands full control to `dnsConfig` — this Pod's real `resolv.conf` shows `ndots:2` instead of the cluster default `5`, proving the override took effect exactly as configured. Lowering `ndots` is a real, common tuning move for a workload that mostly talks to fully-qualified external names, to cut the wasted in-cluster search attempts described above.
+
+## CoreDNS `Corefile`: the real ConfigMap
+
+```text
+$ kubectl get configmap coredns -n kube-system -o jsonpath='{.data.Corefile}'
+.:53 {
+    errors
+    health {
+       lameduck 5s
+    }
+    ready
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+       pods insecure
+       fallthrough in-addr.arpa ip6.arpa
+       ttl 30
+    }
+    prometheus :9153
+    forward . /etc/resolv.conf {
+       max_concurrent 1000
+    }
+    cache 30 {
+       disable success cluster.local
+       disable denial cluster.local
+    }
+    loop
+    reload
+    loadbalance
+}
+```
+
+This is the real plugin chain answering every query in this lesson: the `kubernetes` plugin serves `cluster.local` (with `pods insecure` enabling per-Pod IP-based DNS names, and a 30s TTL), `forward` sends anything outside `cluster.local` upstream to whatever `/etc/resolv.conf` the CoreDNS Pod itself has, and `cache 30` bounds how long answers are cached.
+
+## `ExternalName`: a real CNAME, proven
+
+```yaml
+# k8s/dns-and-service-discovery/externalname-svc.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-api
+spec:
+  type: ExternalName
+  externalName: kubernetes.io
+```
+
+```text
+$ nslookup external-api.default.svc.cluster.local
+Server:		10.96.0.10
+Address:	10.96.0.10#53
+
+external-api.default.svc.cluster.local	canonical name = kubernetes.io.
+Name:	kubernetes.io
+Address: 15.197.167.90
+Name:	kubernetes.io
+Address: 3.33.186.135
+```
+
+CoreDNS answers with a real `CNAME` to `kubernetes.io`, which the resolver then follows to `kubernetes.io`'s own real, current A records — exactly what `ExternalName` is: a DNS-level alias, nothing more. No Service selector, no Endpoints/EndpointSlice, no load balancing — just a name pointing at another name.
+
+## Reading AI-generated code
+
+When reviewing generated DNS-related manifests and code, check for:
+
+- `ExternalName` pointing at a raw IP address instead of a hostname — proven above, `ExternalName` only produces a `CNAME`, and a `CNAME` to an IP address is not valid DNS; a fixed IP needs a different mechanism (a headless Service with manually managed `Endpoints`/`EndpointSlice`, not `ExternalName`).
+- Code that assumes every Pod's `ndots`/`search` matches the cluster default without checking for a `dnsPolicy: None` / `dnsConfig` override — proven above, a Pod's real `resolv.conf` can differ completely from the cluster norm.
+- A retry loop for "DNS propagation delay" copied from public-internet DNS habits — CoreDNS answers are generated live from EndpointSlice state on every query; there is no TTL-based propagation delay to wait out the way there is for public DNS.
+- Hardcoding `10.96.0.10` as "the" cluster DNS server IP in application code instead of reading it from the Pod's own `/etc/resolv.conf` — it's real (proven above) but cluster-specific (`kube-dns` Service ClusterIP), not a universal constant.
+
+<SpotTheBug code={`# k8s/dns-and-service-discovery/pin-to-ip.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: legacy-db
+spec:
+  type: ExternalName
+  externalName: "10.20.30.40"`}>
+`externalName` is set to a raw IP address string, `"10.20.30.40"`. Proven above, `ExternalName` works by having CoreDNS answer with a `CNAME` record pointing at `externalName`'s value — but a `CNAME` target must be a hostname, never an IP address; DNS has no concept of "alias this name to that IP" via CNAME. Depending on the CoreDNS/upstream resolver version this either fails validation, resolves to nothing, or behaves unpredictably — none of which is "pin this Service to a fixed IP," which is almost certainly what the author wanted. The fix: for a fixed-IP external dependency, create a **headless Service with no selector** and a manually-managed `Endpoints`/`EndpointSlice` object pointing at the real IP — that is the actual supported mechanism for "give this IP a stable in-cluster DNS name."
+</SpotTheBug>
+
+## Mental Model
+
+Every DNS answer in the cluster is really "ask CoreDNS, which is itself just a Deployment watching Services/EndpointSlices" (proven above via its real `Corefile`) — there's no separate DNS control plane. `ndots`/`search` shape *which name a client asks about* (proven above with the real `resolv.conf` and the extra lookups a low dot-count name causes); `dnsPolicy`/`dnsConfig` shape *which server and search list a Pod uses at all* (proven above by overriding both); and headless vs normal Service shape *what CoreDNS answers with* (individual Pod IPs vs one ClusterIP, both proven above with real `nslookup` output).
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| Default `ndots:5` + cluster search list | Short in-namespace names (`web-clusterip`) just work | Every external FQDN with fewer than 5 dots costs extra failed lookups against the cluster search suffixes first, proven above |
+| Custom `dnsConfig` with lower `ndots` | Cuts wasted in-cluster search attempts for external-heavy workloads, proven above | Short in-cluster names now need to be fully qualified, or they may not resolve as expected |
+| Headless Service | Per-Pod stable DNS, required for StatefulSet peer discovery, proven above | No load balancing at the DNS layer at all — client must handle multiple A records |
+| `ExternalName` | Clean in-cluster name for an external dependency, proven above with a real CNAME | Just a CNAME — no health checking, no load balancing, must be a real resolvable hostname, never an IP (proven above) |
+
+## Common Misconceptions
+
+- **"DNS changes need time to propagate inside the cluster, like public DNS."** CoreDNS answers are generated live from EndpointSlice state (proven above via the real `Corefile`'s `kubernetes` plugin), not cached the way public DNS/TTL propagation works.
+- **"`ndots` only matters for external names."** Proven above — it changes lookup behavior (and cost) for every name, in-cluster or not, that has fewer dots than the `ndots` setting.
+- **"`ExternalName` can point at an IP address to pin a Service to a fixed backend."** Proven above — it cannot; `ExternalName` only produces a CNAME to a hostname. Pinning a fixed IP needs a headless Service with manually-managed `Endpoints`/`EndpointSlice` instead.
+
 <Mermaid title="A Pod's DNS query resolved by CoreDNS: a Service ClusterIP, or individual Pod IPs for a headless Service" code={dnsResolutionDiagram} />
 
 export const dnsResolutionDiagram = `flowchart TB
@@ -81,7 +253,7 @@ export const dnsResolutionDiagram = `flowchart TB
   coredns -->|"headless Service"| p2["web-2 IP"]`;
 
 <Callout title="The one-line takeaway">
-**CoreDNS** is the cluster's internal DNS server, giving every Service a name in the form `<service>.<namespace>.svc.cluster.local` (with a short form usable inside the same namespace), which normally resolves to the Service's load-balanced ClusterIP. A **headless Service** (`clusterIP: None`) skips load balancing and returns individual Pod IPs directly, which is exactly what **StatefulSets** use to give each ordinal Pod its own stable DNS record at `<pod-name>.<service>.<namespace>.svc.cluster.local`.
+**CoreDNS** is the cluster's internal DNS server (a real Deployment running the `Corefile` proven above), giving every Service a name in the form `<service>.<namespace>.svc.cluster.local` (with a short form usable inside the same namespace), which normally resolves to the Service's load-balanced ClusterIP. A **headless Service** (`clusterIP: None`) skips load balancing and returns individual Pod IPs directly (proven above with real `nslookup` output), which is exactly what **StatefulSets** use to give each ordinal Pod its own stable DNS record. Every Pod's real `/etc/resolv.conf` (proven above) sets `ndots:5` and a cluster `search` list — overridable per-Pod via `dnsPolicy`/`dnsConfig` (proven above) — and **`ExternalName`** is nothing more than a real `CNAME` alias (proven above), never a way to pin a fixed IP.
 </Callout>
 
 export const quizDnsDiscovery = [
@@ -94,6 +266,7 @@ export const quizDnsDiscovery = [
       'Services do not get automatic DNS names',
     ],
     answer: 1,
+    explain: 'Proven above with a real nslookup: the full name is <service-name>.<namespace>.svc.cluster.local, and the short form works only within the same namespace thanks to the search list.',
   },
   {
     q: 'Why do StatefulSets need a headless Service for DNS purposes',
@@ -104,6 +277,7 @@ export const quizDnsDiscovery = [
       'Headless Services are required for any Pod to get a DNS name at all',
     ],
     answer: 1,
+    explain: 'Proven above: a headless Service\'s DNS query returns every backing Pod\'s real IP directly, instead of one load-balanced ClusterIP -- exactly the per-Pod addressability StatefulSet peer discovery needs.',
   },
   {
     q: 'What role does CoreDNS play in the cluster',
@@ -114,6 +288,7 @@ export const quizDnsDiscovery = [
       'It is only used for external, internet-facing DNS lookups',
     ],
     answer: 1,
+    explain: 'Proven above via the real Corefile: CoreDNS is the in-cluster DNS server, and its kubernetes plugin answers Service/Pod name queries live from cluster state.',
   },
   {
     q: 'What does a headless Service (clusterIP: None) return when queried by DNS',
@@ -124,6 +299,29 @@ export const quizDnsDiscovery = [
       'An error, since there is no ClusterIP to return',
     ],
     answer: 2,
+    explain: 'Proven above with a real nslookup returning two separate Address: lines, one per backing Pod, instead of one ClusterIP.',
+  },
+  {
+    q: '```text\n$ cat /etc/resolv.conf\nsearch default.svc.cluster.local svc.cluster.local cluster.local\nnameserver 10.96.0.10\noptions ndots:5\n```\nThis is a real Pod\'s resolv.conf. A lookup for the bare name `web-clusterip` (0 dots) with ndots:5 in effect does what?',
+    options: [
+      'Resolves directly against nameserver 10.96.0.10 with no other attempts, since ndots only affects fully-qualified names',
+      'Tries each entry in the search list first (appending it to the bare name), since the name has fewer dots than ndots, before trying the name as given',
+      'Fails immediately because ndots:5 requires at least 5 dots in every query',
+      'Ignores the search list entirely and queries the nameserver 5 times in parallel',
+    ],
+    answer: 1,
+    explain: 'Proven above: ndots:5 means any name with fewer than 5 dots gets the search list tried first, appending each suffix in order -- extra lookups that are invisible in a single successful nslookup but real on every short-name query.',
+  },
+  {
+    q: '```yaml\napiVersion: v1\nkind: Service\nmetadata:\n  name: legacy-db\nspec:\n  type: ExternalName\n  externalName: "10.20.30.40"\n```\nWhat is wrong with this Service, proven above?',
+    options: [
+      'Nothing -- ExternalName works with either a hostname or a raw IP address',
+      'ExternalName only produces a CNAME record, and a CNAME target must be a hostname -- a raw IP address is not a valid CNAME target',
+      'ExternalName requires a selector, which is missing here',
+      'ExternalName Services are cluster-scoped and cannot have a namespace',
+    ],
+    answer: 1,
+    explain: 'Proven above with a real CNAME to kubernetes.io: ExternalName is a DNS-level alias (CNAME) mechanism only. A fixed IP needs a headless Service with a manually-managed Endpoints/EndpointSlice instead.',
   },
 ];
 
