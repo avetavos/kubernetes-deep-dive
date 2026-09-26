@@ -1,0 +1,30 @@
+---
+import { Code } from 'astro-expressive-code/components';
+
+interface Props {
+  code: string;
+  lang?: string;
+}
+
+const { code, lang = 'yaml' } = Astro.props;
+const th = Astro.currentLocale === 'th';
+const title = th ? '🐛 หา bug ในโค้ดนี้' : '🐛 Spot the bug';
+const reveal = th ? 'เฉลย' : 'Show the answer';
+---
+
+<div class="stb">
+  <p class="stb__label">{title}</p>
+  <Code code={code} lang={lang} />
+  <details class="stb__answer">
+    <summary>{reveal}</summary>
+    <div class="stb__body"><slot /></div>
+  </details>
+</div>
+
+<style>
+  .stb { border: 1px solid var(--sl-color-orange); border-radius: 6px; padding: 0.75rem; margin: 1rem 0; }
+  .stb__label { font-weight: 700; margin: 0 0 0.5rem; color: var(--sl-color-orange-high); }
+  .stb__answer { margin-top: 0.5rem; }
+  .stb__answer summary { cursor: pointer; font-weight: 600; color: var(--sl-color-orange-high); }
+  .stb__body { margin-top: 0.5rem; }
+</style>

@@ -301,6 +301,18 @@ for (const enPath of files) {
     }
   }
 
+  // 4b. every TH <Callout title="..."> / <Mermaid title="..."> / <SpotTheBug title="...">
+  // must be Thai. Exempt titles that read as a proper name ("Svelte vs SvelteKit"):
+  // every word capitalised or a connector. ponytail: word heuristic, allowlist if it misfires.
+  const TITLE_RE = /<(Callout|Mermaid|SpotTheBug)\b[^>]*?\btitle="([^"]*)"/g;
+  const thProse = stripQuizArrays(thSrc).replace(/```[\s\S]*?```/g, '');
+  for (const m of thProse.matchAll(TITLE_RE)) {
+    const title = m[2];
+    if (THAI_RE.test(title)) continue;
+    const properName = title.split(/\s+/).every((w) => /^[A-Z0-9]/.test(w) || /[a-z][A-Z]|[._()<>$]/.test(w) || /^(vs|&|and|or|of|in|to|a)$/.test(w));
+    if (!properName) report(`${thPath}: <${m[1]}> title "${title}" has no Thai characters`);
+  }
+
   // 4. every TH quiz q/explain must contain Thai text (see file-header note
   // on why options[] is excluded from this rule).
   thQuiz.forEach((question, i) => {
