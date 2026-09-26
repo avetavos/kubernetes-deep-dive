@@ -106,7 +106,7 @@ spec:
 
 That allows traffic only from Pods labeled `app: prometheus` that are running specifically inside the `monitoring` namespace — a precise, cross-namespace access rule.
 
-Everything below was proven on this module's own kind cluster (`storage-net`) with **Calico** installed (`v3.31.5`, via the Tigera operator) as a real enforcing CNI — a deliberate choice over kind's default `kindnet`, which does not implement NetworkPolicy at all (more on that at the end of this lesson).
+Everything below was proven on this module's own kind cluster (`storage-net`) with **Calico** installed (`v3.31.5`, via the Tigera operator) as a real enforcing CNI — chosen for its richer policy surface (`AdminNetworkPolicy`/`BaselineAdminNetworkPolicy`, below), not because kind's own default CNI can't enforce: kindnet has enforced NetworkPolicy since kind v0.24.0, proven directly at the end of this lesson.
 
 ## Default-deny (ingress AND egress), proven with real timeouts
 
@@ -322,9 +322,41 @@ $ kubectl exec -n netpol-demo client-a -- wget -q -T 3 -O- http://web.netpol-dem
 
 `client-a`'s real Pod IP (`10.244.147.21`) falls inside `10.244.0.0/16` and outside the excluded `10.244.1.0/24`, so it's allowed — proven with a real successful request. `ipBlock` selects by raw CIDR, completely independent of labels; a Pod rescheduled to a different node (a different IP range) can silently fall in or out of an `ipBlock` rule with no label change at all, which is exactly its main fragility versus label-based selectors.
 
-## kindnet does not enforce NetworkPolicy
+## Enforcement depends on the CNI — proven on kindnet too
 
-A single-node kind cluster with the **default** CNI (`kindnet`) was created specifically to check this, and torn down immediately after (never left running). The result was ambiguous in this run — a `wget: bad address` after applying an identical `default-deny-all` policy, on a cluster only 25 seconds old, is at least as consistent with CoreDNS not being fully ready yet on a brand-new single-node cluster as with actual enforcement, and this session's timing didn't isolate the two before the cluster was torn down. Rather than overclaim either way from an inconclusive real result: kindnet's lack of NetworkPolicy support is well established independently of this run — it is a minimal CNI (bridge + host-local IPAM) with **no NetworkPolicy controller at all**, confirmed by [kind's own known-issues documentation](https://kind.sigs.k8s.io/docs/user/known-issues/) and the [kindnet project itself](https://github.com/aojea/kindnet), which is why this lesson's own enforcement proofs above were deliberately run on a Calico-enabled cluster instead of kind's default.
+A `NetworkPolicy` object is only as real as the CNI plugin enforcing it, and that is not a constant across every CNI, or even across versions of the same CNI — some silently accept the object and enforce nothing at all. The only way to know for a given cluster is a real connectivity test — never `kubectl get networkpolicy` succeeding, and never a CNI's name alone.
+
+kind's own default CNI, **kindnet** (`kindnetd`), is the clearest illustration: earlier versions genuinely had no NetworkPolicy controller — just a minimal bridge + host-local IPAM CNI. That changed in [kind v0.24.0](https://github.com/kubernetes-sigs/kind/releases/tag/v0.24.0) (2024-08-15), whose release notes state: *"Out-of-the-box support for network policy via [sigs.k8s.io/kube-network-policies](https://github.com/kubernetes-sigs/kube-network-policies)"* — `kindnetd` now bundles that controller. On the current shared cluster (kind 0.33, `kindnetd:v20260820-69b56db7`) this is real, proven directly rather than assumed from the version number, in a temporary namespace created for exactly this check and deleted immediately after:
+
+```text
+$ kubectl exec -n kindnet-fix-check busybox -- wget -q -T 3 -O- http://10.244.2.7
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+...
+
+$ kubectl apply -f - <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+EOF
+networkpolicy.networking.k8s.io/default-deny-ingress created
+
+$ kubectl exec -n kindnet-fix-check busybox -- wget -q -T 3 -O- http://10.244.2.7
+wget: download timed out
+command terminated with exit code 1
+```
+
+A real HTTP response, then a real timeout after a default-deny `podSelector: {}` / `policyTypes: [Ingress]` policy — on kindnet, on this exact cluster, no Calico involved. A prior attempt at this same test used a Service DNS name with no matching Service and got `bad address`, a name-resolution failure that says nothing about policy enforcement either way; targeting the Pod IP directly removes that ambiguity.
+
+The lesson here is still "always prove it," with a version boundary attached: on a kind cluster older than v0.24.0 (or with `kindnetd` disabled and nothing substituted), this identical policy object would have changed nothing. Calico remains this lesson's primary enforcing CNI for its richer policy surface — `AdminNetworkPolicy`/`BaselineAdminNetworkPolicy` (below) and a mature, dedicated policy engine — not because kindnet fails to enforce today.
 
 ## `AdminNetworkPolicy`: docs-only overview
 
@@ -336,7 +368,7 @@ When reviewing generated NetworkPolicy manifests, check for:
 
 - A "default-deny" policy with `policyTypes: [Ingress]` only, comment claiming it blocks all traffic — proven above, egress stays wide open.
 - A default-deny policy with no accompanying DNS egress rule — proven above, this breaks every in-cluster DNS lookup from every selected Pod (a `bad address` failure, not a connection timeout), a very common self-inflicted outage.
-- NetworkPolicy manifests applied and "verified working" only by `kubectl get networkpolicy` succeeding — proven above (kindnet discussion), the object can exist and be accepted while enforcing nothing at all; enforcement depends entirely on the CNI.
+- NetworkPolicy manifests applied and "verified working" only by `kubectl get networkpolicy` succeeding — proven above (CNI enforcement section), the object can exist and be accepted while enforcing nothing at all on some CNIs or older CNI versions; enforcement depends entirely on the CNI, and only a real connectivity test proves it either way.
 - A `from` list assumed to be an OR-of-ANDs when the author actually wrote one entry combining `namespaceSelector` + `podSelector` (AND) vs meaning two separate criteria (which needs two separate `from` entries) — proven above these produce genuinely different allowed traffic.
 
 <SpotTheBug code={`# k8s/network-policies/lockdown-shop.yaml
@@ -365,7 +397,7 @@ This default-deny-style policy selects every Pod in `shop` for both `Ingress` an
 
 ## Mental Model
 
-A NetworkPolicy is a request handed to the CNI, not a control Kubernetes itself enforces — `kubectl apply` succeeding only proves the object is stored, never that traffic changed (proven above with kindnet). Within one policy's `ingress`/`egress` rules, each `from`/`to` list entry is its own OR-branch, and multiple selector fields *inside one entry* are ANDed together (proven above with two side-by-side real policies) — that's the one syntax fact this whole lesson's depth hangs on.
+A NetworkPolicy is a request handed to the CNI, not a control Kubernetes itself enforces — `kubectl apply` succeeding only proves the object is stored, never that traffic changed, proven both ways above: the identical policy object genuinely blocks traffic on today's kindnet, and did nothing at all on kindnet before kind v0.24.0. Within one policy's `ingress`/`egress` rules, each `from`/`to` list entry is its own OR-branch, and multiple selector fields *inside one entry* are ANDed together (proven above with two side-by-side real policies) — that's the one syntax fact this whole lesson's depth hangs on.
 
 ## Trade-offs
 
@@ -380,7 +412,7 @@ A NetworkPolicy is a request handed to the CNI, not a control Kubernetes itself 
 
 - **"`policyTypes: [Ingress]` alone means egress is now restricted too, since the policy is 'about' this Pod."** Proven above — egress stays completely open unless `Egress` is explicitly listed in `policyTypes` with its own rules.
 - **"A default-deny policy only blocks 'bad' traffic, DNS still works because it's infrastructure."** Proven above with a real `bad address` failure — DNS (port 53) is just another egress destination and is blocked like anything else without an explicit allow rule.
-- **"If `kubectl apply` accepts a NetworkPolicy, it's enforced."** Discussed above — enforcement is entirely up to the CNI; kindnet's own architecture has no NetworkPolicy controller at all, independent of this run's inconclusive timing.
+- **"If `kubectl apply` accepts a NetworkPolicy, it's enforced."** Proven above both ways — enforcement is entirely up to the CNI and its version: kindnet enforced nothing before kind v0.24.0, enforces for real since (proven directly above), and any CNI still needs a real connectivity test to confirm it, never just a successful `apply`.
 - **"`namespaceSelector` and `podSelector` together in a `from` entry is the same as listing them as two entries."** Proven above with two real, contrasting policies — one entry ANDs the conditions (this pod-label AND this namespace), two entries ORs them (either condition).
 
 <Mermaid title="Default flat all-to-all Pod network versus after a NetworkPolicy restricts allowed paths" code={networkPolicyDiagram} />
@@ -397,7 +429,7 @@ export const networkPolicyDiagram = `flowchart LR
   end`;
 
 <Callout title="The one-line takeaway">
-Kubernetes networking is flat by default: every Pod can reach every other Pod, and Pods with no NetworkPolicy selecting them stay fully open. A **NetworkPolicy** (`networking.k8s.io/v1`) selects Pods via `podSelector` and defines allowed `ingress`/`egress` rules, but it only takes effect if the cluster's **CNI plugin** enforces NetworkPolicy at all — kindnet's own architecture has no NetworkPolicy controller (this lesson's proofs ran on Calico instead). A `podSelector: {}` with an empty `ingress: []`/`egress: []` is the standard **default-deny** pattern, and it breaks DNS with a real `bad address` failure (proven above) unless paired with an explicit port-53 egress rule. Omitting `Egress` from `policyTypes` leaves egress completely open (proven above), combining `namespaceSelector` with `podSelector` in **one** `from` entry is an AND while **two** entries is an OR (proven above with contrasting real policies), and `ipBlock` selects by raw CIDR (proven above), independent of and more fragile than labels.
+Kubernetes networking is flat by default: every Pod can reach every other Pod, and Pods with no NetworkPolicy selecting them stay fully open. A **NetworkPolicy** (`networking.k8s.io/v1`) selects Pods via `podSelector` and defines allowed `ingress`/`egress` rules, but it only takes effect if the cluster's **CNI plugin** enforces NetworkPolicy at all, and that depends on the CNI and its version — proven directly on today's kindnet (enforcing since kind v0.24.0 via `kube-network-policies`) and on Calico, this lesson's primary enforcing CNI for its richer policy surface. A `podSelector: {}` with an empty `ingress: []`/`egress: []` is the standard **default-deny** pattern, and it breaks DNS with a real `bad address` failure (proven above) unless paired with an explicit port-53 egress rule. Omitting `Egress` from `policyTypes` leaves egress completely open (proven above), combining `namespaceSelector` with `podSelector` in **one** `from` entry is an AND while **two** entries is an OR (proven above with contrasting real policies), and `ipBlock` selects by raw CIDR (proven above), independent of and more fragile than labels.
 </Callout>
 
 export const quizNetworkPolicies = [
@@ -421,7 +453,7 @@ export const quizNetworkPolicies = [
       'The Pods must be part of a StatefulSet',
     ],
     answer: 1,
-    explain: 'Discussed above: kindnet, kind\'s default CNI, has no NetworkPolicy controller at all -- this lesson\'s enforcement proofs specifically ran on a Calico-enabled cluster instead.',
+    explain: 'Proven above two ways: enforcement depends on the CNI and its version -- today\'s kindnet enforces (kind >= v0.24.0, via kube-network-policies, proven directly with a real timeout), older kindnet did not, and this lesson\'s richer proofs ran on Calico for its fuller policy surface.',
   },
   {
     q: 'How do you express deny-all-ingress for a set of Pods with NetworkPolicy',
