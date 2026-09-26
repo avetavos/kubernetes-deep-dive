@@ -38,6 +38,7 @@ export default defineConfig({
         { label: 'Scheduling & Scaling', items: [{ autogenerate: { directory: 'scheduling-and-scaling' } }] },
         { label: 'Observability & Security', items: [{ autogenerate: { directory: 'observability-and-security' } }] },
         { label: 'Production & Ecosystem', items: [{ autogenerate: { directory: 'production-and-ecosystem' } }] },
+        { label: 'Glossary', translations: { th: 'อภิธานศัพท์' }, link: 'glossary' },
       ],
       }), preact()],
 });
