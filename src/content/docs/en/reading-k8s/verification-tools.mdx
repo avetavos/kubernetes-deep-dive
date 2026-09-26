@@ -1,0 +1,262 @@
+---
+title: Verification tools
+description: 'What kubectl explain (--recursive, --api-version), kubectl apply --dry-run=server vs --dry-run=client, kubectl diff, kubeconform, kube-linter, Pod Security Admission''s warn mode, ValidatingAdmissionPolicy, this course''s own harness, and a static in-browser schema check each actually prove — with real output.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import K8sSchemaCheck from '../../../../components/K8sSchemaCheck.astro';
+
+None of the tools below overlap perfectly, and none is close to complete on its own — the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)**'s "Caught by" line for each of its 24 entries names exactly which one (if any) of the tools below would have caught it, and 16 of those 24 name none of them at apply time. Every output below is real, captured against a live Kubernetes 1.37.0 `kind` cluster.
+
+## `kubectl explain` — the fastest way to know what a field actually is
+
+`kubectl explain` reads the cluster's own OpenAPI schema — not a cached guess, not a version of the docs that might be stale — which makes it the single fastest way to check whether a field, or an entire `kind`, is real on the exact version you're running. `--recursive` expands every nested field in one pass instead of drilling down level by level:
+
+```text
+$ kubectl explain deployment.spec.strategy --recursive
+FIELDS:
+  rollingUpdate	<RollingUpdateDeployment>
+    maxSurge	<IntOrString>
+    maxUnavailable	<IntOrString>
+  type	<string>
+  enum: Recreate, RollingUpdate
+```
+
+`--api-version` is what makes `kubectl explain` genuinely useful for the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)**'s entry 5 — a HorizontalPodAutoscaler has two live shapes, and explaining each version side by side proves they never overlap:
+
+```text
+$ kubectl explain hpa.spec --api-version=autoscaling/v1
+FIELDS:
+  maxReplicas	<integer> -required-
+  ...
+
+$ kubectl explain hpa.spec --api-version=autoscaling/v2
+FIELDS:
+  behavior	<HorizontalPodAutoscalerBehavior>
+  ...
+```
+
+`v1`'s fields (`targetCPUUtilizationPercentage`) and `v2`'s (`metrics`, `behavior`) simply don't exist on the other version — `kubectl explain` with `--api-version` is a faster, offline way to confirm the mismatch entry 5 already proves with a real, live `BadRequest`.
+
+## `kubectl apply --dry-run=server` vs `--dry-run=client` — one of these talks to the API server, one does not
+
+This is the single most important distinction in this lesson, and the two flags are easy to conflate because both print an almost identical success line. `--dry-run=client` never contacts the API server at all — it only validates the request can be *constructed*, using schema information already cached locally. `--dry-run=server` sends the real request, with `?dryRun=All`, all the way through the same OpenAPI validation and admission chain a real apply would hit, and only skips the final etcd write. Proven directly, on the exact same two catalog bugs, one command apart:
+
+```text
+$ kubectl apply --dry-run=client -f hpa-v1-v2-mixed-shape.yaml
+horizontalpodautoscaler.autoscaling/web created (dry run)
+
+$ kubectl apply --dry-run=server -f hpa-v1-v2-mixed-shape.yaml
+Error from server (BadRequest): ... strict decoding error: unknown field "spec.metrics"
+```
+
+```text
+$ kubectl apply --dry-run=client -f deployment-selector-immutable.yaml   # an existing Deployment, selector changed
+deployment.apps/web configured (dry run)
+
+$ kubectl apply --dry-run=server -f deployment-selector-immutable.yaml
+The Deployment "web" is invalid: spec.selector: Invalid value: ...: field is immutable
+```
+
+`--dry-run=client` reports success on **both** real, current bugs — it has no way to run server-side strict decoding or compare against the object's actually-stored state, since it never leaves your machine. `--dry-run=server` is the only one of the two worth trusting as a review gate; see **[`kubectl` & Declarative YAML](/kubernetes/en/foundations/kubectl-and-declarative-yaml/)** for the full mechanics of both flags and Server-Side Apply.
+
+## `kubectl diff` — see exactly what an apply would change, before it changes it
+
+`kubectl diff -f` runs the same merge Server-Side Apply would, against the live object, and prints a real unified diff without changing anything:
+
+```text
+$ kubectl diff -f deployment-changed.yaml
+--- LIVE
++++ MERGED
+@@
+-  replicas: 2
++  replicas: 4
+   selector:
+     matchLabels:
+@@
+       containers:
+-      - image: nginx:1.27-alpine
++      - image: nginx:1.29-alpine
+```
+
+This is the real, direct way to answer "what does this manifest actually change" for a manifest an AI assistant claims is "just a small tweak" — read the diff, not the claim.
+
+## `kubeconform` — real OpenAPI schema validation, offline, in default and strict mode
+
+`kubeconform` validates a manifest's shape against the real Kubernetes OpenAPI schema for a target version, with no cluster required. Its default mode is lenient about extra fields; `-strict` is where it earns its keep:
+
+```text
+$ docker run --rm -v "$PWD":/data ghcr.io/yannh/kubeconform:latest -strict -summary /data/bad.yaml
+/data/bad.yaml - Deployment web is invalid: problem validating schema: ... at '/spec/template/spec/containers/0':
+additional properties 'privileged' not allowed
+Summary: 1 resource found in 1 file - Valid: 0, Invalid: 1, Errors: 0, Skipped: 0
+```
+
+That catches a `privileged` field placed directly under a container (instead of nested under `securityContext`, where it actually belongs) — a shape mistake that is otherwise easy to misread as correct at a glance. Against a removed `apiVersion`, `kubeconform` reports a different, equally real signal — it has no schema for a version that no longer exists:
+
+```text
+$ docker run --rm -v "$PWD":/data ghcr.io/yannh/kubeconform:latest -summary /data/extensions-v1beta1-deployment.yaml
+/data/extensions-v1beta1-deployment.yaml - Deployment web failed validation: could not find schema for Deployment
+Summary: 1 resource found in 1 file - Valid: 0, Invalid: 0, Errors: 1, Skipped: 0
+```
+
+No cluster needed for either check — this is exactly the tool to run in CI, before anything ever reaches a real `kind`/staging cluster.
+
+## `kube-linter` — real, current findings against a security-and-reliability rule set
+
+`kube-linter` (real output below, from `stackrox/kube-linter`, run via Docker against the exact catalog-shaped `web` Deployment from entry 18/19) checks a much broader rule set than schema validity — resource requests, image tags, anti-affinity, root filesystem, privilege escalation, all at once:
+
+```text
+$ docker run --rm -v "$PWD":/data stackrox/kube-linter:latest lint /data/lint-target.yaml
+Error: found 8 lint errors
+KubeLinter 0.8.3
+
+.../lint-target.yaml: container "web" is privileged (check: privileged-container, ...)
+.../lint-target.yaml: container "web" is Privileged hence allows privilege escalation. (check: privilege-escalation-container, ...)
+.../lint-target.yaml: container "web" is not set to runAsNonRoot (check: run-as-non-root, ...)
+.../lint-target.yaml: container "web" has cpu request 0 (check: unset-cpu-requirements, ...)
+.../lint-target.yaml: container "web" has memory limit 0 (check: unset-memory-requirements, ...)
+.../lint-target.yaml: The container "web" is using an invalid container image, "nginx:latest" (check: latest-tag, ...)
+.../lint-target.yaml: object has 3 replicas but does not specify inter pod anti-affinity (check: no-anti-affinity, ...)
+.../lint-target.yaml: container "web" does not have a read-only root file system (check: no-read-only-root-fs, ...)
+```
+
+One command surfaces the missing-`requests` root cause behind the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)**'s entry 12, the `privileged: true` pattern from entry 18, and several checks this course's catalog doesn't cover at all (`:latest` tags, anti-affinity, read-only root filesystem) — `kube-score` and `polaris` cover overlapping-but-not-identical rule sets the same way, all worth running, none of them a substitute for the others.
+
+## Pod Security Admission's `warn` mode — a live linter running on every real apply
+
+Unlike every tool above, Pod Security Admission runs **inside the API server itself**, on every real request, whether or not anyone is looking — and its `warn` level is specifically designed as a non-blocking linter: it prints the same violation text an `enforce` rejection would, and admits the object anyway.
+
+```text
+$ kubectl apply -f privileged-realistic.yaml   # namespace: enforce=baseline, warn=restricted
+Warning: would violate PodSecurity "restricted:latest": privileged (container "c" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (...), unrestricted capabilities (...), runAsNonRoot != true (...), seccompProfile (...)
+pod/privileged-realistic created
+```
+
+Setting `warn` to a stricter level than `enforce` cluster-wide (or namespace-wide) turns every real `kubectl apply` into a free, zero-setup linter pass — see **[Pod & Cluster Security](/kubernetes/en/observability-and-security/pod-and-cluster-security/)** for the full `privileged`/`baseline`/`restricted` level comparison and the real `enforce` rejection this same message produces.
+
+## `ValidatingAdmissionPolicy` — CEL rules for anything Pod Security Admission doesn't cover
+
+Pod Security Admission's rule set is fixed — it cannot express an organization-specific rule like "only pull images from `myregistry.internal/*`." `ValidatingAdmissionPolicy` (CEL-based, built into the API server, GA since Kubernetes 1.30) fills exactly that gap; **[Pod & Cluster Security](/kubernetes/en/observability-and-security/pod-and-cluster-security/)** proves a real registry-allowlist policy rejecting a real Pod with a real, current CEL-driven error. Treat it the same way as PSA: a live, on-every-request check, not a CI-time or offline one.
+
+## This course's own harness: `tools/verify-manifests.mjs`
+
+Every `yaml` fence in this course tagged with a real path first line (`# k8s/<lesson>/<name>.yaml`) is collected by `tools/verify-manifests.mjs` and run through `kubectl apply --dry-run=server` against this course's own shared `verify-k8s` `kind` cluster (Kubernetes 1.37, Gateway API and VolumeSnapshot CRDs preinstalled):
+
+```bash
+npm run verify
+```
+
+A fence deliberately showing broken YAML (most of the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)**'s "code AI typically writes" examples) starts with `# @expect-error <reason>`, so the harness skips collecting it entirely — the lesson prose carries the real, separately-captured `dry-run=server`/apply/describe/curl output instead, exactly as shown throughout that lesson. `node tools/verify-manifests.mjs --apply <module>/<lesson>` goes further for one lesson at a time: it really applies that lesson's fences into a temporary namespace, waits for Pods, prints `get all` and events, then cleans up — the only way this course's harness reproduces a genuinely runtime-only signal (an `<unknown>` HPA target, a blocked eviction, a real restart loop) on demand, the same way this lesson's own proofs were captured.
+
+## Statically checking a manifest before you apply it
+
+`kubectl apply --dry-run=server` against a real API server (this course's own `tools/verify-manifests.mjs` harness runs exactly that) is the real test — but a quick static check, entirely in your browser, catches the obvious mistakes (unknown fields, missing required fields, wrong types, a removed `apiVersion`) before you even reach a cluster:
+
+<K8sSchemaCheck id="ksc-verification-tools" code={kscVerifySample} />
+
+export const kscVerifySample = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.31
+          privileged: true
+`;
+
+This is the same static, in-browser check already embedded in **[`kubectl` & Declarative YAML](/kubernetes/en/foundations/kubectl-and-declarative-yaml/)** — not a second, separate tool, just a second place it's genuinely useful to reach for one: right before applying a manifest this module just taught you to distrust on sight.
+
+## Mental Model
+
+<Mermaid title="Static tools prove things from source alone; dynamic tools need a real cluster, a real request, or real time" code={verificationToolsDiagram} />
+
+export const verificationToolsDiagram = `flowchart TD
+  subgraph Static["Static (no cluster needed)"]
+    Explain["kubectl explain --recursive/--api-version<br/>real schema, offline"]
+    Conform["kubeconform -strict<br/>shape errors, removed apiVersions"]
+    Lint["kube-linter / kube-score / polaris<br/>security + reliability rules"]
+    Schema["K8sSchemaCheck (in-browser)<br/>same class of check as kubeconform, client-side"]
+  end
+  subgraph Server["Needs a real API server"]
+    DryRun["kubectl apply --dry-run=server<br/>full OpenAPI validation + admission chain"]
+    Diff["kubectl diff<br/>real merge against the live object"]
+    PSA["Pod Security Admission warn/enforce<br/>runs on every real request"]
+    VAP["ValidatingAdmissionPolicy<br/>org-specific CEL rules"]
+    Harness["tools/verify-manifests.mjs<br/>this course's own dry-run=server sweep"]
+  end
+  subgraph Runtime["Needs real time or a real request"]
+    Describe["kubectl describe / get events<br/>HPA unknown, blocked drain, restart loop"]
+    Curl["curl from inside the cluster<br/>Service endpoints, NetworkPolicy direction, DNS"]
+  end
+`;
+
+<Callout title="The one-line takeaway">
+Every tool on this page is a filter, not a verdict — even run together, they leave most of the AI Bug Catalog's 24 patterns (16 of which apply cleanly) uncaught until real time or a real request passes. Run `kubectl explain`/`kubeconform`/`kube-linter` first (no cluster needed), then `kubectl apply --dry-run=server` and this course's own harness against a real API server, then still work through the <a href="/kubernetes/en/reading-k8s/review-checklist/">Review Checklist</a> by eye for everything only a `describe`, an `event`, or a real request can surface.
+</Callout>
+
+export const quizVerificationTools = [
+  {
+    q: "```text\n$ kubectl apply --dry-run=client -f hpa-v1-v2-mixed-shape.yaml\nhorizontalpodautoscaler.autoscaling/web created (dry run)\n```\nGiven this real output, what does a clean `--dry-run=client` result actually prove about strict server-side field validation?",
+    options: [
+      "That the object has no unknown fields",
+      "Nothing about server-side strict decoding at all -- --dry-run=client never contacts the API server, so it cannot run the exact check that rejects this object with a real BadRequest under --dry-run=server",
+      "That the object is definitely valid",
+      "That autoscaling/v1 and v2 are compatible",
+    ],
+    answer: 1,
+    explain: "Proven directly: the identical file that --dry-run=client reports as 'created (dry run)' fails --dry-run=server with a real, current strict decoding BadRequest -- client-side dry-run only validates that a request CAN be constructed, using local cached schema information, never a live round trip.",
+  },
+  {
+    q: "Why does kubeconform's default (non-strict) mode accept a container with a `privileged` field nested directly under it (instead of under securityContext), while `-strict` rejects it?",
+    options: [
+      "kubeconform never checks that field regardless of mode",
+      "Default mode tolerates additional/unknown properties for compatibility with partial or evolving manifests; -strict enforces the schema's 'additionalProperties: false' rule, so anything not explicitly defined at that exact path (including a correct field name in the wrong nesting) is rejected",
+      "Strict mode only checks required fields",
+      "This is a kubeconform bug",
+    ],
+    answer: 1,
+    explain: "Proven above: the identical file passes kubeconform's default mode and fails only with -strict, printing the exact JSON-pointer path and the real 'additional properties not allowed' message.",
+  },
+  {
+    q: "Why is Pod Security Admission's `warn` mode described as a 'live linter' rather than a CI-time tool like kube-linter or kubeconform?",
+    options: [
+      "It isn't different from the others -- all tools run at the same stage",
+      "warn runs inside the API server on every real kubectl apply, printing the same violation text an enforce rejection would while still admitting the object -- it needs no separate CI step or offline run, and it sees the object's fully-defaulted, real final shape, not just its source YAML",
+      "warn mode only works in CI pipelines",
+      "warn is identical to enforce, just renamed",
+    ],
+    answer: 1,
+    explain: "Proven directly: `kubectl apply` against a namespace with warn=restricted prints the real violation text and still creates the Pod -- the check runs live, server-side, on the actual admitted object, not a static read of the YAML file.",
+  },
+  {
+    q: "Why does this course's own `tools/verify-manifests.mjs` mark most of the AI Bug Catalog's 'code AI typically writes' fences with `# @expect-error <reason>` instead of a plain path comment?",
+    options: [
+      "To hide the bugs from readers",
+      "So the harness skips collecting a fence that is deliberately broken -- the lesson prose carries the real, separately-captured dry-run=server/apply/describe/curl output instead of asking every run to reproduce an intentional failure",
+      "@expect-error fences run faster",
+      "It has no effect on the harness at all",
+    ],
+    answer: 1,
+    explain: "Without the marker, a deliberately buggy manifest would make every run of tools/verify-manifests.mjs report a real error for YAML that is intentionally wrong -- the marker tells the harness this fence is deliberately uncollected, matching the convention used across this course.",
+  },
+];
+
+<Quiz client:visible id="reading-k8s/verification-tools" questions={quizVerificationTools} />
+
+<ProgressTracker client:visible id="reading-k8s/verification-tools" />

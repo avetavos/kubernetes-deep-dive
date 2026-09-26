@@ -1,0 +1,179 @@
+---
+title: How to read Kubernetes YAML you did not write
+description: 'A reading order for AI-generated Kubernetes manifests — API version and shape first, then workloads, scheduling, networking, storage and config, security, then observability — because most of what makes generated Kubernetes YAML wrong applies cleanly and fails later, silently.'
+sidebar:
+  order: 0
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+Every earlier module in this course taught you to *write* Kubernetes manifests. This module teaches the other half: reading a manifest someone — or something — else wrote, and deciding whether it is actually correct. An AI assistant hands you a Deployment, a NetworkPolicy, a StatefulSet that looks exactly like the examples you have been studying, uses `kind`/`apiVersion` pairs that read as fluent and current, and — most of the time — **applies without a single error**. That last part is the trap this module exists to close: `kubectl apply --dry-run=server` runs full OpenAPI schema validation and every admission plugin, and it still only rejects **8 of the 24 patterns** the next lesson catalogs. The other 16 create a perfectly healthy-looking object and fail later — silently, in a `kubectl describe`, a `get events`, a real `curl`, a drain, or a reschedule to a different node.
+
+Three training-data problems compound this. First, Kubernetes' API has genuinely changed shape over a decade of releases most public tutorials still describe — `extensions/v1beta1`, `PodSecurityPolicy`, the old Ingress `backend.serviceName` shape are all still fluent-looking, syntactically valid-*seeming* YAML that a current 1.37 API server flatly does not recognize anymore. Second, a huge fraction of Kubernetes YAML online is a **copied blog-post snippet** — correct for the exact scenario the post described, silently wrong for a reader's different namespace, different replica count, or different CNI. Third, the fastest answer to almost any in-cluster permission error is "**fix it by adding `privileged: true`**" — it genuinely makes the error go away, at the cost of disabling nearly every security boundary the container had, rather than granting the one specific thing the workload actually needed. The seven steps below are the order that actually surfaces these failures, and every later lesson in this module drills one part of it.
+
+<Mermaid title="Reading order for a Kubernetes manifest you did not write" code={readingOrderDiagram} />
+
+export const readingOrderDiagram = `flowchart TD
+  A["1. API version &amp; shape<br/>is this apiVersion still real on 1.37?"] --> B["2. Workloads<br/>selector, restartPolicy, update strategy, headless Service"]
+  B --> C["3. Scheduling<br/>requests set? HPA paired correctly? PDB leaves room?"]
+  C --> D["4. Networking<br/>does the selector really match? does policyTypes say what it means?"]
+  D --> E["5. Storage &amp; config<br/>does this data survive a reschedule? is a Secret really secret?"]
+  E --> F["6. Security<br/>privileged as a permission shortcut, dropped capabilities, RBAC scope"]
+  F --> G["7. Observability<br/>do the probes gate the right thing, can you even exec into this?"]
+`;
+
+## 1. API version & shape
+
+Before anything else, check whether the `apiVersion`/`kind` pair this manifest uses is still real on the cluster you're deploying to — because a removed API version is a client-side discovery failure that never reaches business logic at all, and training data spanning a decade of Kubernetes releases reproduces retired shapes constantly.
+
+- **What to look for:** does `apiVersion` match one still listed in `kubectl api-resources`? Is it a Deployment/CronJob/Ingress that predates `apps/v1`/`batch/v1`/the current `networking.k8s.io/v1` shape? Does an `autoscaling/v1` HPA also carry `v2`-only fields like `metrics`, or vice versa? Does the manifest reference a `kind` that was removed outright (`PodSecurityPolicy`)?
+- **The question to ask:** would `kubectl explain <kind>.<field>` even resolve this shape on the version you're actually running, or does it only resolve on the version a training corpus was frozen at?
+- **Which lesson explains it:** the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)**'s API-version group (entries 1–5) for the real, current discovery/decoding errors; **[`kubectl` & Declarative YAML](/kubernetes/en/foundations/kubectl-and-declarative-yaml/)** for `kubectl explain`, `--dry-run=server` vs `--dry-run=client`, and Server-Side Apply.
+
+## 2. Workloads
+
+Once the API shape is real, check whether the workload object itself is internally consistent — a Deployment, StatefulSet, Job, or CronJob can be perfectly schema-valid and still be wrong in ways that only show up once it already exists, or once real time passes.
+
+- **What to look for:** does `spec.selector` match `template.metadata.labels` — and, for an *existing* object, is anyone trying to change that selector at all? Is a Job's `restartPolicy` ever `Always`? Does a StatefulSet's `serviceName` point at a Service that's real *and* headless? Is `concurrencyPolicy` set deliberately on a CronJob, or left at its silent `Allow` default? Are `maxUnavailable`/`maxSurge` both zero?
+- **The question to ask:** if this object already existed in the cluster, would applying this exact YAML change anything the API server refuses to change in place — and if it's brand new, does anything about the object's internal cross-references (`serviceName`, `concurrencyPolicy` left implicit) only fail once real time or a real DNS lookup happens?
+- **Which lesson explains it:** the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)**'s Workloads group (entries 6–11) for the real immutable-selector error, the real `NXDOMAIN`, and the real overlapping-Job proof; **[Deployments and ReplicaSets](/kubernetes/en/workloads/deployments-and-replicasets/)**, **[Jobs & CronJobs](/kubernetes/en/workloads/jobs-and-cronjobs/)**, and **[StatefulSets and DaemonSets](/kubernetes/en/workloads/statefulsets-and-daemonsets/)** for each mechanism proven in full depth.
+
+## 3. Scheduling
+
+A workload and its autoscaling/disruption objects are usually generated together, edited separately, and only fail as a pair — HPA and PodDisruptionBudget bugs are almost always about a second object silently disagreeing with the first.
+
+- **What to look for:** if an HPA targets a workload on CPU/memory utilization, does that workload actually set `resources.requests`? Does a PodDisruptionBudget's `minAvailable` (or `maxUnavailable`) leave real room below the full replica count?
+- **The question to ask:** does `kubectl describe hpa`/`kubectl get pdb` already show the real, current signal (`<unknown>` targets, `ALLOWED DISRUPTIONS: 0`) before you even attempt a scale event or a drain?
+- **Which lesson explains it:** the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)**'s Scheduling group (entries 12–13) for the real `FailedGetResourceMetric` and the real blocked-eviction text; **[Horizontal Pod Autoscaling](/kubernetes/en/scheduling-and-scaling/horizontal-pod-autoscaling/)** and **[Pod Disruption & Cluster Autoscaling](/kubernetes/en/scheduling-and-scaling/pod-disruption-and-cluster-autoscaling/)** for both mechanisms proven in full.
+
+## 4. Networking
+
+A Service's `selector` and a NetworkPolicy's `policyTypes` are both plain, unvalidated matchers — the API server has no way to know what a "correct" value should be, so a typo or a forgotten direction produces a perfectly valid object that just doesn't do what its name implies.
+
+- **What to look for:** does a Service's `selector` genuinely match the labels on the Pods it's meant to front — checked against the real `template.metadata.labels`, not assumed? Does a NetworkPolicy's `policyTypes` list every direction its name or comment claims to restrict? If it lists `Egress` with no rules at all, does anything downstream (DNS resolution to CoreDNS) still need an explicit allow?
+- **The question to ask:** does `kubectl get endpointslice` for this Service actually list anything — and does a real request from inside the cluster, in the specific direction this policy claims to restrict, actually behave the way the object's name suggests?
+- **Which lesson explains it:** the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)**'s Networking group (entries 14–15) for the real, live-cluster proof that a NetworkPolicy's un-listed direction is not restricted at all, and that a real default-deny blocks DNS resolution too.
+
+## 5. Storage & configuration
+
+Two Kubernetes-specific misconceptions recur constantly in generated manifests, and neither one is a schema error: a volume that looks portable but isn't, and a Secret that looks encrypted but isn't.
+
+- **What to look for:** does a `hostPath` volume carry data meant to survive a reschedule onto a different node? Does a comment or a variable name call a `Secret`'s contents "encrypted," when its `data` fields are only base64-encoded?
+- **The question to ask:** if this exact Pod were deleted and rescheduled onto a different node right now, would the data underneath this volume still be there — and if someone with ordinary `get secret` RBAC access ran `base64 -d` on this object's `data` field, would they read the real value?
+- **Which lesson explains it:** the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)**'s Storage & configuration group (entries 16–17) for the real cross-node reschedule proof and the real `base64 -d` decode.
+
+## 6. Security
+
+Faced with a permission error, the fastest available fix an AI assistant reaches for is almost always the broadest one — and every one of these failure modes is a *grant*, not a mistake the API server can flag on its own, because Kubernetes has no way to know "more privilege than this workload needs" from the YAML alone.
+
+- **What to look for:** does `securityContext.privileged: true` (or `hostNetwork`/`hostPID`/`hostIPC`) appear as the apparent fix for an in-container permission error? Are Linux capabilities ever dropped (`capabilities.drop: ["ALL"]`), with only the specific one or two actually needed added back? Is `automountServiceAccountToken` left at its default `true` for a workload that never calls the API server? Is a workload's ServiceAccount ever bound to `cluster-admin`?
+- **The question to ask:** what is the one specific capability, `runAsUser`, or RBAC verb this workload actually needs — and does the manifest grant exactly that, or the broadest thing that also happens to work?
+- **Which lesson explains it:** the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)**'s Security group (entries 18–21) for the real Pod Security Admission rejection text and the real `kubectl auth can-i` proof of `cluster-admin` overreach; **[Pod & Cluster Security](/kubernetes/en/observability-and-security/pod-and-cluster-security/)** and **[RBAC & Service Accounts](/kubernetes/en/observability-and-security/rbac-and-service-accounts/)** for both mechanisms in full depth.
+
+## 7. Observability
+
+Last, check whether the manifest's own health signals — probes — actually gate what they claim to, and whether the container underneath can even be inspected when something goes wrong.
+
+- **What to look for:** does a Deployment sitting behind a Service have a `readinessProbe` that checks the actual application endpoint, not just "process is running"? Are `livenessProbe` and `readinessProbe` ever pointed at the identical endpoint with no `startupProbe` cushioning a slow warm-up? Does a debugging instruction assume `kubectl exec -it <pod> -- sh` always works, even against a distroless image with no shell at all?
+- **The question to ask:** during this container's real, actual startup window — not the steady state — what does a real request against the Service actually return, and if you genuinely needed a shell inside this exact container right now, would one exist?
+- **Which lesson explains it:** the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)**'s Observability group (entries 22–24) for the real `Connection refused` during a startup window, the real liveness-triggered restart loop, and the real `OCI runtime exec failed` on a distroless image; **[Probes: Liveness, Readiness, Startup](/kubernetes/en/observability-and-security/probes-liveness-readiness-startup/)** and **[Logging & Metrics](/kubernetes/en/observability-and-security/logging-and-metrics/)** for both mechanisms proven in full, including `kubectl debug --target`.
+
+## What this module covers next
+
+- **[The AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)** — 24 specific patterns, each with the manifest AI typically writes, the real `dry-run=server`/apply/describe/curl output it produces on a live cluster, and the fix.
+- **[Review Checklist](/kubernetes/en/reading-k8s/review-checklist/)** — the same 24 patterns as a one-page, seven-group checklist, each line linking the lesson that proves it.
+- **[Verification Tools](/kubernetes/en/reading-k8s/verification-tools/)** — what `kubectl explain`, `--dry-run=server` vs `--dry-run=client`, `kubectl diff`, `kubeconform`, `kube-linter`, Pod Security Admission's `warn` mode, `ValidatingAdmissionPolicy`, this course's own harness, and a static in-browser schema check each actually prove.
+- Three worked reviews — **[Worked Review 1](/kubernetes/en/reading-k8s/worked-review-1/)**, **[Worked Review 2](/kubernetes/en/reading-k8s/worked-review-2/)**, **[Worked Review 3](/kubernetes/en/reading-k8s/worked-review-3/)** — applying this reading order to full, AI-generated manifest sets (a web app Deployment+Service+Ingress+HPA, a stateful database StatefulSet+PVC+backup CronJob, and a platform namespace with RBAC+NetworkPolicy+PDB+Pod Security Admission). These three lessons are written and maintained separately from this one; if a link below 404s while that work is still in progress, the reading order and the catalog above stand on their own regardless.
+
+## Mental Model
+
+```text
+Reading order for a Kubernetes manifest you did not write:
+
+1. API version & shape  → is this apiVersion/kind pair still real on the version you're running?
+2. Workloads             → is the object internally consistent, and would a change to it even be accepted?
+3. Scheduling            → do the workload and its HPA/PDB actually agree with each other?
+4. Networking            → does the selector really match, does policyTypes say what it means?
+5. Storage & config      → does this data survive a reschedule, is a Secret really secret?
+6. Security              → is this the narrowest grant that works, or the broadest one that also works?
+7. Observability         → do the probes gate what they claim, can you actually get inside if you need to?
+
+"It applied without an error" answers almost none of these — 16 of the 24 patterns in this
+module's catalog apply cleanly and fail later, silently.
+```
+
+## Common Misconceptions
+
+- **"If it applies without an error, it's correct."** Proven throughout this module's catalog: 16 of its 24 patterns pass `kubectl apply --dry-run=server` cleanly — it runs full OpenAPI schema validation and every admission plugin, and it still has no way to check a Service selector against real Pod labels, a StatefulSet's `serviceName` against a real Service, or an HPA against the Deployment it targets having `resources.requests` set at all.
+- **"AI-generated Kubernetes YAML just needs a newer prompt."** The problem isn't staleness alone — `extensions/v1beta1`, `PodSecurityPolicy`, and the old Ingress `backend.serviceName` shape are specifically *fluent-looking*, syntactically plausible Kubernetes that happens to target an API surface this course's installed 1.37 no longer has.
+- **"A silent failure is rarer than a rejected `apply`, so it matters less."** The opposite is closer to true in this catalog: a PodDisruptionBudget that blocks every future drain, a NetworkPolicy that restricts a direction nobody asked it to and leaves the intended one wide open, or a Secret that reads as "encrypted" in a comment ship to production with zero errors, zero warnings, and zero indication anything is wrong.
+- **"`privileged: true` is a stronger version of the one capability my container needs."** It is a different category of grant — it disables nearly every container security boundary at once, not just the one thing that was actually missing.
+
+<Callout title="The one-line takeaway">
+Read a Kubernetes manifest in this order — API version and shape, workloads, scheduling, networking, storage and config, security, then observability — because each step changes what the next one means, and because "it applied without an error" tells you the object is schema-valid, never that it does what its name or comments claim.
+</Callout>
+
+export const quizReadingK8sIndex = [
+  {
+    q: "Why does this module check API version & shape before checking anything about workloads or networking?",
+    options: [
+      "Because apiVersion is always the shortest field to read",
+      "Because a removed or mismatched apiVersion/kind pair is a client-side discovery failure that never even reaches the object's own business logic — every later question about the object's content is moot if the object itself can't be created at all",
+      "Because networking objects never have apiVersion issues",
+      "The order does not matter",
+    ],
+    answer: 1,
+    explain: "Proven in the AI Bug Catalog's entries 1-4: 'no matches for kind X in version Y' is a RESTMapper/discovery error, resolved before the API server ever evaluates the object's fields, selectors, or cross-references.",
+  },
+  {
+    q: "```text\n$ kubectl apply -f statefulset.yaml\nstatefulset.apps/db created\n$ kubectl get pod\nNAME   READY   STATUS\ndb-0   1/1     Running\ndb-1   1/1     Running\n```\nGiven this real output, what does a healthy `kubectl get` actually prove about a StatefulSet's `serviceName`?",
+    options: [
+      "That serviceName points at a real, headless Service",
+      "Nothing about serviceName at all — proven in the AI Bug Catalog, the API server never validates serviceName against an existing Service, so a StatefulSet can be perfectly healthy while every per-Pod DNS name it should provide returns NXDOMAIN",
+      "That the StatefulSet has no bugs",
+      "That a headless Service was auto-created",
+    ],
+    answer: 1,
+    explain: "Proven directly: db-0 and db-1 both report 1/1 Running with serviceName pointing at a Service that was never created — the only way to catch this is a real DNS lookup, never a healthy kubectl get.",
+  },
+  {
+    q: "Why does this module treat 'privileged: true fixes a permission error' as a Security reading-order concern rather than a routine debugging step?",
+    options: [
+      "privileged: true never actually fixes anything",
+      "It genuinely does make the error disappear, by disabling nearly every container security boundary at once — the reading order exists because that trade-off is invisible unless you specifically ask 'what is the ONE thing this container actually needed'",
+      "Security concerns only apply to RBAC objects",
+      "privileged: true is always rejected by the API server",
+    ],
+    answer: 1,
+    explain: "Proven in the AI Bug Catalog's entry 18: the real Pod Security 'restricted' rejection names five separate fields at once (privileged, allowPrivilegeEscalation, capabilities, runAsNonRoot, seccompProfile) that privileged: true fails simultaneously -- confirming it is a blanket grant, not a targeted one.",
+  },
+  {
+    q: "Which step in this reading order specifically asks 'does kubectl get endpointslice for this Service actually list anything'?",
+    options: [
+      "API version & shape",
+      "Networking",
+      "Scheduling",
+      "Observability",
+    ],
+    answer: 1,
+    explain: "The Networking step exists precisely because a Service's selector is an unvalidated matcher — proven with a real EndpointSlice listing <unset> ENDPOINTS in the AI Bug Catalog's entry 11, with zero error anywhere at apply time.",
+  },
+  {
+    q: "Why does this module say 16 of its 24 catalog entries are MORE concerning than the 8 the API server rejects outright, rather than less?",
+    options: [
+      "It doesn't -- rejected entries are worse",
+      "A rejected apply is loud and immediate -- a reader notices instantly. A silently-accepted object with a real bug (a blocked drain, an unrestricted egress direction, data that vanishes on reschedule) looks identical to a correct one until something depends on the exact behaviour that's wrong, often much later and in production",
+      "Silent failures are rarer in practice",
+      "The API server always catches security-related bugs eventually",
+    ],
+    answer: 1,
+    explain: "Proven throughout the catalog: entries like the PodDisruptionBudget that blocks every future drain, or the NetworkPolicy that restricts the wrong direction, apply cleanly and only surface once a real drain, a real request, or a real DNS lookup depends on the behaviour the object silently got wrong.",
+  },
+];
+
+<Quiz client:visible id="reading-k8s/index" questions={quizReadingK8sIndex} />
+
+<ProgressTracker client:visible id="reading-k8s/index" />

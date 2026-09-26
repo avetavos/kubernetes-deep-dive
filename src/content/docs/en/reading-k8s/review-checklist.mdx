@@ -1,0 +1,119 @@
+---
+title: Review checklist
+description: 'A one-page, eight-group checklist for reviewing Kubernetes manifests — each line a yes/no question linking the lesson that explains the underlying rule.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+This is the checklist to run down — by eye, on any diff, yours or an AI's — after the tools in **[Verification Tools](/kubernetes/en/reading-k8s/verification-tools/)** have run and come back clean. It fits on one printed page on purpose: a checklist nobody actually opens during a review is worthless. Every line links the lesson that explains *why*, so this page stays a list, not a re-run of the course. The groups follow the same order as **[How to read Kubernetes YAML you did not write](/kubernetes/en/reading-k8s/)**, plus a final Tooling group covering how each of the other seven actually gets verified.
+
+<Mermaid title="What actually catches each group, if anything" code={checklistCoverageDiagram} />
+
+export const checklistCoverageDiagram = `flowchart LR
+  A["API versions &amp; shape"] --> T["dry-run=server catches most<br/>(discovery errors, strict decoding)"]
+  W["Workloads"] --> P["Partial: immutable-field errors caught,<br/>headless-Service/concurrency gaps are not"]
+  S["Scheduling"] --> P
+  N["Networking"] --> M["Mostly human review<br/>(selector/policyTypes are unvalidated matchers)"]
+  ST["Storage &amp; config"] --> M
+  Sec["Security"] --> P2["Partial: PSA/VAP catch known fields,<br/>RBAC over-grant needs auth can-i"]
+  O["Observability"] --> M
+`;
+
+## API versions & shape
+
+- Does `apiVersion` still resolve on the cluster you're deploying to (`kubectl api-resources`, `kubectl explain <kind>`)? `extensions/v1beta1`, `batch/v1beta1`, and `networking.k8s.io/v1beta1` are all removed. See the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)**, entries 1–3.
+- Does anything still reference `kind: PodSecurityPolicy`? Removed in Kubernetes 1.25 — the replacement is a Namespace label plus Pod Security Admission. See entry 4.
+- Does an `Ingress` use the current `backend.service.name`/`port.number` shape (with `pathType` set), not the removed `backend.serviceName`/`servicePort`? See entry 3.
+- Does a `HorizontalPodAutoscaler` mix `autoscaling/v1` fields (`targetCPUUtilizationPercentage`) with `autoscaling/v2`-only fields (`metrics`, `behavior`) in the same object? A real, current server-side `BadRequest`. See entry 5.
+
+## Workloads
+
+- Is anyone attempting to change an *existing* Deployment's `spec.selector`? A real, current `field is immutable` rejection. See the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)**, entry 6, and **[Deployments and ReplicaSets](/kubernetes/en/workloads/deployments-and-replicasets/)**.
+- Does a Job's Pod template ever set `restartPolicy: Always`? Only `OnFailure`/`Never` are valid — see entry 7 for the real, current rejection.
+- Does a Deployment's `strategy.rollingUpdate` set both `maxUnavailable: 0` and `maxSurge: 0`? A real, current invalid-value rejection, not a stuck rollout discovered later. See entry 8.
+- Does every StatefulSet's `serviceName` point at a Service that actually exists **and** is headless (`clusterIP: None`)? Not validated at creation time — see entry 9, proven with a real `NXDOMAIN`.
+- Is `concurrencyPolicy` set deliberately on every CronJob, rather than left at its silent `Allow` default? See entry 10, proven with real overlapping Job runs.
+- Does every Service's `selector` genuinely match the Pod template's real `labels` — checked directly, not assumed? See entry 11, proven with a real, empty `EndpointSlice`.
+
+## Scheduling
+
+- If an HPA targets a workload by CPU/memory utilization, does that workload's containers set `resources.requests`? See the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)**, entry 12, proven with a real `FailedGetResourceMetric`, and **[Horizontal Pod Autoscaling](/kubernetes/en/scheduling-and-scaling/horizontal-pod-autoscaling/)**.
+- Does every PodDisruptionBudget's `minAvailable` (or `maxUnavailable`) leave real room strictly below the full replica count? See entry 13, proven with a real, permanently-blocked drain, and **[Pod Disruption & Cluster Autoscaling](/kubernetes/en/scheduling-and-scaling/pod-disruption-and-cluster-autoscaling/)**.
+
+## Networking
+
+- Does a NetworkPolicy's `policyTypes` list every direction its name or comment claims to restrict? Omitting `Egress` leaves that direction completely unrestricted, not "covered by default." See the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)**, entry 14, proven with a real, unblocked curl.
+- If a NetworkPolicy is a genuine default-deny (`policyTypes: [Ingress, Egress]`, no rules), does it still explicitly allow egress to the cluster's DNS provider (`kube-system`, UDP/TCP 53)? Otherwise every hostname lookup — including Kubernetes Service names — fails too. See entry 15, proven with a real, timed-out `nslookup`.
+
+## Storage & configuration
+
+- Does a `hostPath` volume carry data meant to survive the Pod being rescheduled onto a different node? Proven to silently leave data behind — see the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)**, entry 16.
+- Does anything — a comment, a variable name, a runbook — call a `Secret`'s contents "encrypted"? Its `data` fields are base64-encoded only, trivially reversible by anyone with ordinary `get secret` access. See entry 17.
+
+## Security
+
+- Does `securityContext.privileged: true` (or `hostNetwork`/`hostPID`/`hostIPC`) appear as the apparent fix for an in-container permission error, rather than the one specific capability or field actually needed? See the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)**, entry 18, and **[Pod & Cluster Security](/kubernetes/en/observability-and-security/pod-and-cluster-security/)** for the real Pod Security Admission rejection this produces.
+- Are Linux capabilities ever dropped (`capabilities.drop: ["ALL"]`), with only what's genuinely needed added back via `capabilities.add`? See entry 19.
+- Is `automountServiceAccountToken: false` set on any workload that never calls the Kubernetes API server? See entry 20.
+- Is a workload's ServiceAccount ever bound to `cluster-admin`, rather than a narrowly-scoped `Role`/`ClusterRole`? See entry 21, proven with a real `kubectl auth can-i` showing cluster-wide reach, and **[RBAC & Service Accounts](/kubernetes/en/observability-and-security/rbac-and-service-accounts/)**.
+
+## Observability
+
+- Does every Deployment sitting behind a Service have a `readinessProbe` that checks the real application endpoint, not just "process is running"? See the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)**, entry 22, proven with a real `Connection refused` during startup, and **[Probes: Liveness, Readiness, Startup](/kubernetes/en/observability-and-security/probes-liveness-readiness-startup/)**.
+- Are `livenessProbe` and `readinessProbe` ever pointed at the identical endpoint with no `startupProbe` cushioning a slow warm-up? See entry 23, proven with a real, self-inflicted restart loop.
+- Does a debugging instruction assume `kubectl exec -it <pod> -- sh` always works, even against a minimal or distroless image with no shell at all? `kubectl debug --target` (ephemeral containers, GA since 1.25) is the real fix. See entry 24, and **[Logging & Metrics](/kubernetes/en/observability-and-security/logging-and-metrics/)**.
+
+## Tooling
+
+- Is `kubectl apply --dry-run=server` (not just `--dry-run=client`) run against a real API server before anything in this checklist is trusted as "probably fine"? `--dry-run=client` never contacts the server at all and misses every discovery/admission/strict-decoding error this checklist relies on. See **[Verification Tools](/kubernetes/en/reading-k8s/verification-tools/)**.
+- Does CI run a real schema validator (`kubeconform`, `kube-linter`, `polaris`, or this course's own `tools/verify-manifests.mjs`) against every manifest, not just a human skim? See **[Verification Tools](/kubernetes/en/reading-k8s/verification-tools/)**.
+- Is Pod Security Admission's `warn` mode (not just `enforce`) treated as a live linter — checked on every apply, even in namespaces not yet ready to enforce `restricted`? See **[Pod & Cluster Security](/kubernetes/en/observability-and-security/pod-and-cluster-security/)**.
+
+<Callout title="A checklist narrows the search, it does not replace it">
+Every line above maps to one of the 24 patterns in the **[AI Bug Catalog](/kubernetes/en/reading-k8s/ai-bug-catalog/)** — only 8 of which `kubectl apply --dry-run=server` rejects outright. Run this list on every diff regardless of how clean `dry-run=server` came back.
+</Callout>
+
+export const quizReviewChecklist = [
+  {
+    q: "Why does the 'API versions & shape' group's coverage diagram say 'dry-run=server catches most' while 'Networking' and 'Storage & config' say 'mostly human review'?",
+    options: [
+      "It's arbitrary — every group has identical tool coverage",
+      "A removed apiVersion is a discovery-level failure the API server (or kubectl's RESTMapper) can detect on its own; a Service selector or a hostPath's cross-node portability are semantic questions the API server has no way to check without knowing the reviewer's actual intent",
+      "Networking objects are never validated by any tool",
+      "Storage objects always fail dry-run=server",
+    ],
+    answer: 1,
+    explain: "Proven throughout the AI Bug Catalog: entries 1-5 (API versions) are real, current rejections at apply time; entries 11, 14-17 (selectors, policyTypes, hostPath, Secret) all apply cleanly with zero complaint, because none of them is a shape the API server can call invalid on its own.",
+  },
+  {
+    q: "```yaml\napiVersion: policy/v1\nkind: PodDisruptionBudget\nspec:\n  minAvailable: 3\n  selector:\n    matchLabels: { app: web-app }\n```\nWith a 3-replica Deployment selected by this PDB, which checklist group covers reviewing this line, and what does it depend on to catch it?",
+    options: [
+      "Networking — it depends on NetworkPolicy enforcement",
+      "Scheduling — catching it depends on comparing minAvailable against the workload's actual replicas field, since kubectl apply itself accepts this object with zero complaint",
+      "API versions & shape — policy/v1 is deprecated",
+      "Tooling — only kube-linter catches this",
+    ],
+    answer: 1,
+    explain: "Proven in the AI Bug Catalog's entry 13: this exact object applies successfully and only shows ALLOWED DISRUPTIONS: 0 once queried directly, or once a real drain is attempted and retries forever -- the Scheduling group's checklist item exists precisely because the object alone gives no warning.",
+  },
+  {
+    q: "Why does the checklist ask specifically whether a default-deny NetworkPolicy still allows DNS egress, rather than just 'does this NetworkPolicy look like default-deny'?",
+    options: [
+      "Those two questions are exactly the same thing",
+      "A NetworkPolicy can correctly list policyTypes: [Ingress, Egress] with no rules -- genuinely achieving default-deny -- and still break the workload by blocking its own DNS resolution, which is a real, separate, very common incident this checklist item exists to catch before it ships",
+      "DNS is never affected by NetworkPolicy",
+      "This only matters when Calico is installed",
+    ],
+    answer: 1,
+    explain: "Proven directly with a real nslookup: a correct, complete default-deny NetworkPolicy timed out resolving even the cluster's own kubernetes.default.svc.cluster.local name, until an explicit egress rule for UDP/TCP 53 to kube-system was added back.",
+  },
+];
+
+<Quiz client:visible id="reading-k8s/review-checklist" questions={quizReviewChecklist} />
+
+<ProgressTracker client:visible id="reading-k8s/review-checklist" />

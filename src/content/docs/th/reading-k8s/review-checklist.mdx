@@ -1,0 +1,119 @@
+---
+title: Review checklist
+description: 'checklist หน้าเดียวแปดกลุ่มสำหรับรีวิว manifest ของ Kubernetes — แต่ละบรรทัดเป็นคำถาม yes/no ที่ลิงก์ไปบทที่อธิบายกฎเบื้องหลัง'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+นี่คือ checklist ที่ควรไล่ดู — ด้วยตาเปล่า บน diff ไหนก็ได้ ของคุณเองหรือของ AI — หลังจากเครื่องมือใน **[Verification Tools](/kubernetes/th/reading-k8s/verification-tools/)** รันผ่านมาสะอาดแล้ว มันตั้งใจให้พอดีหน้าเดียวสำหรับพิมพ์ออกมา: checklist ที่ไม่มีใครเปิดดูจริงตอนรีวิวไม่มีค่าอะไรเลย ทุกบรรทัดลิงก์ไปบทที่อธิบายว่า *ทำไม* หน้านี้จึงยังเป็นแค่ลิสต์ ไม่ใช่การรื้อคอร์สมาเล่าซ้ำ กลุ่มต่าง ๆ เรียงตามลำดับเดียวกับ **[วิธีอ่าน YAML ของ Kubernetes ที่ไม่ได้เขียนเอง](/kubernetes/th/reading-k8s/)** บวกกลุ่ม Tooling ปิดท้ายที่ครอบคลุมว่าอีกเจ็ดกลุ่มถูกตรวจสอบจริงได้อย่างไร
+
+<Mermaid title="อะไรที่จับแต่ละกลุ่มได้จริงบ้าง" code={checklistCoverageDiagram} />
+
+export const checklistCoverageDiagram = `flowchart LR
+  A["apiVersion &amp; รูปร่าง"] --> T["dry-run=server จับได้ส่วนใหญ่<br/>(discovery error, strict decoding)"]
+  W["Workload"] --> P["จับได้บางส่วน: immutable-field error จับได้,<br/>ช่องว่างของ headless Service/concurrency จับไม่ได้"]
+  S["Scheduling"] --> P
+  N["Networking"] --> M["ต้องรีวิวด้วยตาเป็นหลัก<br/>(selector/policyTypes เป็น matcher ที่ไม่ถูกตรวจสอบ)"]
+  ST["Storage &amp; config"] --> M
+  Sec["Security"] --> P2["จับได้บางส่วน: PSA/VAP จับ field ที่รู้จัก,<br/>RBAC เกินสิทธิ์ต้อง auth can-i"]
+  O["Observability"] --> M
+`;
+
+## apiVersion & รูปร่าง
+
+- `apiVersion` ยัง resolve ได้บนคลัสเตอร์ที่คุณ deploy จริงหรือไม่ (`kubectl api-resources`, `kubectl explain <kind>`)? `extensions/v1beta1`, `batch/v1beta1`, และ `networking.k8s.io/v1beta1` ถูกถอดออกทั้งหมดแล้ว ดู **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** ข้อ 1–3
+- ยังมีที่ไหนอ้างถึง `kind: PodSecurityPolicy` อยู่หรือไม่? ถูกลบไปตั้งแต่ Kubernetes 1.25 — ตัวแทนคือ label บน Namespace บวกกับ Pod Security Admission ดูข้อ 4
+- `Ingress` ใช้รูปร่างปัจจุบัน `backend.service.name`/`port.number` (พร้อมตั้ง `pathType`) ไม่ใช่ `backend.serviceName`/`servicePort` ที่ถูกลบไปแล้วหรือไม่? ดูข้อ 3
+- `HorizontalPodAutoscaler` ปน field ของ `autoscaling/v1` (`targetCPUUtilizationPercentage`) กับ field ที่มีแค่ใน `autoscaling/v2` (`metrics`, `behavior`) ใน object เดียวกันหรือไม่? เป็น `BadRequest` จริงฝั่ง server ปัจจุบัน ดูข้อ 5
+
+## Workload
+
+- มีใครพยายามเปลี่ยน `spec.selector` ของ Deployment ที่ *มีอยู่แล้ว* หรือไม่? เป็นการปฏิเสธ `field is immutable` จริงและปัจจุบัน ดู **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** ข้อ 6 และ **[Deployments and ReplicaSets](/kubernetes/th/workloads/deployments-and-replicasets/)**
+- Pod template ของ Job เคยตั้ง `restartPolicy: Always` หรือไม่? มีแค่ `OnFailure`/`Never` ที่ valid — ดูข้อ 7 สำหรับการปฏิเสธจริงและปัจจุบัน
+- `strategy.rollingUpdate` ของ Deployment ตั้งทั้ง `maxUnavailable: 0` และ `maxSurge: 0` หรือไม่? เป็นการปฏิเสธค่า invalid จริงและปัจจุบัน ไม่ใช่ rollout ที่ค้างซึ่งพบทีหลัง ดูข้อ 8
+- `serviceName` ของทุก StatefulSet ชี้ไปที่ Service ที่มีอยู่จริง **และ** headless (`clusterIP: None`) หรือไม่? ไม่ถูกตรวจสอบตอนสร้าง — ดูข้อ 9 พิสูจน์ด้วย `NXDOMAIN` จริง
+- `concurrencyPolicy` ตั้งไว้อย่างตั้งใจในทุก CronJob หรือปล่อยไว้ที่ค่า default `Allow` แบบเงียบ ๆ? ดูข้อ 10 พิสูจน์ด้วย Job ที่ทับซ้อนกันจริง
+- `selector` ของทุก Service ตรงกับ `labels` จริงของ Pod template หรือไม่ — เช็กโดยตรง ไม่ใช่แค่สมมติ? ดูข้อ 11 พิสูจน์ด้วย `EndpointSlice` ที่ว่างเปล่าจริง
+
+## Scheduling
+
+- ถ้า HPA เล็งไปที่ workload โดยดู CPU/memory utilization container ของ workload นั้นตั้ง `resources.requests` หรือไม่? ดู **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** ข้อ 12 พิสูจน์ด้วย `FailedGetResourceMetric` จริง และ **[Horizontal Pod Autoscaling](/kubernetes/th/scheduling-and-scaling/horizontal-pod-autoscaling/)**
+- `minAvailable` (หรือ `maxUnavailable`) ของทุก PodDisruptionBudget เหลือที่ว่างจริงต่ำกว่าจำนวน replica เต็มหรือไม่? ดูข้อ 13 พิสูจน์ด้วยการ drain ที่ถูกบล็อกถาวรจริง และ **[Pod Disruption & Cluster Autoscaling](/kubernetes/th/scheduling-and-scaling/pod-disruption-and-cluster-autoscaling/)**
+
+## Networking
+
+- `policyTypes` ของ NetworkPolicy ระบุครบทุกทิศทางที่ชื่อหรือ comment ของมันอ้างว่าจำกัดหรือไม่? การละ `Egress` ทำให้ทิศทางนั้นไม่ถูกจำกัดเลย ไม่ใช่ "ครอบคลุมโดย default" ดู **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** ข้อ 14 พิสูจน์ด้วย curl ที่ไม่ถูกบล็อกจริง
+- ถ้า NetworkPolicy เป็น default-deny จริง (`policyTypes: [Ingress, Egress]`, ไม่มี rule) มันยัง allow egress ไปยังตัวให้บริการ DNS ของคลัสเตอร์ (`kube-system`, UDP/TCP 53) อย่างชัดเจนหรือไม่? ไม่งั้นทุกการ lookup hostname — รวมถึงชื่อ Service ของ Kubernetes เอง — จะพังไปด้วย ดูข้อ 15 พิสูจน์ด้วย `nslookup` ที่ timeout จริง
+
+## Storage & configuration
+
+- volume แบบ `hostPath` เก็บข้อมูลที่ควรรอดจากการ reschedule ไปยัง node อื่นหรือไม่? พิสูจน์แล้วว่าทิ้งข้อมูลไว้แบบเงียบ ๆ — ดู **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** ข้อ 16
+- มีอะไร — comment, ชื่อตัวแปร, runbook — เรียกเนื้อหาของ `Secret` ว่า "encrypted" หรือไม่? field `data` ของมันแค่ base64-encode เท่านั้น ใครก็ตามที่มีสิทธิ์ `get secret` ธรรมดาก็ decode กลับได้ทันที ดูข้อ 17
+
+## Security
+
+- `securityContext.privileged: true` (หรือ `hostNetwork`/`hostPID`/`hostIPC`) ปรากฏเป็นวิธีแก้ permission error ในคอนเทนเนอร์ แทนที่จะเป็น capability หรือ field เฉพาะที่จำเป็นจริง ๆ หรือไม่? ดู **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** ข้อ 18 และ **[Pod & Cluster Security](/kubernetes/th/observability-and-security/pod-and-cluster-security/)** สำหรับข้อความปฏิเสธจริงของ Pod Security Admission ที่มันสร้าง
+- Linux capability เคยถูก drop หรือไม่ (`capabilities.drop: ["ALL"]`) โดยเพิ่มกลับมาเฉพาะสิ่งที่จำเป็นจริงผ่าน `capabilities.add`? ดูข้อ 19
+- `automountServiceAccountToken: false` ตั้งไว้บน workload ที่ไม่เคยเรียก API server ของ Kubernetes เลยหรือไม่? ดูข้อ 20
+- ServiceAccount ของ workload เคยถูกผูกกับ `cluster-admin` แทนที่จะเป็น `Role`/`ClusterRole` ที่จำกัดขอบเขตแคบ ๆ หรือไม่? ดูข้อ 21 พิสูจน์ด้วย `kubectl auth can-i` จริงที่แสดงขอบเขตทั่วทั้งคลัสเตอร์ และ **[RBAC & Service Accounts](/kubernetes/th/observability-and-security/rbac-and-service-accounts/)**
+
+## Observability
+
+- ทุก Deployment ที่อยู่หลัง Service มี `readinessProbe` ที่เช็ก endpoint ของแอปจริง ไม่ใช่แค่ "process กำลังรัน" หรือไม่? ดู **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** ข้อ 22 พิสูจน์ด้วย `Connection refused` จริงระหว่าง startup และ **[Probes: Liveness, Readiness, Startup](/kubernetes/th/observability-and-security/probes-liveness-readiness-startup/)**
+- `livenessProbe` กับ `readinessProbe` เคยชี้ไปที่ endpoint เดียวกันโดยไม่มี `startupProbe` รองรับการ warm-up ที่ช้าหรือไม่? ดูข้อ 23 พิสูจน์ด้วย restart loop ที่เกิดจากตัวเองจริง
+- คำสั่ง debug สมมติว่า `kubectl exec -it <pod> -- sh` ใช้ได้เสมอ แม้กับ image แบบ minimal หรือ distroless ที่ไม่มี shell เลยหรือไม่? `kubectl debug --target` (ephemeral container, GA ตั้งแต่ 1.25) คือวิธีแก้จริง ดูข้อ 24 และ **[Logging & Metrics](/kubernetes/th/observability-and-security/logging-and-metrics/)**
+
+## Tooling
+
+- `kubectl apply --dry-run=server` (ไม่ใช่แค่ `--dry-run=client`) ถูกรันกับ API server จริงก่อนที่จะเชื่อว่าอะไรใน checklist นี้ "น่าจะโอเค" หรือไม่? `--dry-run=client` ไม่ติดต่อ server เลย และพลาด error ของ discovery/admission/strict-decoding ทุกอันที่ checklist นี้พึ่งพา ดู **[Verification Tools](/kubernetes/th/reading-k8s/verification-tools/)**
+- CI รัน schema validator จริง (`kubeconform`, `kube-linter`, `polaris`, หรือ `tools/verify-manifests.mjs` ของคอร์สนี้เอง) กับทุก manifest ไม่ใช่แค่คนไล่ดูด้วยตาหรือไม่? ดู **[Verification Tools](/kubernetes/th/reading-k8s/verification-tools/)**
+- โหมด `warn` ของ Pod Security Admission (ไม่ใช่แค่ `enforce`) ถูกใช้เป็น linter ที่ทำงานจริง — เช็กทุกครั้งที่ apply แม้ใน namespace ที่ยังไม่พร้อม enforce `restricted` หรือไม่? ดู **[Pod & Cluster Security](/kubernetes/th/observability-and-security/pod-and-cluster-security/)**
+
+<Callout title="checklist ช่วยจำกัดขอบเขตการค้นหา ไม่ได้แทนที่มัน">
+ทุกบรรทัดด้านบนโยงกับหนึ่งใน 24 แพทเทิร์นของ **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** — มีแค่ 8 เท่านั้นที่ `kubectl apply --dry-run=server` ปฏิเสธตรง ๆ ไล่ลิสต์นี้กับทุก diff ไม่ว่า `dry-run=server` จะกลับมาสะอาดแค่ไหน
+</Callout>
+
+export const quizReviewChecklist = [
+  {
+    q: "ทำไม diagram coverage ของกลุ่ม 'API versions & shape' ถึงบอกว่า 'dry-run=server จับได้ส่วนใหญ่' ในขณะที่ 'Networking' กับ 'Storage & config' บอกว่า 'ต้องรีวิวด้วยตาเป็นหลัก'?",
+    options: [
+      "It's arbitrary — every group has identical tool coverage",
+      "A removed apiVersion is a discovery-level failure the API server (or kubectl's RESTMapper) can detect on its own; a Service selector or a hostPath's cross-node portability are semantic questions the API server has no way to check without knowing the reviewer's actual intent",
+      "Networking objects are never validated by any tool",
+      "Storage objects always fail dry-run=server",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตลอด AI Bug Catalog: ข้อ 1-5 (apiVersion) คือการปฏิเสธจริงและปัจจุบันตอน apply; ข้อ 11, 14-17 (selector, policyTypes, hostPath, Secret) apply ผ่านสะอาดโดยไม่มีการบ่นเลย เพราะไม่มีข้อไหนเป็นรูปร่างที่ API server เรียกว่า invalid ได้เอง",
+  },
+  {
+    q: "```yaml\napiVersion: policy/v1\nkind: PodDisruptionBudget\nspec:\n  minAvailable: 3\n  selector:\n    matchLabels: { app: web-app }\n```\nกับ Deployment 3 replica ที่ PDB นี้เลือก กลุ่ม checklist ไหนครอบคลุมการรีวิวบรรทัดนี้ และมันต้องพึ่งอะไรถึงจะจับได้?",
+    options: [
+      "Networking — it depends on NetworkPolicy enforcement",
+      "Scheduling — catching it depends on comparing minAvailable against the workload's actual replicas field, since kubectl apply itself accepts this object with zero complaint",
+      "API versions & shape — policy/v1 is deprecated",
+      "Tooling — only kube-linter catches this",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ใน AI Bug Catalog ข้อ 13: object นี้ apply ผ่านสำเร็จแล้วโชว์ ALLOWED DISRUPTIONS: 0 ก็ต่อเมื่อ query ตรง ๆ หรือลอง drain จริงแล้วมันวนซ้ำตลอด — checklist ของกลุ่ม Scheduling มีอยู่เพราะ object เพียงอย่างเดียวไม่เตือนอะไรเลย",
+  },
+  {
+    q: "ทำไม checklist ถึงถามเจาะจงว่า NetworkPolicy แบบ default-deny ยัง allow DNS egress อยู่ไหม แทนที่จะถามแค่ 'NetworkPolicy นี้ดูเหมือน default-deny ไหม'?",
+    options: [
+      "Those two questions are exactly the same thing",
+      "A NetworkPolicy can correctly list policyTypes: [Ingress, Egress] with no rules -- genuinely achieving default-deny -- and still break the workload by blocking its own DNS resolution, which is a real, separate, very common incident this checklist item exists to catch before it ships",
+      "DNS is never affected by NetworkPolicy",
+      "This only matters when Calico is installed",
+    ],
+    answer: 1,
+    explain: "พิสูจน์โดยตรงด้วย nslookup จริง: NetworkPolicy แบบ default-deny ที่ถูกต้องครบสมบูรณ์ timeout ตอน resolve แม้แต่ชื่อ kubernetes.default.svc.cluster.local ของคลัสเตอร์เอง จนกว่าจะเพิ่ม egress rule สำหรับ UDP/TCP 53 ไปยัง kube-system กลับเข้าไป",
+  },
+];
+
+<Quiz client:visible id="reading-k8s/review-checklist" questions={quizReviewChecklist} />
+
+<ProgressTracker client:visible id="reading-k8s/review-checklist" />

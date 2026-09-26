@@ -1,0 +1,179 @@
+---
+title: วิธีอ่าน YAML ของ Kubernetes ที่ไม่ได้เขียนเอง
+description: 'ลำดับการอ่าน manifest ของ Kubernetes ที่ AI เขียน — เริ่มจาก apiVersion กับรูปร่าง ตามด้วย workload, scheduling, networking, storage กับ config, security, แล้วจึง observability — เพราะสิ่งที่ทำให้ YAML ของ Kubernetes ที่ AI เขียนผิดส่วนใหญ่ apply ผ่านเฉย ๆ แล้วพังทีหลังแบบเงียบ ๆ'
+sidebar:
+  order: 0
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+ทุกโมดูลก่อนหน้านี้สอนให้คุณ *เขียน* manifest ของ Kubernetes โมดูลนี้สอนอีกครึ่งหนึ่ง: การอ่าน manifest ที่คนอื่น — หรือ AI — เขียนไว้ แล้วตัดสินว่ามันถูกต้องจริงหรือไม่ AI ผู้ช่วยส่ง Deployment, NetworkPolicy, StatefulSet ที่หน้าตาเหมือนตัวอย่างที่คุณเรียนมาทุกประการ ใช้คู่ `kind`/`apiVersion` ที่ดูลื่นไหลทันสมัย และ — ส่วนใหญ่แล้ว — **apply ผ่านโดยไม่มี error สักตัว** ส่วนสุดท้ายนี้แหละคือกับดักที่โมดูลนี้มีไว้ปิด: `kubectl apply --dry-run=server` รัน OpenAPI schema validation เต็มรูปแบบและทุก admission plugin แล้วมันยังปฏิเสธแค่ **8 จาก 24 แพทเทิร์น** ที่บทถัดไปรวบรวมไว้เท่านั้น อีก 16 ที่เหลือสร้าง object ที่ดูสมบูรณ์แข็งแรงแล้วพังทีหลัง — แบบเงียบ ๆ ใน `kubectl describe`, `get events`, curl จริง, การ drain, หรือการย้าย Pod ไปอีก node
+
+ปัญหา training data สามอย่างซ้อนกันทำให้แย่ลง อย่างแรก API ของ Kubernetes เปลี่ยนรูปร่างจริง ๆ ตลอดสิบปีของการ release ที่ tutorial สาธารณะส่วนใหญ่ยังบรรยายอยู่ — `extensions/v1beta1`, `PodSecurityPolicy`, รูปร่างเก่าของ Ingress `backend.serviceName` ล้วนยังดูลื่นไหล เป็น YAML ที่ *ดูเหมือน* valid แต่ API server 1.37 ปัจจุบันไม่รู้จักมันแล้วเลย อย่างที่สอง YAML ของ Kubernetes ออนไลน์จำนวนมากคือ **บล็อกที่ copy จากบทความ** — ถูกต้องสำหรับสถานการณ์เป๊ะ ๆ ที่บทความนั้นบรรยาย แต่ผิดแบบเงียบ ๆ สำหรับ namespace อื่น, จำนวน replica อื่น, หรือ CNI อื่นของผู้อ่าน อย่างที่สาม คำตอบที่เร็วที่สุดสำหรับ permission error เกือบทุกอันในคลัสเตอร์คือ "**แก้ด้วย `privileged: true`**" — มันทำให้ error หายไปจริง แลกกับการปิดเกือบทุก security boundary ของ container แทนที่จะให้สิ่งที่ workload ต้องการจริง ๆ เพียงอย่างเดียว เจ็ดขั้นตอนด้านล่างคือลำดับที่เผยความผิดพลาดเหล่านี้จริง ๆ และบทเรียนถัดไปในโมดูลนี้แต่ละบทจะเจาะลึกทีละส่วน
+
+<Mermaid title="ลำดับการอ่าน manifest ของ Kubernetes ที่ไม่ได้เขียนเอง" code={readingOrderDiagram} />
+
+export const readingOrderDiagram = `flowchart TD
+  A["1. apiVersion &amp; รูปร่าง<br/>apiVersion นี้ยังจริงบน 1.37 หรือไม่?"] --> B["2. Workload<br/>selector, restartPolicy, update strategy, headless Service"]
+  B --> C["3. Scheduling<br/>ตั้ง requests หรือยัง? HPA จับคู่ถูกไหม? PDB เหลือที่ว่างไหม?"]
+  C --> D["4. Networking<br/>selector ตรงจริงไหม? policyTypes บอกตามที่ตั้งใจไหม?"]
+  D --> E["5. Storage &amp; config<br/>ข้อมูลนี้รอดจากการย้าย node ไหม? Secret นี้ลับจริงไหม?"]
+  E --> F["6. Security<br/>privileged เป็นทางลัดแก้ permission, capabilities ถูก drop ไหม, RBAC scope"]
+  F --> G["7. Observability<br/>probe กันสิ่งที่ควรกันจริงไหม, exec เข้าไปได้จริงไหม"]
+`;
+
+## 1. apiVersion & รูปร่าง
+
+ก่อนอื่นให้ตรวจว่าคู่ `apiVersion`/`kind` ของ manifest นี้ยังจริงบนคลัสเตอร์ที่จะ deploy หรือไม่ — เพราะ apiVersion ที่ถูกลบไปแล้วคือความล้มเหลวระดับ discovery ฝั่ง client ที่ไม่มีทางไปถึง business logic เลย และ training data ที่ครอบคลุมการ release ของ Kubernetes นับสิบปีก็ผลิตซ้ำรูปร่างที่ถูกถอดออกไปแล้วอยู่เรื่อย ๆ
+
+- **สิ่งที่ต้องมองหา:** `apiVersion` ยังอยู่ใน `kubectl api-resources` หรือไม่? เป็น Deployment/CronJob/Ingress ที่มาก่อน `apps/v1`/`batch/v1`/รูปร่างปัจจุบันของ `networking.k8s.io/v1` หรือเปล่า? HPA แบบ `autoscaling/v1` มี field ของ `v2` เท่านั้นอย่าง `metrics` ปนอยู่ด้วยหรือไม่ หรือกลับกัน? มี `kind` ที่ถูกลบไปแล้วอย่าง `PodSecurityPolicy` อยู่หรือเปล่า?
+- **คำถามที่ต้องถาม:** `kubectl explain <kind>.<field>` จะ resolve รูปร่างนี้ได้จริงบนเวอร์ชันที่คุณรันอยู่ไหม หรือ resolve ได้แค่บนเวอร์ชันที่ training corpus ถูกแช่แข็งไว้?
+- **บทเรียนที่อธิบายเรื่องนี้:** กลุ่ม API version ของ **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** (ข้อ 1–5) สำหรับ error จริงของ discovery/decoding; **[`kubectl` และ Declarative YAML](/kubernetes/th/foundations/kubectl-and-declarative-yaml/)** สำหรับ `kubectl explain`, `--dry-run=server` เทียบกับ `--dry-run=client`, และ Server-Side Apply
+
+## 2. Workload
+
+พอ apiVersion จริงแล้ว ต่อไปตรวจว่า workload object เองสอดคล้องกันภายในหรือไม่ — Deployment, StatefulSet, Job, หรือ CronJob อาจถูกต้องตาม schema เป๊ะแต่ยังผิดในแบบที่แสดงออกก็ต่อเมื่อ object มีอยู่แล้ว หรือเมื่อเวลาผ่านไปจริง ๆ
+
+- **สิ่งที่ต้องมองหา:** `spec.selector` ตรงกับ `template.metadata.labels` หรือไม่ — และสำหรับ object ที่ *มีอยู่แล้ว* มีใครพยายามเปลี่ยน selector นั้นอยู่หรือเปล่า? `restartPolicy` ของ Job เคยเป็น `Always` ไหม? `serviceName` ของ StatefulSet ชี้ไปที่ Service ที่จริง *และ* headless หรือไม่? `concurrencyPolicy` ของ CronJob ตั้งไว้อย่างตั้งใจ หรือปล่อยไว้ที่ค่า default `Allow` แบบเงียบ ๆ? `maxUnavailable`/`maxSurge` เป็นศูนย์ทั้งคู่หรือไม่?
+- **คำถามที่ต้องถาม:** ถ้า object นี้มีอยู่ในคลัสเตอร์แล้ว การ apply YAML นี้เป๊ะ ๆ จะเปลี่ยนอะไรที่ API server ปฏิเสธไม่ให้เปลี่ยนแบบ in-place หรือไม่ — และถ้าเป็นของใหม่เอี่ยม มี cross-reference ภายใน object เอง (`serviceName`, `concurrencyPolicy` ที่ปล่อยไว้โดยนัย) ที่พังก็ต่อเมื่อเวลาจริงผ่านไปหรือมี DNS lookup จริงเกิดขึ้นหรือไม่?
+- **บทเรียนที่อธิบายเรื่องนี้:** กลุ่ม Workload ของ **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** (ข้อ 6–11) สำหรับ error ของ immutable selector จริง, `NXDOMAIN` จริง, และการพิสูจน์ Job ที่ทับซ้อนกันจริง; **[Deployments and ReplicaSets](/kubernetes/th/workloads/deployments-and-replicasets/)**, **[Jobs & CronJobs](/kubernetes/th/workloads/jobs-and-cronjobs/)**, และ **[StatefulSets and DaemonSets](/kubernetes/th/workloads/statefulsets-and-daemonsets/)** สำหรับกลไกแต่ละอันที่พิสูจน์แบบเจาะลึกเต็มรูปแบบ
+
+## 3. Scheduling
+
+workload กับ object ด้าน autoscaling/disruption ของมันมักถูกสร้างพร้อมกัน แก้แยกกัน และพังเป็นคู่แทบทุกครั้ง — บั๊กของ HPA และ PodDisruptionBudget เกือบทั้งหมดคือ object ที่สองไม่ตรงกับตัวแรกแบบเงียบ ๆ
+
+- **สิ่งที่ต้องมองหา:** ถ้า HPA เล็งไปที่ workload โดยดู CPU/memory utilization workload นั้นตั้ง `resources.requests` ไว้จริงหรือไม่? `minAvailable` (หรือ `maxUnavailable`) ของ PodDisruptionBudget เหลือที่ว่างจริงต่ำกว่าจำนวน replica เต็มหรือไม่?
+- **คำถามที่ต้องถาม:** `kubectl describe hpa`/`kubectl get pdb` แสดงสัญญาณจริงอยู่แล้วหรือไม่ (`<unknown>` targets, `ALLOWED DISRUPTIONS: 0`) ก่อนที่คุณจะลองทำ scale event หรือ drain จริงเสียอีก?
+- **บทเรียนที่อธิบายเรื่องนี้:** กลุ่ม Scheduling ของ **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** (ข้อ 12–13) สำหรับ `FailedGetResourceMetric` จริงและข้อความ blocked-eviction จริง; **[Horizontal Pod Autoscaling](/kubernetes/th/scheduling-and-scaling/horizontal-pod-autoscaling/)** และ **[Pod Disruption & Cluster Autoscaling](/kubernetes/th/scheduling-and-scaling/pod-disruption-and-cluster-autoscaling/)** สำหรับกลไกทั้งสองแบบเต็ม
+
+## 4. Networking
+
+`selector` ของ Service และ `policyTypes` ของ NetworkPolicy ล้วนเป็น matcher ธรรมดาที่ไม่ถูกตรวจสอบ — API server ไม่มีทางรู้ว่าค่าที่ "ถูกต้อง" ควรเป็นอะไร ดังนั้น typo หรือทิศทางที่ลืมใส่จึงได้ object ที่ valid เป๊ะแต่ไม่ได้ทำตามชื่อของมันเลย
+
+- **สิ่งที่ต้องมองหา:** `selector` ของ Service ตรงกับ label จริงของ Pod ที่มันควรจะนำหน้าหรือไม่ — เช็กกับ `template.metadata.labels` จริง ไม่ใช่แค่สมมติ? `policyTypes` ของ NetworkPolicy ระบุครบทุกทิศทางที่ชื่อหรือ comment อ้างว่าจำกัดไหม? ถ้าระบุ `Egress` แบบไม่มี rule เลย มีอะไรปลายทาง (DNS resolution ไปยัง CoreDNS) ที่ยังต้องการ allow อย่างชัดเจนหรือไม่?
+- **คำถามที่ต้องถาม:** `kubectl get endpointslice` ของ Service นี้มีอะไรอยู่จริงหรือไม่ — และ request จริงจากในคลัสเตอร์ ในทิศทางที่ policy นี้อ้างว่าจำกัด ทำงานตามชื่อของ object จริงหรือไม่?
+- **บทเรียนที่อธิบายเรื่องนี้:** กลุ่ม Networking ของ **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** (ข้อ 14–15) สำหรับการพิสูจน์บนคลัสเตอร์จริงว่าทิศทางที่ไม่ได้ระบุใน NetworkPolicy ไม่ถูกจำกัดเลย และ default-deny จริงบล็อก DNS resolution ด้วย
+
+## 5. Storage & configuration
+
+ความเข้าใจผิดเฉพาะของ Kubernetes สองอย่างเกิดซ้ำ ๆ ใน manifest ที่ AI เขียน และไม่มีอันไหนเป็น schema error เลย: volume ที่ดูเหมือน portable แต่ไม่ใช่ กับ Secret ที่ดูเหมือนถูก encrypt แต่ไม่ใช่
+
+- **สิ่งที่ต้องมองหา:** volume แบบ `hostPath` เก็บข้อมูลที่ควรรอดจากการย้ายไป node อื่นหรือไม่? มี comment หรือชื่อตัวแปรเรียกเนื้อหาของ `Secret` ว่า "encrypted" ทั้งที่ field `data` ของมันแค่ base64-encode เท่านั้นหรือไม่?
+- **คำถามที่ต้องถาม:** ถ้า Pod นี้ถูกลบและ reschedule ไปยัง node อื่นตอนนี้เลย ข้อมูลใต้ volume นี้จะยังอยู่ไหม — และถ้ามีใครที่มีสิทธิ์ `get secret` ธรรมดารัน `base64 -d` กับ field `data` ของ object นี้ พวกเขาจะอ่านค่าจริงได้ไหม?
+- **บทเรียนที่อธิบายเรื่องนี้:** กลุ่ม Storage & configuration ของ **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** (ข้อ 16–17) สำหรับการพิสูจน์การย้าย node จริงและการ decode `base64 -d` จริง
+
+## 6. Security
+
+เมื่อเจอ permission error คำตอบที่เร็วที่สุดที่ AI ผู้ช่วยเลือกใช้เกือบทุกครั้งคือคำตอบที่กว้างที่สุด — และทุกรูปแบบด้านล่างนี้คือการ *ให้สิทธิ์*ไม่ใช่ความผิดพลาดที่ API server ตรวจจับเองได้ เพราะ Kubernetes ไม่มีทางรู้จาก YAML เพียงอย่างเดียวว่า "สิทธิ์เกินกว่าที่ workload นี้ต้องการ"
+
+- **สิ่งที่ต้องมองหา:** `securityContext.privileged: true` (หรือ `hostNetwork`/`hostPID`/`hostIPC`) ปรากฏเป็นวิธีแก้ permission error ในคอนเทนเนอร์หรือไม่? Linux capability เคยถูก drop ไหม (`capabilities.drop: ["ALL"]`) โดยเพิ่มกลับมาเฉพาะตัวที่จำเป็นจริง ๆ ผ่าน `capabilities.add`? `automountServiceAccountToken` ปล่อยไว้ที่ค่า default `true` สำหรับ workload ที่ไม่เคยเรียก API server หรือไม่? ServiceAccount ของ workload เคยถูกผูกกับ `cluster-admin` ไหม?
+- **คำถามที่ต้องถาม:** สิ่งเดียวที่ workload นี้ต้องการจริง ๆ (capability ไหน, `runAsUser` แบบไหน, RBAC verb ไหน) คืออะไร — และ manifest ให้สิทธิ์แค่นั้นจริงหรือให้สิ่งที่กว้างที่สุดที่บังเอิญใช้ได้ด้วย?
+- **บทเรียนที่อธิบายเรื่องนี้:** กลุ่ม Security ของ **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** (ข้อ 18–21) สำหรับข้อความปฏิเสธของ Pod Security Admission จริงและการพิสูจน์ `kubectl auth can-i` จริงว่า `cluster-admin` ให้สิทธิ์เกินจำเป็น; **[Pod & Cluster Security](/kubernetes/th/observability-and-security/pod-and-cluster-security/)** และ **[RBAC & Service Accounts](/kubernetes/th/observability-and-security/rbac-and-service-accounts/)** สำหรับกลไกทั้งสองแบบเจาะลึกเต็มรูปแบบ
+
+## 7. Observability
+
+สุดท้าย ตรวจว่าสัญญาณสุขภาพของ manifest เอง — probe — กันสิ่งที่มันอ้างจริงหรือไม่ และคอนเทนเนอร์ข้างในตรวจสอบได้จริงไหมเมื่อมีอะไรผิดพลาด
+
+- **สิ่งที่ต้องมองหา:** Deployment ที่อยู่หลัง Service ทุกตัวมี `readinessProbe` ที่เช็ก endpoint ของแอปจริง ไม่ใช่แค่ "process กำลังรัน" หรือไม่? `livenessProbe` กับ `readinessProbe` เคยชี้ไปที่ endpoint เดียวกันโดยไม่มี `startupProbe` รองรับการ warm-up ที่ช้าหรือไม่? คำสั่ง debug สมมติว่า `kubectl exec -it <pod> -- sh` ใช้ได้เสมอ แม้กับ image แบบ distroless ที่ไม่มี shell เลยหรือไม่?
+- **คำถามที่ต้องถาม:** ในช่วง startup จริง ๆ ของคอนเทนเนอร์นี้ — ไม่ใช่ตอน steady state — request จริงกับ Service คืนค่าอะไรจริง ๆ และถ้าคุณต้องการ shell ในคอนเทนเนอร์นี้เป๊ะ ๆ ตอนนี้เลย จะมี shell ให้ใช้ไหม?
+- **บทเรียนที่อธิบายเรื่องนี้:** กลุ่ม Observability ของ **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** (ข้อ 22–24) สำหรับ `Connection refused` จริงระหว่าง startup, restart loop ที่เกิดจาก liveness จริง, และ `OCI runtime exec failed` จริงบน image แบบ distroless; **[Probes: Liveness, Readiness, Startup](/kubernetes/th/observability-and-security/probes-liveness-readiness-startup/)** และ **[Logging & Metrics](/kubernetes/th/observability-and-security/logging-and-metrics/)** สำหรับกลไกทั้งสองแบบเจาะลึกเต็มรูปแบบ รวมถึง `kubectl debug --target`
+
+## โมดูลนี้ครอบคลุมอะไรต่อ
+
+- **[The AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** — 24 แพทเทิร์นเฉพาะ แต่ละอันมี manifest ที่ AI มักเขียน, output จริงของ `dry-run=server`/apply/describe/curl ที่มันสร้างบนคลัสเตอร์จริง, และวิธีแก้
+- **[Review Checklist](/kubernetes/th/reading-k8s/review-checklist/)** — 24 แพทเทิร์นเดียวกันในรูปแบบ checklist หน้าเดียว เจ็ดกลุ่ม แต่ละบรรทัดลิงก์ไปบทที่พิสูจน์มัน
+- **[Verification Tools](/kubernetes/th/reading-k8s/verification-tools/)** — `kubectl explain`, `--dry-run=server` เทียบกับ `--dry-run=client`, `kubectl diff`, `kubeconform`, `kube-linter`, โหมด `warn` ของ Pod Security Admission, `ValidatingAdmissionPolicy`, harness ของคอร์สนี้เอง, และการตรวจ schema แบบ static ในเบราว์เซอร์ พิสูจน์อะไรได้จริงบ้าง
+- worked review สามบท — **[Worked Review 1](/kubernetes/th/reading-k8s/worked-review-1/)**, **[Worked Review 2](/kubernetes/th/reading-k8s/worked-review-2/)**, **[Worked Review 3](/kubernetes/th/reading-k8s/worked-review-3/)** — ใช้ลำดับการอ่านนี้กับชุด manifest เต็มที่ AI เขียน (web app แบบ Deployment+Service+Ingress+HPA, ฐานข้อมูล stateful แบบ StatefulSet+PVC+backup CronJob, และ namespace ระดับแพลตฟอร์มที่มี RBAC+NetworkPolicy+PDB+Pod Security Admission) สามบทนี้เขียนและดูแลแยกจากบทนี้ — ถ้าลิงก์ด้านล่าง 404 ระหว่างที่งานนั้นยังไม่เสร็จ ลำดับการอ่านและ catalog ด้านบนก็ยังใช้ได้ด้วยตัวเองอยู่ดี
+
+## Mental Model
+
+```text
+ลำดับการอ่าน manifest ของ Kubernetes ที่ไม่ได้เขียนเอง:
+
+1. apiVersion & รูปร่าง  → คู่ apiVersion/kind นี้ยังจริงบนเวอร์ชันที่คุณรันอยู่ไหม?
+2. Workload              → object สอดคล้องกันภายในไหม และการเปลี่ยนแปลงมันจะถูกยอมรับจริงไหม?
+3. Scheduling            → workload กับ HPA/PDB ของมันตรงกันจริงไหม?
+4. Networking            → selector ตรงจริงไหม, policyTypes บอกตามที่ตั้งใจไหม?
+5. Storage & config      → ข้อมูลนี้รอดจากการย้าย node ไหม, Secret นี้ลับจริงไหม?
+6. Security              → นี่คือสิทธิ์แคบที่สุดที่ใช้ได้ หรือกว้างที่สุดที่บังเอิญใช้ได้?
+7. Observability         → probe กันสิ่งที่มันอ้างจริงไหม, เข้าไปข้างในได้จริงไหมถ้าจำเป็น?
+
+"apply ผ่านโดยไม่มี error" ตอบคำถามเหล่านี้ได้แทบไม่ตรงเลย — 16 จาก 24 แพทเทิร์นใน
+catalog ของโมดูลนี้ apply ผ่านสะอาดแล้วพังทีหลังแบบเงียบ ๆ
+```
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ถ้า apply ผ่านโดยไม่มี error แปลว่าถูกต้อง"** พิสูจน์แล้วตลอด catalog ของโมดูลนี้: 16 จาก 24 แพทเทิร์นผ่าน `kubectl apply --dry-run=server` สะอาด — มันรัน OpenAPI schema validation เต็มรูปแบบและทุก admission plugin แล้วก็ยังไม่มีทางเช็ก selector ของ Service กับ label จริงของ Pod, `serviceName` ของ StatefulSet กับ Service ที่มีอยู่จริง, หรือ HPA กับ Deployment ที่มันเล็งว่ามี `resources.requests` ตั้งไว้หรือเปล่า
+- **"YAML ของ Kubernetes ที่ AI เขียนแค่ต้อง prompt ใหม่ให้ดีขึ้น"** ปัญหาไม่ได้อยู่ที่ความเก่าอย่างเดียว — `extensions/v1beta1`, `PodSecurityPolicy`, และรูปร่างเก่าของ Ingress `backend.serviceName` ล้วนเป็น Kubernetes ที่ *ดูลื่นไหล* เป็นไปได้ตามหลักไวยากรณ์ แต่เล็งไปที่พื้นผิว API ที่ 1.37 ของคอร์สนี้ไม่มีแล้ว
+- **"ความล้มเหลวแบบเงียบเกิดน้อยกว่า apply ที่ถูกปฏิเสธ เลยสำคัญน้อยกว่า"** ตรงข้ามต่างหากที่ใกล้ความจริงใน catalog นี้: PodDisruptionBudget ที่บล็อกการ drain ทุกครั้งในอนาคต, NetworkPolicy ที่จำกัดทิศทางที่ไม่มีใครขอแล้วปล่อยทิศทางที่ตั้งใจไว้โล่งเปิด, หรือ Secret ที่อ่านว่า "encrypted" ใน comment ล้วน ship ขึ้น production โดยไม่มี error ไม่มี warning ไม่มีสัญญาณอะไรผิดปกติเลย
+- **"`privileged: true` เป็นแค่เวอร์ชันที่แรงกว่าของ capability เดียวที่ container ต้องการ"** มันเป็นการให้สิทธิ์คนละประเภทเลย — มันปิดเกือบทุก security boundary ของ container พร้อมกัน ไม่ใช่แค่สิ่งเดียวที่ขาดไปจริง ๆ
+
+<Callout title="สรุปหนึ่งบรรทัด">
+อ่าน manifest ของ Kubernetes ตามลำดับนี้ — apiVersion กับรูปร่าง, workload, scheduling, networking, storage กับ config, security, แล้วจึง observability — เพราะแต่ละขั้นเปลี่ยนความหมายของขั้นถัดไป และเพราะ "apply ผ่านโดยไม่มี error" บอกแค่ว่า object ถูกต้องตาม schema ไม่เคยบอกว่ามันทำตามที่ชื่อหรือ comment อ้างจริง
+</Callout>
+
+export const quizReadingK8sIndex = [
+  {
+    q: "ทำไมโมดูลนี้ถึงเช็ก API version & รูปร่างก่อนเช็กอะไรเกี่ยวกับ workload หรือ networking?",
+    options: [
+      "Because apiVersion is always the shortest field to read",
+      "Because a removed or mismatched apiVersion/kind pair is a client-side discovery failure that never even reaches the object's own business logic — every later question about the object's content is moot if the object itself can't be created at all",
+      "Because networking objects never have apiVersion issues",
+      "The order does not matter",
+    ],
+    answer: 1,
+    explain: "พิสูจน์แล้วใน AI Bug Catalog ข้อ 1-4: 'no matches for kind X in version Y' คือ error ระดับ RESTMapper/discovery ที่ถูก resolve ก่อนที่ API server จะพิจารณา field, selector, หรือ cross-reference ของ object เลยด้วยซ้ำ",
+  },
+  {
+    q: "```text\n$ kubectl apply -f statefulset.yaml\nstatefulset.apps/db created\n$ kubectl get pod\nNAME   READY   STATUS\ndb-0   1/1     Running\ndb-1   1/1     Running\n```\nจาก output จริงนี้ `kubectl get` ที่แข็งแรงพิสูจน์อะไรเกี่ยวกับ `serviceName` ของ StatefulSet จริง ๆ?",
+    options: [
+      "That serviceName points at a real, headless Service",
+      "Nothing about serviceName at all — proven in the AI Bug Catalog, the API server never validates serviceName against an existing Service, so a StatefulSet can be perfectly healthy while every per-Pod DNS name it should provide returns NXDOMAIN",
+      "That the StatefulSet has no bugs",
+      "That a headless Service was auto-created",
+    ],
+    answer: 1,
+    explain: "พิสูจน์โดยตรง: db-0 กับ db-1 รายงาน 1/1 Running ทั้งคู่ ทั้งที่ serviceName ชี้ไปที่ Service ที่ไม่เคยถูกสร้างเลย — วิธีเดียวที่จะจับบั๊กนี้ได้คือ DNS lookup จริง ไม่มีทางเห็นจาก kubectl get ที่แข็งแรงเลย",
+  },
+  {
+    q: "ทำไมโมดูลนี้ถึงจัด 'privileged: true แก้ permission error' เป็นประเด็นของขั้น Security ในลำดับการอ่าน แทนที่จะเป็นขั้นตอน debug ธรรมดา?",
+    options: [
+      "privileged: true never actually fixes anything",
+      "It genuinely does make the error disappear, by disabling nearly every container security boundary at once — the reading order exists because that trade-off is invisible unless you specifically ask 'what is the ONE thing this container actually needed'",
+      "Security concerns only apply to RBAC objects",
+      "privileged: true is always rejected by the API server",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ใน AI Bug Catalog ข้อ 18: ข้อความปฏิเสธ Pod Security 'restricted' จริง ระบุ field แยกกันห้าอันพร้อมกัน (privileged, allowPrivilegeEscalation, capabilities, runAsNonRoot, seccompProfile) ที่ privileged: true ทำผิดพร้อมกันทั้งหมด — ยืนยันว่ามันคือการให้สิทธิ์แบบเหมารวม ไม่ใช่แบบเจาะจง",
+  },
+  {
+    q: "ขั้นไหนในลำดับการอ่านนี้ที่ถามตรง ๆ ว่า 'kubectl get endpointslice ของ Service นี้ list อะไรจริงหรือไม่'?",
+    options: [
+      "API version & shape",
+      "Networking",
+      "Scheduling",
+      "Observability",
+    ],
+    answer: 1,
+    explain: "ขั้น Networking มีอยู่เพราะ selector ของ Service คือ matcher ที่ไม่ถูกตรวจสอบ — พิสูจน์ด้วย EndpointSlice จริงที่แสดง ENDPOINTS เป็น <unset> ใน AI Bug Catalog ข้อ 11 โดยไม่มี error เลยตอน apply",
+  },
+  {
+    q: "ทำไมโมดูลนี้ถึงบอกว่า 16 จาก 24 ข้อใน catalog น่ากังวลกว่า 8 ข้อที่ API server ปฏิเสธตรง ๆ แทนที่จะน้อยกว่า?",
+    options: [
+      "It doesn't -- rejected entries are worse",
+      "A rejected apply is loud and immediate -- a reader notices instantly. A silently-accepted object with a real bug (a blocked drain, an unrestricted egress direction, data that vanishes on reschedule) looks identical to a correct one until something depends on the exact behaviour that's wrong, often much later and in production",
+      "Silent failures are rarer in practice",
+      "The API server always catches security-related bugs eventually",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ตลอด catalog: ข้อที่เป็น PodDisruptionBudget ที่บล็อกการ drain ทุกครั้งในอนาคต หรือ NetworkPolicy ที่จำกัดทิศทางผิด apply ผ่านสะอาดแล้วโผล่มาก็ต่อเมื่อการ drain จริง, request จริง, หรือ DNS lookup จริงต้องพึ่งพฤติกรรมที่มันผิดแบบเงียบ ๆ",
+  },
+];
+
+<Quiz client:visible id="reading-k8s/index" questions={quizReadingK8sIndex} />
+
+<ProgressTracker client:visible id="reading-k8s/index" />

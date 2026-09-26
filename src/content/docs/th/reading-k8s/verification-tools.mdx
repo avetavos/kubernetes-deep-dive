@@ -1,0 +1,262 @@
+---
+title: Verification tools
+description: '`kubectl explain` (`--recursive`, `--api-version`), `kubectl apply --dry-run=server` เทียบกับ `--dry-run=client`, `kubectl diff`, `kubeconform`, `kube-linter`, โหมด `warn` ของ Pod Security Admission, `ValidatingAdmissionPolicy`, harness ของคอร์สนี้เอง, และการตรวจ schema แบบ static ในเบราว์เซอร์ พิสูจน์อะไรได้จริงบ้าง — พร้อม output จริง'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import K8sSchemaCheck from '../../../../components/K8sSchemaCheck.astro';
+
+ไม่มีเครื่องมือด้านล่างอันไหนที่ overlap กันสมบูรณ์ และไม่มีอันไหนที่ครบถ้วนด้วยตัวเองเลย — บรรทัด "Caught by" ของแต่ละข้อในทั้ง 24 ข้อของ **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** ระบุชัดว่าเครื่องมือไหน (ถ้ามี) ด้านล่างนี้จะจับมันได้ และ 16 จาก 24 ข้อนั้นไม่มีเครื่องมือไหนจับได้เลยตอน apply ทุก output ด้านล่างเป็นของจริง จับมาจากคลัสเตอร์ `kind` ของ Kubernetes 1.37.0 จริง
+
+## `kubectl explain` — วิธีที่เร็วที่สุดที่จะรู้ว่า field นี้คืออะไรจริง ๆ
+
+`kubectl explain` อ่าน OpenAPI schema ของคลัสเตอร์เอง — ไม่ใช่การเดาที่ cache ไว้ ไม่ใช่เอกสารเวอร์ชันที่อาจล้าสมัย — ทำให้มันเป็นวิธีที่เร็วที่สุดที่จะเช็กว่า field หนึ่ง หรือทั้ง `kind` จริงบนเวอร์ชันที่คุณรันอยู่หรือไม่ `--recursive` ขยายทุก field ที่ซ้อนกันในครั้งเดียว แทนที่จะไล่ทีละชั้น:
+
+```text
+$ kubectl explain deployment.spec.strategy --recursive
+FIELDS:
+  rollingUpdate	<RollingUpdateDeployment>
+    maxSurge	<IntOrString>
+    maxUnavailable	<IntOrString>
+  type	<string>
+  enum: Recreate, RollingUpdate
+```
+
+`--api-version` คือสิ่งที่ทำให้ `kubectl explain` มีประโยชน์จริงสำหรับข้อ 5 ของ **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** — HorizontalPodAutoscaler มีรูปร่างที่ใช้งานจริงพร้อมกันสองแบบ และการ explain ทั้งสองเวอร์ชันเทียบกันพิสูจน์ว่ามันไม่เคยทับซ้อนกันเลย:
+
+```text
+$ kubectl explain hpa.spec --api-version=autoscaling/v1
+FIELDS:
+  maxReplicas	<integer> -required-
+  ...
+
+$ kubectl explain hpa.spec --api-version=autoscaling/v2
+FIELDS:
+  behavior	<HorizontalPodAutoscalerBehavior>
+  ...
+```
+
+field ของ `v1` (`targetCPUUtilizationPercentage`) กับของ `v2` (`metrics`, `behavior`) ไม่มีอยู่บนอีกเวอร์ชันเลย — `kubectl explain` กับ `--api-version` คือวิธีที่เร็วกว่าและออฟไลน์ในการยืนยันความไม่ตรงกันที่ข้อ 5 พิสูจน์ไว้แล้วด้วย `BadRequest` จริงบนคลัสเตอร์จริง
+
+## `kubectl apply --dry-run=server` เทียบกับ `--dry-run=client` — อันหนึ่งคุยกับ API server จริง อีกอันไม่คุยเลย
+
+นี่คือความต่างที่สำคัญที่สุดในบทนี้ และสอง flag นี้สับสนกันง่ายมากเพราะทั้งคู่พิมพ์บรรทัด success ที่แทบเหมือนกัน `--dry-run=client` ไม่ติดต่อ API server เลย — มันแค่ตรวจว่า request *สร้างได้* โดยใช้ schema ที่ cache ไว้ในเครื่องเท่านั้น `--dry-run=server` ส่ง request จริง (ด้วย `?dryRun=All`) ผ่าน OpenAPI validation และ admission chain เดียวกับ apply จริงทุกประการ แล้วข้ามแค่ขั้นตอนสุดท้ายคือเขียนลง etcd พิสูจน์โดยตรง บนบั๊กใน catalog สองข้อเดียวกัน ห่างกันแค่คำสั่งเดียว:
+
+```text
+$ kubectl apply --dry-run=client -f hpa-v1-v2-mixed-shape.yaml
+horizontalpodautoscaler.autoscaling/web created (dry run)
+
+$ kubectl apply --dry-run=server -f hpa-v1-v2-mixed-shape.yaml
+Error from server (BadRequest): ... strict decoding error: unknown field "spec.metrics"
+```
+
+```text
+$ kubectl apply --dry-run=client -f deployment-selector-immutable.yaml   # Deployment ที่มีอยู่แล้ว เปลี่ยน selector
+deployment.apps/web configured (dry run)
+
+$ kubectl apply --dry-run=server -f deployment-selector-immutable.yaml
+The Deployment "web" is invalid: spec.selector: Invalid value: ...: field is immutable
+```
+
+`--dry-run=client` รายงานว่าสำเร็จทั้ง**สอง**บั๊กจริงและปัจจุบัน — มันไม่มีทางรัน strict decoding ฝั่ง server หรือเทียบกับสถานะที่เก็บจริงของ object ได้เลย เพราะไม่เคยออกจากเครื่องคุณเลย `--dry-run=server` เป็นตัวเดียวในสองตัวนี้ที่ควรใช้เป็น review gate ดู **[`kubectl` และ Declarative YAML](/kubernetes/th/foundations/kubectl-and-declarative-yaml/)** สำหรับกลไกเต็มรูปแบบของทั้งสอง flag และ Server-Side Apply
+
+## `kubectl diff` — เห็นสิ่งที่ apply จะเปลี่ยน ก่อนที่มันจะเปลี่ยนจริง
+
+`kubectl diff -f` รัน merge แบบเดียวกับที่ Server-Side Apply จะทำ กับ object ที่มีอยู่จริง แล้วพิมพ์ diff จริงแบบ unified โดยไม่เปลี่ยนอะไรเลย:
+
+```text
+$ kubectl diff -f deployment-changed.yaml
+--- LIVE
++++ MERGED
+@@
+-  replicas: 2
++  replicas: 4
+   selector:
+     matchLabels:
+@@
+       containers:
+-      - image: nginx:1.27-alpine
++      - image: nginx:1.29-alpine
+```
+
+นี่คือวิธีตรงและจริงที่สุดที่จะตอบคำถาม "manifest นี้เปลี่ยนอะไรจริง ๆ" สำหรับ manifest ที่ AI ผู้ช่วยอ้างว่า "แค่แก้นิดเดียว" — อ่าน diff ไม่ใช่คำอ้าง
+
+## `kubeconform` — ตรวจ OpenAPI schema จริง แบบออฟไลน์ ทั้งโหมดปกติและ strict
+
+`kubeconform` ตรวจรูปร่างของ manifest กับ OpenAPI schema จริงของ Kubernetes สำหรับเวอร์ชันเป้าหมาย โดยไม่ต้องมีคลัสเตอร์เลย โหมด default ของมันค่อนข้างผ่อนปรนเรื่อง field เกิน `-strict` คือจุดที่มันแสดงฝีมือจริง:
+
+```text
+$ docker run --rm -v "$PWD":/data ghcr.io/yannh/kubeconform:latest -strict -summary /data/bad.yaml
+/data/bad.yaml - Deployment web is invalid: problem validating schema: ... at '/spec/template/spec/containers/0':
+additional properties 'privileged' not allowed
+Summary: 1 resource found in 1 file - Valid: 0, Invalid: 1, Errors: 0, Skipped: 0
+```
+
+จับได้ว่า field `privileged` ถูกวางตรงใต้ container เลย (แทนที่จะซ้อนอยู่ใต้ `securityContext` ตามที่ควรจะเป็น) — ความผิดที่มองผ่าน ๆ เข้าใจว่าถูกต้องได้ง่ายมาก กับ `apiVersion` ที่ถูกลบไปแล้ว `kubeconform` รายงานสัญญาณอีกแบบที่จริงเช่นกัน — มันไม่มี schema สำหรับเวอร์ชันที่ไม่มีอยู่แล้ว:
+
+```text
+$ docker run --rm -v "$PWD":/data ghcr.io/yannh/kubeconform:latest -summary /data/extensions-v1beta1-deployment.yaml
+/data/extensions-v1beta1-deployment.yaml - Deployment web failed validation: could not find schema for Deployment
+Summary: 1 resource found in 1 file - Valid: 0, Invalid: 0, Errors: 1, Skipped: 0
+```
+
+ไม่ต้องมีคลัสเตอร์เลยสำหรับทั้งสองเช็ก — นี่คือเครื่องมือที่ควรรันใน CI ก่อนที่จะไปถึงคลัสเตอร์ `kind`/staging จริงเสียอีก
+
+## `kube-linter` — ผลลัพธ์จริงและปัจจุบันจากชุดกฎด้าน security และ reliability
+
+`kube-linter` (output จริงด้านล่างจาก `stackrox/kube-linter` รันผ่าน Docker กับ Deployment `web` ที่มีรูปร่างเดียวกับข้อ 18/19 ของ catalog) เช็กชุดกฎที่กว้างกว่า schema validity มาก — resource requests, image tag, anti-affinity, root filesystem, privilege escalation พร้อมกันหมด:
+
+```text
+$ docker run --rm -v "$PWD":/data stackrox/kube-linter:latest lint /data/lint-target.yaml
+Error: found 8 lint errors
+KubeLinter 0.8.3
+
+.../lint-target.yaml: container "web" is privileged (check: privileged-container, ...)
+.../lint-target.yaml: container "web" is Privileged hence allows privilege escalation. (check: privilege-escalation-container, ...)
+.../lint-target.yaml: container "web" is not set to runAsNonRoot (check: run-as-non-root, ...)
+.../lint-target.yaml: container "web" has cpu request 0 (check: unset-cpu-requirements, ...)
+.../lint-target.yaml: container "web" has memory limit 0 (check: unset-memory-requirements, ...)
+.../lint-target.yaml: The container "web" is using an invalid container image, "nginx:latest" (check: latest-tag, ...)
+.../lint-target.yaml: object has 3 replicas but does not specify inter pod anti-affinity (check: no-anti-affinity, ...)
+.../lint-target.yaml: container "web" does not have a read-only root file system (check: no-read-only-root-fs, ...)
+```
+
+คำสั่งเดียวเผยต้นตอของข้อ 12 ใน **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)** ที่ requests หายไป, แพทเทิร์น `privileged: true` จากข้อ 18, และเช็กอีกหลายอย่างที่ catalog ของคอร์สนี้ไม่ได้ครอบคลุมเลย (image tag `:latest`, anti-affinity, read-only root filesystem) — `kube-score` กับ `polaris` ครอบคลุมชุดกฎที่คาบเกี่ยวกันแต่ไม่เหมือนกันเป๊ะในแบบเดียวกัน คุ้มค่าที่จะรันทุกตัว ไม่มีตัวไหนแทนกันได้
+
+## โหมด `warn` ของ Pod Security Admission — linter ที่ทำงานจริงบนทุก apply จริง
+
+ต่างจากทุกเครื่องมือด้านบน Pod Security Admission ทำงาน**อยู่ข้างใน API server เอง** บนทุก request จริง ไม่ว่าจะมีใครมองอยู่หรือไม่ — และระดับ `warn` ของมันถูกออกแบบมาให้เป็น linter แบบไม่บล็อกโดยเฉพาะ: มันพิมพ์ข้อความ violation เดียวกับที่ `enforce` จะปฏิเสธ แล้วก็ยอม admit object นั้นอยู่ดี
+
+```text
+$ kubectl apply -f privileged-realistic.yaml   # namespace: enforce=baseline, warn=restricted
+Warning: would violate PodSecurity "restricted:latest": privileged (container "c" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (...), unrestricted capabilities (...), runAsNonRoot != true (...), seccompProfile (...)
+pod/privileged-realistic created
+```
+
+การตั้ง `warn` ให้เข้มกว่า `enforce` ทั่วทั้งคลัสเตอร์ (หรือทั้ง namespace) เปลี่ยนทุก `kubectl apply` จริงให้เป็น linter pass ฟรี ๆ ที่ไม่ต้องตั้งค่าอะไรเพิ่ม ดู **[Pod & Cluster Security](/kubernetes/th/observability-and-security/pod-and-cluster-security/)** สำหรับการเทียบระดับ `privileged`/`baseline`/`restricted` เต็มรูปแบบ และการปฏิเสธจริงของ `enforce` ที่ข้อความเดียวกันนี้สร้าง
+
+## `ValidatingAdmissionPolicy` — กฎแบบ CEL สำหรับสิ่งที่ Pod Security Admission ไม่ครอบคลุม
+
+ชุดกฎของ Pod Security Admission ตายตัว — มันไม่มีทางแสดงกฎเฉพาะองค์กรอย่าง "ดึง image จาก `myregistry.internal/*` เท่านั้น" ได้ `ValidatingAdmissionPolicy` (ใช้ CEL, built-in ใน API server, GA ตั้งแต่ Kubernetes 1.30) เติมช่องว่างนั้นพอดี **[Pod & Cluster Security](/kubernetes/th/observability-and-security/pod-and-cluster-security/)** พิสูจน์ policy จริงที่ปฏิเสธ image นอก allowlist ด้วย error จาก CEL จริงและปัจจุบัน ปฏิบัติกับมันแบบเดียวกับ PSA: เป็นเช็กที่ทำงานจริงบนทุก request ไม่ใช่เช็กแบบ CI หรือแบบออฟไลน์
+
+## harness ของคอร์สนี้เอง: `tools/verify-manifests.mjs`
+
+ทุก fence ประเภท `yaml` ในคอร์สนี้ที่มี path comment จริงเป็นบรรทัดแรก (`# k8s/<lesson>/<name>.yaml`) ถูกเก็บโดย `tools/verify-manifests.mjs` แล้วรันผ่าน `kubectl apply --dry-run=server` กับคลัสเตอร์ `kind` ที่ใช้ร่วมกันของคอร์สนี้เอง (`verify-k8s`, Kubernetes 1.37, ติดตั้ง Gateway API และ VolumeSnapshot CRD ไว้ล่วงหน้า):
+
+```bash
+npm run verify
+```
+
+fence ที่ตั้งใจแสดง YAML ที่พัง (ตัวอย่าง "โค้ดที่ AI มักเขียน" ส่วนใหญ่ใน **[AI Bug Catalog](/kubernetes/th/reading-k8s/ai-bug-catalog/)**) ขึ้นต้นด้วย `# @expect-error <เหตุผล>` ทำให้ harness ข้ามการเก็บ fence นั้นไปทั้งหมด — เนื้อหาของบทเรียนแบกรับ output จริงของ `dry-run=server`/apply/describe/curl ที่จับแยกต่างหากไว้แทน ตามที่แสดงตลอดบทเรียนนั้น `node tools/verify-manifests.mjs --apply <module>/<lesson>` ไปไกลกว่านั้นทีละบท: มัน apply จริง fence ของบทนั้นลง namespace ชั่วคราว รอ Pod, พิมพ์ `get all` และ events แล้วเก็บกวาด — วิธีเดียวที่ harness ของคอร์สนี้ทำซ้ำสัญญาณที่เป็น runtime ล้วน ๆ ได้ตามต้องการ (HPA target แบบ `<unknown>`, eviction ที่ถูกบล็อก, restart loop จริง) แบบเดียวกับที่การพิสูจน์ในบทนี้ถูกจับมา
+
+## ตรวจ manifest แบบ static ก่อน apply จริง
+
+`kubectl apply --dry-run=server` กับ API server จริง (harness ของคอร์สนี้เอง `tools/verify-manifests.mjs` รันแบบนี้อยู่แล้ว) คือบททดสอบจริง — แต่การตรวจแบบ static เร็ว ๆ ในเบราว์เซอร์ จับ error พื้นฐาน (field ที่ไม่มีจริง, field จำเป็นที่ขาด, type ผิด, `apiVersion` ที่ถูกลบไปแล้ว) ได้ก่อนจะไปถึง cluster ด้วยซ้ำ:
+
+<K8sSchemaCheck id="ksc-verification-tools" code={kscVerifySample} />
+
+export const kscVerifySample = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.31
+          privileged: true
+`;
+
+นี่คือเช็กแบบ static ในเบราว์เซอร์ตัวเดียวกับที่ฝังไว้แล้วใน **[`kubectl` และ Declarative YAML](/kubernetes/th/foundations/kubectl-and-declarative-yaml/)** — ไม่ใช่เครื่องมือที่สอง แยกต่างหาก แค่เป็นอีกที่หนึ่งที่มันมีประโยชน์จริง: ก่อนที่จะ apply manifest ที่โมดูลนี้เพิ่งสอนให้คุณไม่เชื่อตั้งแต่แรกเห็น
+
+## Mental Model
+
+<Mermaid title="เครื่องมือแบบ static พิสูจน์สิ่งต่าง ๆ จากซอร์สอย่างเดียว; เครื่องมือแบบ dynamic ต้องการคลัสเตอร์จริง, request จริง, หรือเวลาจริง" code={verificationToolsDiagram} />
+
+export const verificationToolsDiagram = `flowchart TD
+  subgraph Static["Static (ไม่ต้องมีคลัสเตอร์)"]
+    Explain["kubectl explain --recursive/--api-version<br/>schema จริง ออฟไลน์"]
+    Conform["kubeconform -strict<br/>error รูปร่าง, apiVersion ที่ถูกลบ"]
+    Lint["kube-linter / kube-score / polaris<br/>กฎด้าน security + reliability"]
+    Schema["K8sSchemaCheck (ในเบราว์เซอร์)<br/>เช็กแบบเดียวกับ kubeconform ฝั่ง client"]
+  end
+  subgraph Server["ต้องการ API server จริง"]
+    DryRun["kubectl apply --dry-run=server<br/>OpenAPI validation เต็มรูปแบบ + admission chain"]
+    Diff["kubectl diff<br/>merge จริงกับ object ที่มีอยู่"]
+    PSA["Pod Security Admission warn/enforce<br/>ทำงานทุก request จริง"]
+    VAP["ValidatingAdmissionPolicy<br/>กฎ CEL เฉพาะองค์กร"]
+    Harness["tools/verify-manifests.mjs<br/>การกวาด dry-run=server ของคอร์สนี้เอง"]
+  end
+  subgraph Runtime["ต้องการเวลาจริงหรือ request จริง"]
+    Describe["kubectl describe / get events<br/>HPA unknown, drain ที่ถูกบล็อก, restart loop"]
+    Curl["curl จากในคลัสเตอร์<br/>Service endpoint, ทิศทางของ NetworkPolicy, DNS"]
+  end
+`;
+
+<Callout title="สรุปหนึ่งบรรทัด">
+ทุกเครื่องมือในหน้านี้คือตัวกรอง ไม่ใช่คำตัดสิน — แม้รันพร้อมกันทั้งหมด ก็ยังทิ้งแพทเทิร์นส่วนใหญ่ใน 24 ข้อของ AI Bug Catalog (16 ข้อ apply ผ่านสะอาด) ไว้โดยไม่ถูกจับจนกว่าเวลาจริงหรือ request จริงจะผ่านไป รัน `kubectl explain`/`kubeconform`/`kube-linter` ก่อน (ไม่ต้องมีคลัสเตอร์) แล้วค่อย `kubectl apply --dry-run=server` และ harness ของคอร์สนี้เองกับ API server จริง แล้วยังต้องไล่ <a href="/kubernetes/th/reading-k8s/review-checklist/">Review Checklist</a> ด้วยตาเปล่าสำหรับทุกอย่างที่มีแค่ `describe`, event, หรือ request จริงเท่านั้นที่จะเผยออกมาได้
+</Callout>
+
+export const quizVerificationTools = [
+  {
+    q: "```text\n$ kubectl apply --dry-run=client -f hpa-v1-v2-mixed-shape.yaml\nhorizontalpodautoscaler.autoscaling/web created (dry run)\n```\nจาก output จริงนี้ ผล `--dry-run=client` ที่สะอาดพิสูจน์อะไรจริง ๆ เกี่ยวกับ strict field validation ฝั่ง server?",
+    options: [
+      "That the object has no unknown fields",
+      "Nothing about server-side strict decoding at all -- --dry-run=client never contacts the API server, so it cannot run the exact check that rejects this object with a real BadRequest under --dry-run=server",
+      "That the object is definitely valid",
+      "That autoscaling/v1 and v2 are compatible",
+    ],
+    answer: 1,
+    explain: "พิสูจน์โดยตรง: ไฟล์เดียวกันเป๊ะที่ --dry-run=client รายงานว่า 'created (dry run)' กลับล้มเหลวตอน --dry-run=server ด้วย BadRequest จริงและปัจจุบันของ strict decoding — dry-run ฝั่ง client แค่ตรวจว่า request สร้างได้ โดยใช้ schema ที่ cache ไว้ในเครื่อง ไม่เคยไปถึง round trip จริงเลย",
+  },
+  {
+    q: "ทำไมโหมด default (non-strict) ของ kubeconform ถึงยอมรับ container ที่มี field `privileged` ซ้อนอยู่ตรงใต้มันเลย (แทนที่จะอยู่ใต้ securityContext) ในขณะที่ `-strict` ปฏิเสธมัน?",
+    options: [
+      "kubeconform never checks that field regardless of mode",
+      "Default mode tolerates additional/unknown properties for compatibility with partial or evolving manifests; -strict enforces the schema's 'additionalProperties: false' rule, so anything not explicitly defined at that exact path (including a correct field name in the wrong nesting) is rejected",
+      "Strict mode only checks required fields",
+      "This is a kubeconform bug",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ด้านบน: ไฟล์เดียวกันเป๊ะผ่านโหมด default ของ kubeconform แล้วล้มเหลวเฉพาะตอนใช้ -strict โดยพิมพ์ JSON-pointer path จริงและข้อความ 'additional properties not allowed' จริง",
+  },
+  {
+    q: "ทำไมโหมด `warn` ของ Pod Security Admission ถึงถูกบรรยายว่าเป็น 'linter ที่ทำงานจริง' แทนที่จะเป็นเครื่องมือระดับ CI แบบ kube-linter หรือ kubeconform?",
+    options: [
+      "It isn't different from the others -- all tools run at the same stage",
+      "warn runs inside the API server on every real kubectl apply, printing the same violation text an enforce rejection would while still admitting the object -- it needs no separate CI step or offline run, and it sees the object's fully-defaulted, real final shape, not just its source YAML",
+      "warn mode only works in CI pipelines",
+      "warn is identical to enforce, just renamed",
+    ],
+    answer: 1,
+    explain: "พิสูจน์โดยตรง: `kubectl apply` กับ namespace ที่ตั้ง warn=restricted พิมพ์ข้อความ violation จริงแล้วก็ยังสร้าง Pod อยู่ดี — การเช็กทำงานจริง ฝั่ง server บน object ที่ admit จริง ไม่ใช่การอ่านไฟล์ YAML แบบ static",
+  },
+  {
+    q: "ทำไม `tools/verify-manifests.mjs` ของคอร์สนี้เองถึง mark fence ส่วนใหญ่ของ 'โค้ดที่ AI มักเขียน' ใน AI Bug Catalog ด้วย `# @expect-error <เหตุผล>` แทนที่จะเป็น path comment ธรรมดา?",
+    options: [
+      "To hide the bugs from readers",
+      "So the harness skips collecting a fence that is deliberately broken -- the lesson prose carries the real, separately-captured dry-run=server/apply/describe/curl output instead of asking every run to reproduce an intentional failure",
+      "@expect-error fences run faster",
+      "It has no effect on the harness at all",
+    ],
+    answer: 1,
+    explain: "ถ้าไม่มี marker นี้ manifest ที่ตั้งใจให้พังจะทำให้ทุกครั้งที่รัน tools/verify-manifests.mjs รายงาน error จริงสำหรับ YAML ที่ตั้งใจให้ผิดอยู่แล้ว — marker บอก harness ว่า fence นี้ตั้งใจไม่ถูกเก็บ ตรงกับข้อตกลงที่ใช้ทั่วทั้งคอร์สนี้",
+  },
+];
+
+<Quiz client:visible id="reading-k8s/verification-tools" questions={quizVerificationTools} />
+
+<ProgressTracker client:visible id="reading-k8s/verification-tools" />

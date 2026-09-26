@@ -1,0 +1,1600 @@
+---
+title: The AI bug catalog
+description: '24 บั๊กที่ YAML ของ Kubernetes ซึ่ง AI เขียนสร้างซ้ำ ๆ — manifest ที่ AI มักเขียน ทำไมมันผิด output จริงของ dry-run=server/apply/describe/curl ที่ทำซ้ำบนคลัสเตอร์ 1.37 จริง และวิธีแก้'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
+
+ทุก manifest ด้านล่างถูกเขียนให้หน้าตาเหมือน YAML ที่ AI ผู้ช่วยเขียนจริง ๆ ทุกประการ — ส่วนใหญ่ลื่นไหล เป็นไปได้ตามหลักไวยากรณ์ และมีรูปร่างตาม training data ที่ยังจำ `extensions/v1beta1` ได้ และ "แค่ตั้ง `privileged: true` มันจะแก้ permission error ให้เอง" — แล้วรันจริง: `kubectl apply --dry-run=server` (หรือ apply จริง เมื่อบั๊กนั้นเงียบต่อ API server) กับคลัสเตอร์ `kind` ของ Kubernetes 1.37.0 จริง (`reading-a`, 1 control-plane + 2 worker สร้างขึ้นสำหรับโมดูลนี้และลบทิ้งหลังจับการพิสูจน์เหล่านี้เสร็จแล้ว) output ของ `kubectl`, event, และผล curl ที่ยกมาด้านล่างคัดลอกมาจากการรันจริงเป๊ะ ไม่ได้เรียบเรียงจากความจำ สังเกตว่าอันไหนที่ API server ปฏิเสธจริง: **มีแค่ 8 จาก 24 แพทเทิร์นเท่านั้นที่ทำให้ `kubectl apply --dry-run=server` ล้มเหลวตรง ๆ** — ข้อ 1–8 ในตารางด้านล่าง อีก 16 ข้อที่เหลือ apply ผ่านสะอาดแล้วพังทีหลังแบบเงียบ ๆ ในแบบที่มีแค่ `describe` จริง, `get events` จริง, curl จริง, หรือการ reschedule ไปอีก node เท่านั้นที่เผยออกมา 24 แพทเทิร์นนี้จัดกลุ่มตามเจ็ดพื้นที่เดียวกับ **[วิธีอ่าน YAML ของ Kubernetes ที่ไม่ได้เขียนเอง](/kubernetes/th/reading-k8s/)** และ **[Review Checklist](/kubernetes/th/reading-k8s/review-checklist/)** ที่ตามหลังบทนี้
+
+## apiVersion & รูปร่าง
+
+### 1. `extensions/v1beta1` สำหรับ Deployment
+
+training data ของ AI ครอบคลุมหลายปีของ tutorial Kubernetes และ `Deployment` เคยอยู่ใต้ `extensions/v1beta1` และ `apps/v1beta1`/`apps/v1beta2` มาก่อนที่จะลงตัวที่ `apps/v1` ถูกลบไปตั้งแต่ Kubernetes **1.16** (ปี 2019) แต่ก็ยังเป็นหนึ่งในค่า `apiVersion` ที่ถูกหลอนบ่อยที่สุดใน manifest ที่ AI สร้าง เพราะ training corpus สาธารณะจำนวนมากมีอายุก่อนการลบนี้
+
+```yaml
+# k8s/ai-bug-catalog/extensions-v1beta1-deployment.yaml — @expect-error extensions/v1beta1 was removed in Kubernetes 1.16
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27-alpine
+```
+
+**อาการ — output จริง จาก `kubectl apply --dry-run=server` กับคลัสเตอร์ 1.37.0 จริง:**
+
+```text
+error: resource mapping not found for name: "web" namespace: "" from "extensions-v1beta1-deployment.yaml": no matches for kind "Deployment" in version "extensions/v1beta1"
+ensure CRDs are installed first
+```
+
+นี่คือความล้มเหลวของ RESTMapper ฝั่ง client ไม่ใช่แม้แต่ request ที่ไปถึง API server ให้ปฏิเสธ — `kubectl` หา `extensions/v1beta1` ใน discovery document ของคลัสเตอร์ไม่เจอเลย บน Kubernetes เวอร์ชันไหนก็ตามที่ใหม่กว่า 1.16
+
+**วิธีแก้:**
+
+```yaml
+# k8s/ai-bug-catalog/extensions-v1beta1-deployment-fixed.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27-alpine
+```
+
+**จับได้ด้วย:** `kubectl explain deployment` (resolve ได้แค่ใต้ `apps/v1`), `kubectl apply --dry-run=server`/`--dry-run=client` (ล้มเหลวเหมือนกันทั้งคู่ — นี่คือ discovery error ไม่ใช่ schema error), kubeconform, `kubectl api-resources`
+
+### 2. `batch/v1beta1` สำหรับ CronJob
+
+training data เก่าแบบเดียวกัน แค่คนละ API group: `CronJob` เลื่อนขึ้นเป็น `batch/v1` ใน Kubernetes 1.21 และเวอร์ชัน `batch/v1beta1` ถูกลบไปตั้งแต่ **1.25**
+
+```yaml
+# k8s/ai-bug-catalog/batch-v1beta1-cronjob.yaml — @expect-error batch/v1beta1 CronJob was removed in Kubernetes 1.25
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: nightly
+spec:
+  schedule: '0 2 * * *'
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: report
+              image: busybox:1.38
+```
+
+**อาการ — output จริง:**
+
+```text
+error: resource mapping not found for name: "nightly" namespace: "" from "batch-v1beta1-cronjob.yaml": no matches for kind "CronJob" in version "batch/v1beta1"
+ensure CRDs are installed first
+```
+
+**วิธีแก้:**
+
+```yaml
+# k8s/ai-bug-catalog/batch-v1beta1-cronjob-fixed.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly
+spec:
+  schedule: '0 2 * * *'
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: report
+              image: busybox:1.38
+```
+
+**จับได้ด้วย:** `kubectl explain cronjob` (`batch/v1` เท่านั้น), dry-run=server, kubeconform
+
+### 3. `networking.k8s.io/v1beta1` Ingress กับรูปร่างเก่า `backend.serviceName`/`servicePort`
+
+ข้อเท็จจริงเก่าสองอย่างซ้อนกันตรงนี้: Ingress API `v1beta1` ถูกลบไปตั้งแต่ Kubernetes 1.22 **และ** รูปร่างของ `backend` ก็เปลี่ยนพร้อมกัน — `serviceName`/`servicePort` (v1beta1) กลายเป็น `service.name`/`service.port.number` (v1) โมเดล AI ที่ train บนตัวอย่าง Ingress ก่อนปี 2021 ผลิตทั้งสองอย่างนี้ซ้ำพร้อมกันเสมอ
+
+```yaml
+# k8s/ai-bug-catalog/ingress-v1beta1-backend-shape.yaml — @expect-error networking.k8s.io/v1beta1 was removed in Kubernetes 1.22; the old backend.serviceName/servicePort shape is gone too
+apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: web
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            backend:
+              serviceName: web
+              servicePort: 80
+```
+
+**อาการ — output จริง:**
+
+```text
+error: resource mapping not found for name: "web" namespace: "" from "ingress-v1beta1-backend-shape.yaml": no matches for kind "Ingress" in version "networking.k8s.io/v1beta1"
+ensure CRDs are installed first
+```
+
+**วิธีแก้:**
+
+```yaml
+# k8s/ai-bug-catalog/ingress-v1beta1-backend-shape-fixed.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  number: 80
+```
+
+สังเกตว่ารูปร่างใหม่ยังต้องการ `pathType` ด้วย — field จำเป็นที่ไม่มีอยู่เลยใน v1beta1 ดังนั้นการแก้แค่ `apiVersion` แล้วปล่อยรูปร่างเก่าของ `backend` กับ `pathType` ที่ขาดไว้ยังคงล้มเหลวอยู่ดี
+
+**จับได้ด้วย:** `kubectl explain ingress.spec.rules.http.paths` (แบบ recursive แสดงว่า `pathType` จำเป็น และ `backend.service.name`/`port.number` คือรูปร่างจริง), dry-run=server, kubeconform
+
+### 4. `kind: PodSecurityPolicy`
+
+`PodSecurityPolicy` ถูก deprecate ตั้งแต่ Kubernetes 1.21 และถูกลบไปเลยตั้งแต่ **1.25** แทนที่ด้วย Pod Security Admission (label บน namespace) และสำหรับสิ่งที่ PSP ทำได้แต่ PSA ทำไม่ได้ ก็มี `ValidatingAdmissionPolicy` หรือ webhook ของบุคคลที่สาม (Kyverno, Gatekeeper) AI ผู้ช่วยยังแนะนำมันอยู่เรื่อย ๆ เพราะ "เพิ่ม PodSecurityPolicy" คือคำตอบมาตรฐานของ "จะจำกัด Pod แบบ privileged ยังไง" มาหลายปี
+
+```yaml
+# k8s/ai-bug-catalog/podsecuritypolicy-removed.yaml — @expect-error PodSecurityPolicy was removed in Kubernetes 1.25
+apiVersion: policy/v1beta1
+kind: PodSecurityPolicy
+metadata:
+  name: restricted
+spec:
+  privileged: false
+  seLinux:
+    rule: RunAsAny
+  runAsUser:
+    rule: RunAsAny
+  fsGroup:
+    rule: RunAsAny
+  supplementalGroups:
+    rule: RunAsAny
+```
+
+**อาการ — output จริง:**
+
+```text
+error: resource mapping not found for name: "restricted" namespace: "" from "podsecuritypolicy-removed.yaml": no matches for kind "PodSecurityPolicy" in version "policy/v1beta1"
+ensure CRDs are installed first
+```
+
+**วิธีแก้:** ไม่มีตัวแทนแบบ 1:1 ตรง ๆ — ข้อจำกัดที่เทียบเท่าย้ายไปเป็น **label บน Namespace** ที่ควบคุมโดย Pod Security Admission controller ที่ built-in แทน object ระดับคลัสเตอร์แบบเดิม:
+
+```yaml
+# k8s/ai-bug-catalog/podsecuritypolicy-removed-fixed.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: my-app
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+```
+
+**จับได้ด้วย:** `kubectl explain podsecuritypolicy` (ไม่มี kind นี้เลย), `kubectl api-resources | grep -i podsecuritypolicy` (ว่างเปล่า), dry-run=server, kubeconform ดู **[Pod & Cluster Security](/kubernetes/th/observability-and-security/pod-and-cluster-security/)** สำหรับระดับ `restricted`/`baseline`/`privileged` เต็มรูปแบบ และ `ValidatingAdmissionPolicy`
+
+### 5. field ของ `autoscaling/v1` ปนกับ field ของ `autoscaling/v2` ใน HPA เดียวกัน
+
+`HorizontalPodAutoscaler` มีสองรูปร่างที่ใช้งานจริงพร้อมกัน — `autoscaling/v1` (target เดียวเป็นเปอร์เซ็นต์ CPU, `targetCPUUtilizationPercentage`) และ `autoscaling/v2` (array `metrics`, multi-metric, custom/external metric) ตัวอย่างที่ AI สร้างมักวางตัวอย่างสไตล์ `v1` แล้ว "ช่วยเสริม" บล็อก `metrics` ที่ copy มาจากตัวอย่าง `v2` ในลมหายใจเดียวกัน — รูปร่างที่ไม่เคย valid บนเวอร์ชันไหนเลย
+
+```yaml
+# k8s/ai-bug-catalog/hpa-v1-v2-mixed-shape.yaml — @expect-error targetCPUUtilizationPercentage is autoscaling/v1; metrics is autoscaling/v2 only — this object is declared as v1
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 60
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+```
+
+**อาการ — output จริง จาก `kubectl apply` กับคลัสเตอร์ 1.37.0 จริง:**
+
+```text
+Error from server (BadRequest): error when creating "hpa-v1-v2-mixed-shape.yaml": HorizontalPodAutoscaler in version "v1" cannot be handled as a HorizontalPodAutoscaler: strict decoding error: unknown field "spec.metrics"
+```
+
+นี่คือ strict field validation ฝั่ง server จริงและปัจจุบัน — `metrics` ไม่ใช่ typo ที่ API server เพิกเฉยเงียบ ๆ มันคือ `BadRequest` ทันทีที่ object ถูก decode เป็น `v1`
+
+**วิธีแก้:** เลือกเวอร์ชันเดียว `autoscaling/v2` คือเวอร์ชันที่ควรเขียนวันนี้ (รองรับ multi-metric, `behavior`, และเป็นรูปร่างเดียวที่แสดงอะไรได้มากกว่า CPU percentage เดียว):
+
+```yaml
+# k8s/ai-bug-catalog/hpa-v1-v2-mixed-shape-fixed.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+```
+
+**จับได้ด้วย:** `kubectl apply --dry-run=server` (strict decoding รันฝั่ง server ไม่ว่าจะ dry-run หรือไม่), `kubectl explain hpa.spec --api-version=autoscaling/v1` เทียบกับ `--api-version=autoscaling/v2` (แบบ recursive แสดงว่าสองรูปร่างไม่เคยทับซ้อนกันเลย) ดู **[Horizontal Pod Autoscaling](/kubernetes/th/scheduling-and-scaling/horizontal-pod-autoscaling/)** สำหรับการเทียบ `v1`/`v2` เต็มรูปแบบ พิสูจน์ในแบบเดียวกัน
+
+## Workload
+
+### 6. `selector.matchLabels` ถูกเปลี่ยนหลังจาก Deployment มีอยู่แล้ว
+
+`spec.selector` ของ Deployment ถูกตั้งครั้งเดียวตอนสร้าง แล้ว immutable ตลอดไปหลังจากนั้น — ไม่ใช่เพราะ Kubernetes เข้มงวดโดยไม่มีเหตุผล แต่เพราะการเปลี่ยนมันจะทำให้ Pod/ReplicaSet ทุกตัวที่ selector เก่าจับคู่ไว้ถูกทิ้งแบบเงียบ ๆ AI ผู้ช่วยที่ถูกขอให้ "เพิ่ม label" ให้ Deployment ที่มีอยู่แล้วมักจะแก้ selector ไปพร้อมกับ label ของ template โดยสมมติว่าทั้งคู่เป็นแค่ metadata ที่แก้ได้อย่างอิสระ
+
+```yaml
+# k8s/ai-bug-catalog/deployment-selector-immutable.yaml — @expect-error changing spec.selector on an existing Deployment is rejected
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: bugcat-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web
+      tier: frontend
+  template:
+    metadata:
+      labels:
+        app: web
+        tier: frontend
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10
+```
+
+**อาการ — output จริง apply ใส่ Deployment ชื่อ `web` ที่มีอยู่แล้วซึ่ง selector คือ `{app: web}`:**
+
+```text
+$ kubectl apply -f deployment-selector-immutable.yaml
+The Deployment "web" is invalid: spec.selector: Invalid value: {"matchLabels":{"app":"web","tier":"frontend"}}: field is immutable
+```
+
+**วิธีแก้:** ตัดสินใจ selector ให้ถูกต้องก่อน apply ครั้งแรก แล้วอย่าไปแตะมันอีกเลย ถ้า selector จำเป็นต้องเปลี่ยนจริง ๆ ไม่มีวิธี migrate แบบ in-place — ลบแล้วสร้างใหม่ (`kubectl delete --cascade=orphan` ก่อนถ้าอยากให้ Pod ที่มีอยู่รอด แล้ว adopt มันภายใต้ selector ใหม่):
+
+```yaml
+# k8s/ai-bug-catalog/deployment-selector-immutable-fixed.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: bugcat-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+        tier: frontend # extra template labels are fine to add — only the selector itself is frozen
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10
+```
+
+**จับได้ด้วย:** dry-run=server กับคลัสเตอร์จริง (การเช็ก immutability เทียบกับ object ที่เก็บไว้ ดังนั้นจะ trigger ก็ต่อเมื่อ Deployment มีอยู่แล้วเท่านั้น — `--dry-run=server` บนชื่อใหม่เอี่ยมจะไม่เจอมันเลย), `kubectl diff -f`, การรีวิว
+
+### 7. `restartPolicy: Always` บน Pod template ของ Job
+
+ประเด็นทั้งหมดของ Job คือ "ทำงานจนเสร็จ แล้วหยุด" — Pod template ของมันจำกัดไว้ที่ `restartPolicy: OnFailure` หรือ `Never` เท่านั้น โมเดล AI ตั้ง `Always` เป็น default อยู่บ่อย ๆ เพราะมันคือค่า default ในทุกที่อื่นของ Kubernetes (Deployment, StatefulSet, DaemonSet) และ YAML ของ Job ที่ AI สร้างมักจะ copy Pod template ที่มีรูปร่างแบบ Deployment มาทั้งดุ้น
+
+```yaml
+# k8s/ai-bug-catalog/job-restartpolicy-always.yaml — @expect-error restartPolicy: Always is not a valid Job Pod template value
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bad-job
+spec:
+  template:
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: work
+          image: busybox:1.38
+          command: ['sh', '-c', 'echo hi']
+```
+
+**อาการ — output จริง:**
+
+```text
+$ kubectl apply --dry-run=server -f job-restartpolicy-always.yaml
+The Job "bad-job" is invalid: spec.template.spec.restartPolicy: Required value: valid values: "OnFailure", "Never"
+```
+
+**วิธีแก้:**
+
+```yaml
+# k8s/ai-bug-catalog/job-restartpolicy-always-fixed.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bad-job
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: work
+          image: busybox:1.38
+          command: ['sh', '-c', 'echo hi']
+```
+
+**จับได้ด้วย:** dry-run=server, kubeconform, `kubectl explain job.spec.template.spec.restartPolicy` ดู **[Jobs & CronJobs](/kubernetes/th/workloads/jobs-and-cronjobs/)**
+
+### 8. `maxUnavailable: 0` กับ `maxSurge: 0` พร้อมกันบน RollingUpdate
+
+สองปุ่มนี้ไม่เป็นอิสระต่อกัน — รวมกันแล้วต้องเหลือทาง *บางอย่าง* ให้ rollout เดินหน้าได้ "ห้าม Pod ไหน unavailable เลย แล้วก็ห้ามสร้าง Pod เกินด้วย" ไม่ใช่กลยุทธ์ที่ระมัดระวัง มันคือ rollout ที่ไม่มีวันขยับ replica แม้แต่ตัวเดียวจากเก่าไปใหม่ได้เลย และ API server ปฏิเสธมันตั้งแต่ตอน apply ไม่ใช่ค้นพบว่า rollout ค้างทีหลัง AI ผู้ช่วยที่ถูกขอ "rolling update ที่ปลอดภัยที่สุดเท่าที่จะทำได้" มักจะตั้งทั้งสองปุ่มเป็นศูนย์ ด้วยเหตุผล "0 unavailable = ปลอดภัยที่สุด" โดยไม่รู้ว่าคู่นี้ invalid ร่วมกัน
+
+```yaml
+# k8s/ai-bug-catalog/rollout-maxunavailable-maxsurge-zero.yaml — @expect-error maxUnavailable: 0 is invalid when maxSurge is also 0
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-zerozero
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web-zerozero
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 0
+  template:
+    metadata:
+      labels:
+        app: web-zerozero
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10
+```
+
+**อาการ — output จริง:**
+
+```text
+$ kubectl apply --dry-run=server -f rollout-maxunavailable-maxsurge-zero.yaml
+The Deployment "web-zerozero" is invalid: spec.strategy.rollingUpdate.maxUnavailable: Invalid value: 0: may not be 0 when `maxSurge` is 0
+```
+
+**วิธีแก้:** ยอมให้มี surge Pod หนึ่งตัว (`maxSurge: 1` ยังคง unavailable เป็นศูนย์) หรือยอมรับ strategy แบบ Recreate ถ้า workload รันสองเวอร์ชันคู่กันจริง ๆ ไม่ได้:
+
+```yaml
+# k8s/ai-bug-catalog/rollout-maxunavailable-maxsurge-zero-fixed.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-zerozero
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web-zerozero
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: web-zerozero
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10
+```
+
+**จับได้ด้วย:** dry-run=server, kubeconform ดู **[Deployments and ReplicaSets](/kubernetes/th/workloads/deployments-and-replicasets/)**
+
+### 9. StatefulSet ที่ `serviceName` ชี้ไปที่ไม่มีอะไรเลย
+
+`serviceName` **ไม่ถูกตรวจสอบกับ Service จริงตอนสร้าง** — API server ยอมรับ StatefulSet ที่อ้างถึง headless Service ที่ไม่มีอยู่จริง หรือ Service แบบ `ClusterIP` ธรรมดาที่ไม่ headless อย่างเต็มใจ manifest หลายไฟล์ที่ AI สร้างมัก "ลืม" Service headless คู่กัน หรือสร้างมันโดยไม่มี `clusterIP: None` เพราะไม่มีอะไรใน YAML ของ StatefulSet เอง error เลย
+
+```yaml
+# k8s/ai-bug-catalog/statefulset-missing-headless-service.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+  namespace: sts-demo
+spec:
+  serviceName: db-headless-not-created
+  replicas: 2
+  selector:
+    matchLabels: { app: db }
+  template:
+    metadata:
+      labels: { app: db }
+    spec:
+      containers:
+        - name: db
+          image: registry.k8s.io/pause:3.10
+```
+
+**อาการ — output จริง; StatefulSet ขึ้นมาสมบูรณ์แข็งแรง ร่องรอยเดียวของบั๊กคือ DNS lookup:**
+
+```text
+$ kubectl apply -f statefulset-missing-headless-service.yaml
+statefulset.apps/db created
+$ kubectl get statefulset,pod -n sts-demo
+NAME                  READY   AGE
+statefulset.apps/db   2/2     8s
+
+NAME       READY   STATUS    RESTARTS   AGE
+pod/db-0   1/1     Running   0          8s
+pod/db-1   1/1     Running   0          6s
+
+$ kubectl run resolver --image=busybox:1.38 --restart=Never --rm -it -- nslookup db-0.db-headless-not-created.sts-demo.svc.cluster.local
+** server can't find db-0.db-headless-not-created.sts-demo.svc.cluster.local: NXDOMAIN
+```
+
+**วิธีแก้:** สร้าง headless Service คู่กัน (`clusterIP: None`) พร้อมกับ StatefulSet:
+
+```yaml
+# k8s/ai-bug-catalog/statefulset-missing-headless-service-fixed.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: db-headless-not-created
+  namespace: sts-demo
+spec:
+  clusterIP: None
+  selector:
+    app: db
+  ports:
+    - port: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+  namespace: sts-demo
+spec:
+  serviceName: db-headless-not-created
+  replicas: 2
+  selector:
+    matchLabels: { app: db }
+  template:
+    metadata:
+      labels: { app: db }
+    spec:
+      containers:
+        - name: db
+          image: registry.k8s.io/pause:3.10
+```
+
+**จับได้ด้วย:** ไม่มีอะไรอัตโนมัติตอน apply เลย — พิสูจน์แล้วข้างต้นว่านี่คือช่องว่างจริงและปัจจุบันของ server-side validation มีแค่ `nslookup`/`dig` จริงจากในคลัสเตอร์ หรือการรีวิวเท่านั้นที่จับได้ ดู **[StatefulSets and DaemonSets](/kubernetes/th/workloads/statefulsets-and-daemonsets/)** ที่พิสูจน์ `NXDOMAIN` แบบเดียวกันเป๊ะ
+
+### 10. CronJob ที่ไม่ตั้ง `concurrencyPolicy` เลย (default เป็น `Allow`)
+
+`concurrencyPolicy` มีค่า default เป็น `Allow` — run ก่อนหน้ากับ run ถัดไปตามตารางเวลาแค่ถูกปล่อยให้ทับซ้อนกันได้เฉย ๆ เมื่อเวลาทำงานจริงของ Job นานกว่าช่วงห่างของตาราง (report รายคืนที่นานกว่าหนึ่งวันหายาก แต่ Job เช็ก health รายนาทีที่ใช้เวลา 90 วินาทีไม่หายากเลย) นี่จะสร้าง run ที่ทับซ้อนกันแบบเงียบ ๆ ไม่จบสิ้น YAML ของ CronJob ที่ AI สร้างมักละ `concurrencyPolicy` ไปเลย เพราะ field นี้รู้สึกเหมือนเป็น optional และตารางเวลาเพียงอย่างเดียวก็ "ดู" ถูกต้องแล้ว
+
+```yaml
+# k8s/ai-bug-catalog/cronjob-default-concurrency-allow.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: overlap-demo
+  namespace: cronjob-demo
+spec:
+  schedule: '* * * * *'
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: work
+              image: busybox:1.38
+              command: ['sh', '-c', 'echo start $(date +%T); sleep 100; echo done $(date +%T)']
+```
+
+**อาการ — output จริง; Job ที่ตัว body sleep 100 วินาที บนตารางเวลาทุกนาที โดยปล่อย `concurrencyPolicy` ไว้ไม่ได้ตั้ง:**
+
+```text
+$ kubectl get cronjob overlap-demo -o jsonpath='{.spec.concurrencyPolicy}'
+Allow
+$ kubectl get jobs -n cronjob-demo
+NAME                    STATUS    COMPLETIONS   DURATION   AGE
+overlap-demo-29840448   Complete  1/1           106s       2m15s
+overlap-demo-29840449   Running   0/1           65s        65s
+overlap-demo-29840450   Running   0/1           15s        15s
+```
+
+Job สองตัว (`...449` กับ `...450`) รันพร้อมกันจริง ๆ — API server ถึงกับใส่ `concurrencyPolicy: Allow` ให้เต็มตัวเมื่อ query เข้าไปเลยด้วยซ้ำ ยืนยันว่านี่ไม่เคยเป็น "ไม่มี policy" มันคือ default ที่ทำงานอยู่ตลอด
+
+**วิธีแก้:** ตั้ง `concurrencyPolicy` อย่างตั้งใจ — `Forbid` (ข้าม run ใหม่ไปเลยขณะที่ยังมี run เดิมทำอยู่) มักถูกต้องสำหรับอะไรก็ตามที่ไม่ควรทับซ้อนกัน:
+
+```yaml
+# k8s/ai-bug-catalog/cronjob-default-concurrency-allow-fixed.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: overlap-demo
+  namespace: cronjob-demo
+spec:
+  schedule: '* * * * *'
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: work
+              image: busybox:1.38
+              command: ['sh', '-c', 'echo start $(date +%T); sleep 100; echo done $(date +%T)']
+```
+
+**จับได้ด้วย:** ไม่มีอะไรอัตโนมัติเลย — valid ทั้งสองแบบ มีแค่การเฝ้าดู `kubectl get jobs` ตามเวลาจริง หรือการรีวิวเท่านั้นที่จับได้ ดู **[Jobs & CronJobs](/kubernetes/th/workloads/jobs-and-cronjobs/)** สำหรับกลไก `Allow`/`Forbid`/`Replace` เดียวกันที่พิสูจน์ไว้โดยตรง
+
+### 11. `selector` ของ Service ที่ไม่ตรงกับ label ของ Pod ไหนเลย
+
+typo ใน `selector` ของ Service — `app: web-typo` แทนที่จะเป็น `app: web` — valid ตาม schema ด้วยตัวเอง API server ไม่มีทางรู้ว่า label ของ Pod ที่ "ถูกต้อง" ควรเป็นอะไร Service ถูกสร้างสำเร็จ โดยมี Endpoint **เป็นศูนย์** และคงเป็นแบบนั้นแบบเงียบ ๆ ตลอดไป
+
+```yaml
+# k8s/ai-bug-catalog/service-selector-typo.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: bugcat-demo
+spec:
+  selector:
+    app: web-typo
+  ports:
+    - port: 80
+      targetPort: 80
+```
+
+**อาการ — output จริง; มี Pod จริงที่ label เป็น `app: web-a9` อยู่ใน namespace เดียวกัน Service เลือก `app: web-a9-typo`:**
+
+```text
+$ kubectl apply -f service-selector-typo.yaml
+service/web-a9 created
+Warning: v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice
+$ kubectl get endpoints web-a9
+NAME     ENDPOINTS   AGE
+web-a9   <none>      0s
+$ kubectl get endpointslice -l kubernetes.io/service-name=web-a9
+NAME           ADDRESSTYPE   PORTS     ENDPOINTS   AGE
+web-a9-5m4cc   IPv4          <unset>   <unset>     0s
+```
+
+ไม่มี error ที่ไหนเลย — `service/web-a9 created` หน้าตาเหมือนกับ Service ที่ select ถูกต้องทุกประการ ร่องรอยเดียวคือ `EndpointSlice` ที่มีอยู่แต่ไม่ได้ list อะไรเลย
+
+**วิธีแก้:** `selector` ของ Service ต้องตรงกับ label ของ Pod template เป๊ะ:
+
+```yaml
+# k8s/ai-bug-catalog/service-selector-typo-fixed.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: bugcat-demo
+spec:
+  selector:
+    app: web-a9
+  ports:
+    - port: 80
+      targetPort: 80
+```
+
+**จับได้ด้วย:** ไม่มีอะไรเลยตอน apply — `kubectl get endpointslice -l kubernetes.io/service-name=<svc>` (หรือ `kubectl get endpoints <svc>` ที่เลิกใช้แล้ว) คือสัญญาณจริงเพียงอย่างเดียว และเห็นได้หลังเกิดเหตุแล้วเท่านั้น การรีวิว หรือเช็กอัตโนมัติแบบ "ทุก Service ต้องมี Endpoint อย่างน้อยหนึ่งตัว" คือทางเดียวที่จับได้ก่อนเกิดเหตุ
+
+<SpotTheBug code={`apiVersion: v1
+kind: Service
+metadata:
+  name: checkout
+spec:
+  selector:
+    app: checkout-svc
+  ports:
+    - port: 8080`}>
+Deployment ที่ Service นี้ควรจะนำหน้าให้ label Pod ของมันว่า `app: checkout` ไม่ใช่ `app: checkout-svc` — แค่ `-svc` เกินมาหนึ่งคำที่ไม่มี schema check, `kubectl explain`, หรือ dry-run ไหนจับได้เลย เพราะ `selector` ของ Service คือแค่ label matcher ธรรมดาที่ไม่มีการอ้างอิงกลับไปที่ Deployment เฉพาะเจาะจงเลย object นี้ apply ผ่านสะอาดแล้วก็ "ขึ้น" ตลอดไปโดยมี endpoint จริงเป็นศูนย์ วิธีเดียวที่จะจับสิ่งนี้ได้คือสิ่งที่ข้อ 11 พิสูจน์ไว้เป๊ะ: อ่าน `template.metadata.labels` จริงของ Deployment แล้วเทียบกับ `spec.selector` ของ Service ด้วยตาเปล่า หรือ query `kubectl get endpointslice` หลัง apply ทุกครั้ง
+</SpotTheBug>
+
+## Scheduling
+
+### 12. Deployment ที่ไม่มี resource `requests` เลย แล้วมี HPA แบบ CPU-percentage นำหน้า
+
+`HorizontalPodAutoscaler` คำนวณ CPU **utilization** เป็นเปอร์เซ็นต์ของ `resources.requests.cpu` ของแต่ละ Pod — ถ้าไม่มี request ตั้งไว้ก็ไม่มีตัวหาร และ HPA คำนวณเปอร์เซ็นต์ไม่ได้เลย ไม่ว่า metric CPU จริงจะพร้อมใช้แค่ไหนก็ตาม ตัวอย่างที่ AI สร้างมักมี HPA ครบสมบูรณ์แล้วละ `resources.requests` บน Deployment ที่มันเล็งไปเลย เพราะสอง object นี้ถูกแก้ไข (หรือสร้าง) แยกจากกัน
+
+```yaml
+# k8s/ai-bug-catalog/hpa-no-requests.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+  namespace: hpa-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: web-app }
+  template:
+    metadata:
+      labels: { app: web-app }
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10
+          # no resources.requests set at all
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app
+  namespace: hpa-demo
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+```
+
+**อาการ — output จริง โดยติดตั้ง `metrics-server` และทำงานอยู่:**
+
+```text
+$ kubectl get hpa web-app -n hpa-demo
+NAME      REFERENCE            TARGETS              MINPODS   MAXPODS   REPLICAS   AGE
+web-app   Deployment/web-app   cpu: <unknown>/60%   2         10        2          34s
+
+$ kubectl describe hpa web-app -n hpa-demo
+Conditions:
+  Type           Status  Reason                   Message
+  ----           ------  ------                   -------
+  ScalingActive  False   FailedGetResourceMetric  the HPA was unable to compute the replica count: failed to get cpu utilization: missing request for cpu in container web of Pod web-app-7f4646f86-4p49q
+Events:
+  Warning  FailedGetResourceMetric  failed to get cpu utilization: missing request for cpu in container web of Pod web-app-7f4646f86-4p49q
+```
+
+`cpu: <unknown>/60%` กับเหตุผลจริงของ `FailedGetResourceMetric` ระบุสาเหตุตรง ๆ เลย — นี่ไม่ใช่ metrics-server ล่ม `metrics-server` กำลังรันและรายงานปกติดี HPA แค่ไม่มีอะไรให้หารเลย
+
+**วิธีแก้:** ตั้ง `resources.requests.cpu` (และโดยทั่วไป `resources.requests.memory`) บนทุก container ที่ HPA เล็งไป — นี่คือคู่ที่บังคับ ไม่ใช่ขั้นตอนปรับแต่งที่เป็น optional:
+
+```yaml
+# k8s/ai-bug-catalog/hpa-no-requests-fixed.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+  namespace: hpa-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: web-app }
+  template:
+    metadata:
+      labels: { app: web-app }
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+```
+
+**จับได้ด้วย:** ไม่มีอะไรตอน apply เลย — ทั้งสอง object valid แยกกัน มีแค่ `kubectl describe hpa` (หรือ condition/event ของ API server เอง) หลังเกิดเหตุ หรือกฎการรีวิวที่จับคู่ "HPA เล็งไปที่ workload นี้" กับ "workload มี requests" เป็นเช็กเดียวกันเท่านั้น ดู **[Horizontal Pod Autoscaling](/kubernetes/th/scheduling-and-scaling/horizontal-pod-autoscaling/)** ที่พิสูจน์คู่ `<unknown>`/`FailedGetResourceMetric` เดียวกันเป๊ะ และเรียกคู่นี้ว่า "สองข้อบังคับ" ของ autoscaler อย่างชัดเจน
+
+### 13. PodDisruptionBudget ที่ `minAvailable` เท่ากับจำนวน replica เต็ม
+
+**PodDisruptionBudget** ที่ตั้ง `minAvailable` เท่ากับ (หรือมากกว่า) `replicas` รวมของ workload valid ตาม schema และดูเหมือนปกป้องดี — แต่มันหมายถึง **ไม่มีการหยุดชะงักโดยสมัครใจข้อไหนเลยที่ถูกอนุญาต** ตลอดไป การ drain node, การอัปเกรดคลัสเตอร์, หรือ cluster-autoscaler ที่จะลดขนาดโดยเล็งไป Pod ไหนของ workload นั้นจะค้างไม่มีกำหนด ไม่ใช่เพราะอะไรพัง แต่เพราะ budget ไม่มีที่ว่างจริง ๆ เลย AI ผู้ช่วยที่ถูกขอให้ "ทำให้ workload นี้ไม่ถูกรบกวนเด็ดขาด" มักเลือกค่า `minAvailable` สูงสุดที่ยังดูสมเหตุสมผล — จำนวน replica เต็ม — โดยไม่รู้ตัวว่ามันบล็อกการบำรุงรักษาที่ถูกต้องตามกฎหมายตลอดไปด้วย
+
+```yaml
+# k8s/ai-bug-catalog/pdb-blocks-drain-forever.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+  namespace: pdb-demo
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: web-app }
+  template:
+    metadata:
+      labels: { app: web-app }
+    spec:
+      containers:
+        - name: web
+          image: registry.k8s.io/pause:3.10
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web-app-pdb
+  namespace: pdb-demo
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels: { app: web-app }
+```
+
+**อาการ — output จริง จากการ `kubectl drain` node ที่มี Pod `web-app` สองในสามตัวอยู่จริง:**
+
+```text
+$ kubectl get pdb web-app-pdb -n pdb-demo
+NAME          MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+web-app-pdb   3               N/A               0                     2s
+
+$ kubectl drain reading-a-worker --ignore-daemonsets --delete-emptydir-data
+evicting pod pdb-demo/web-app-7f4646f86-4fzpq
+error when evicting pods/"web-app-7f4646f86-4fzpq" -n "pdb-demo" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+evicting pod pdb-demo/web-app-7f4646f86-c8tms
+error when evicting pods/"web-app-7f4646f86-c8tms" -n "pdb-demo" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+```
+
+`ALLOWED DISRUPTIONS: 0` เห็นได้ก่อนที่จะแม้แต่ลอง drain เลยด้วยซ้ำ — budget ไม่มีที่ว่างเลยทันทีที่ replica ทั้งสามตัวยังแข็งแรงอยู่ การ drain retry ไม่หยุด (หรือจนกว่า timeout ของมันเอง) ไม่มีวันสำเร็จกับ Pod สองตัวนี้
+
+**วิธีแก้:** เหลือที่ว่างจริง — `minAvailable` (หรือ `maxUnavailable`) ที่ต่ำกว่าจำนวน replica เต็มอย่างเคร่งครัด เพื่อให้อย่างน้อยหนึ่งการหยุดชะงักโดยสมัครใจดำเนินต่อได้เสมอ:
+
+```yaml
+# k8s/ai-bug-catalog/pdb-blocks-drain-forever-fixed.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web-app-pdb
+  namespace: pdb-demo
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels: { app: web-app }
+```
+
+**จับได้ด้วย:** `kubectl get pdb` (คอลัมน์ `ALLOWED DISRUPTIONS` เห็นได้ก่อนลอง drain เลยด้วยซ้ำ — สัญญาณจริงที่เร็วที่สุด), การลอง `kubectl drain --dry-run=server` จริง, การรีวิว ดู **[Pod Disruption & Cluster Autoscaling](/kubernetes/th/scheduling-and-scaling/pod-disruption-and-cluster-autoscaling/)** ที่พิสูจน์ข้อความปฏิเสธ eviction เดียวกันเป๊ะ
+
+## Networking
+
+### 14. NetworkPolicy ที่ตั้งใจจะล็อก Pod แต่ `policyTypes` ลืม `Egress`
+
+`policyTypes` ไม่ได้ถูกอนุมานจากการมีบล็อก `egress:`/`ingress:` อยู่ — มันต้อง list ไว้อย่างชัดเจน และ Kubernetes จำกัดแค่ทิศทางที่ระบุไว้จริงเท่านั้น NetworkPolicy ที่ตั้งใจว่า "Pod นี้ไม่ควรเรียกออกไปที่ไหนได้เลย" ที่ list แค่ `policyTypes: [Ingress]` ไม่ได้จำกัด egress อะไรเลย — traffic ขาออกของ Pod ยังคงไม่ถูกจำกัดอย่างสมบูรณ์แบบเงียบ ๆ
+
+```yaml
+# k8s/ai-bug-catalog/networkpolicy-missing-egress.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: client-lockdown
+  namespace: netpol-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: client
+  policyTypes:
+    - Ingress
+```
+
+**อาการ — output จริง บนคลัสเตอร์จริงที่ CNI (`kindnetd` ของ kind 0.33 ที่เป็น default) บังคับใช้ `NetworkPolicy` จริง:**
+
+```text
+$ kubectl apply -f networkpolicy-missing-egress.yaml
+networkpolicy.networking.k8s.io/client-lockdown created
+$ kubectl get networkpolicy client-lockdown -n netpol-demo -o jsonpath='{.spec.policyTypes}'
+["Ingress"]
+
+$ kubectl exec client -n netpol-demo -- wget -qO- --timeout=2 http://10.244.1.9
+<p><em>Thank you for using nginx.</em></p>
+```
+
+request ขาออกของ Pod `client` ไปยัง Pod อื่นสำเร็จสะอาด — ไม่มีอะไรใน NetworkPolicy นี้จำกัดมันเลย เพราะ `Egress` ไม่เคยอยู่ใน `policyTypes` ผู้อ่านที่ไล่ดู `podSelector` กับ rule ที่ว่างเปล่าเพียงอย่างเดียวอาจสรุปง่าย ๆ ว่า "default-deny" สำเร็จแล้ว ซึ่งไม่จริงเลย ทั้งสองทิศทางที่ policy นี้ไม่ได้ระบุไว้
+
+**วิธีแก้:** list ทุกทิศทางที่ policy ตั้งใจจะจำกัดจริง ๆ:
+
+```yaml
+# k8s/ai-bug-catalog/networkpolicy-missing-egress-fixed.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: client-lockdown
+  namespace: netpol-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: client
+  policyTypes:
+    - Ingress
+    - Egress
+```
+
+**จับได้ด้วย:** ไม่มีอะไรตอน apply เลย — valid ไม่ว่าจะตั้งใจแบบไหน มีแค่การทดสอบการเชื่อมต่อจริงจากในคลัสเตอร์ (พิสูจน์แล้วข้างต้น) หรือกฎการรีวิวที่จับคู่ "ชื่อ/comment ของ NetworkPolicy นี้บอกว่า default-deny" กับ "`policyTypes` list ครบทั้งสองทิศทาง" เป็นเช็กเดียวกัน **ข้อแก้ไขที่มีประโยชน์และใหม่จริง ๆ จากคลัสเตอร์ของโมดูลนี้เอง:** คำแนะนำเก่าบอกว่า CNI default ของ kind (`kindnet`) ไม่บังคับใช้ `NetworkPolicy` เลย — พิสูจน์โดยตรงข้างต้น `kindnetd:v20260820-69b56db7` (default ปัจจุบันของ kind 0.33) **บังคับใช้จริง** — การทดสอบควบคุมโดยไม่มี policy เลยสำเร็จเหมือนกัน ยืนยันว่าการบล็อกข้างต้นคือ policy ไม่ใช่ปัญหาเครือข่ายที่ไม่เกี่ยวข้อง
+
+### 15. NetworkPolicy แบบ "default-deny-all" ที่ไม่มี rule allow DNS egress
+
+อีกทิศทางหนึ่งของกลไกเดียวกัน และเป็นกับดักที่ตกง่ายกว่ามาก: NetworkPolicy ที่ list `policyTypes: [Ingress, Egress]` ถูกต้อง แต่ **ไม่มี `egress:` rule เลย** จะบล็อกทุกทิศทางจริง รวมถึง DNS resolution ของคลัสเตอร์เองด้วย — Pod ภายใต้ policy นี้ resolve hostname *ไหนก็ไม่ได้เลย* รวมถึงชื่อ Service ของ Kubernetes เพราะ query ไปยัง CoreDNS (`kube-dns`, UDP/TCP port 53) เองก็เป็น traffic ขาออกที่ policy นี้ปฏิเสธ
+
+```yaml
+# k8s/ai-bug-catalog/networkpolicy-default-deny-blocks-dns.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: client-default-deny-all
+  namespace: netpol-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: client
+  policyTypes:
+    - Ingress
+    - Egress
+```
+
+**อาการ — output จริง:**
+
+```text
+$ kubectl apply -f networkpolicy-default-deny-blocks-dns.yaml
+networkpolicy.networking.k8s.io/client-default-deny-all created
+
+$ kubectl exec client -n netpol-demo -- nslookup kubernetes.default.svc.cluster.local
+;; connection timed out; no servers could be reached
+```
+
+`no servers could be reached` — query ไปยัง CoreDNS ที่ `10.96.0.10:53` ไม่ได้รับ response กลับมาเลยด้วยซ้ำ เพราะ Egress default-deny บล็อกมันเหมือนกับการเชื่อมต่อขาออกอื่นทุกอย่าง
+
+**วิธีแก้:** rule `egress` ที่ allow DNS ไปยังตัวให้บริการ DNS ของคลัสเตอร์ (namespace `kube-system`, port 53, ทั้งสอง protocol) เพิ่มเข้าไปพร้อมกับอะไรก็ตามที่ workload ต้องการเข้าถึงจริง:
+
+```yaml
+# k8s/ai-bug-catalog/networkpolicy-default-deny-blocks-dns-fixed.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: client-default-deny-allow-dns
+  namespace: netpol-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: client
+  policyTypes:
+    - Ingress
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+```
+
+**อาการของวิธีแก้ พิสูจน์ในแบบเดียวกัน:**
+
+```text
+$ kubectl exec client -n netpol-demo -- nslookup kubernetes.default.svc.cluster.local
+Address: 10.96.0.10:53
+Name:    kubernetes.default.svc.cluster.local
+Address: 10.96.0.1
+```
+
+DNS resolve ได้อีกครั้ง ปลายทาง egress อื่นทุกอันที่ policy นี้ไม่ได้ allow ไว้อย่างชัดเจนยังคงถูกปฏิเสธอยู่ — ท่าที default-deny ที่ตั้งใจไว้ยังคงอยู่ทุกที่ยกเว้นข้อยกเว้นเดียวที่ workload ต้องการจริง
+
+**จับได้ด้วย:** ไม่มีอะไรตอน apply เลย — มีแค่ DNS query จริงจากในคลัสเตอร์ (พิสูจน์แล้วข้างต้น) หรือรายการ checklist ที่ถามตรง ๆ ว่า "policy default-deny นี้ยัง allow DNS อยู่ไหม" นี่คือหนึ่งใน incident รายงานจริงที่พบบ่อยที่สุดของ NetworkPolicy ในโลกจริง เพราะตัว object เองไม่เคยดูผิดเลย
+
+## Storage & configuration
+
+### 16. ใช้ `hostPath` แทนที่ `PersistentVolumeClaim`
+
+`hostPath` mount path บน **node** ที่ Pod บังเอิญไปตกลง — ไม่ portable ไม่มี replication และไม่มีแนวคิดของ "volume เดียวกัน ไม่ว่า Pod จะถูก reschedule ไปที่ไหน" ตัวอย่างที่ AI สร้างเลือกใช้มันบ่อยเพราะไม่ต้องมี `StorageClass`, ไม่ต้องมี provisioner, และไม่ต้องมี object เพิ่ม — มัน "ใช้ได้เลย" ในครั้งแรกบน demo node เดียว ซึ่งเป็นกรณีเดียวพอดีที่ปัญหาเรื่อง portability ไม่มีวันโผล่มาให้เห็น
+
+```yaml
+# k8s/ai-bug-catalog/hostpath-not-portable.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: writer
+  namespace: hostpath-demo
+spec:
+  containers:
+    - name: c
+      image: busybox:1.38
+      command: ['sh', '-c', 'echo "important-data" > /data/state.txt && sleep 3600']
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      hostPath:
+        path: /var/lib/app-data
+        type: DirectoryOrCreate
+```
+
+**อาการ — output จริง; Pod spec เดียวกันเป๊ะ pin ไปที่ worker node ตัวแรกก่อน แล้ว reschedule ไปตัวที่สอง บนคลัสเตอร์สอง worker จริง:**
+
+```text
+$ kubectl exec writer -- cat /data/state.txt   # on reading-a-worker
+important-data
+
+$ kubectl delete pod writer
+$ kubectl apply -f writer-on-worker2.yaml      # identical spec, nodeName: reading-a-worker2
+$ kubectl exec writer -- cat /data/state.txt
+cat: can't open '/data/state.txt': No such file or directory
+```
+
+ไม่มีอะไรผิดปกติกับ Pod ตัวที่สองเลย — `hostPath` mount `/var/lib/app-data` ตามที่ขอเป๊ะ มันแค่ mount โฟลเดอร์ **คนละอัน ว่างเปล่า** บน filesystem ของอีก node เท่านั้น ไม่มี event ไม่มี warning ไม่มี error ระบุสิ่งนี้เลย
+
+**วิธีแก้:** `PersistentVolumeClaim` กับ `StorageClass` จริง (หรือสำหรับข้อมูลระดับ node ที่ไม่จำเป็นต้องย้ายจริง ๆ volume แบบ `local` พร้อม node affinity ที่ถูกต้อง — ไม่ใช่ `hostPath` เปล่า ๆ สำหรับอะไรก็ตามที่ต้องรอดจากการ reschedule):
+
+```yaml
+# k8s/ai-bug-catalog/hostpath-not-portable-fixed.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data
+  namespace: hostpath-demo
+spec:
+  accessModes: ['ReadWriteOnce']
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: writer
+  namespace: hostpath-demo
+spec:
+  containers:
+    - name: c
+      image: busybox:1.38
+      command: ['sh', '-c', 'echo "important-data" > /data/state.txt && sleep 3600']
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: app-data
+```
+
+**จับได้ด้วย:** ไม่มีอะไรตอน apply เลย — Pod ทั้งสองตัวข้างต้น valid สมบูรณ์แยกกัน มีแค่การ reschedule จริงไปอีก node (พิสูจน์แล้วข้างต้น) หรือการรีวิวเท่านั้นที่จับได้
+
+### 17. สมมติว่าข้อมูลของ Secret "ถูก encrypt" เพราะมันเป็น `Secret`
+
+object `Secret` เก็บ field `data` แบบ **base64-encode** ไม่ใช่ encrypt — base64 คือการเข้ารหัส (encoding) ไม่ใช่ cipher และการ decode มันไม่ต้องใช้ key เลย manifest ของ Secret ที่ AI สร้าง (และ comment ที่ AI ผู้ช่วยเขียนกำกับไว้) มักบรรยายค่าว่า "encrypted" ซึ่งผิดเปล่า ๆ และชักจูงให้ปฏิบัติกับเนื้อหาของ Secret ปลอดภัยกว่าที่มันเป็นจริง (commit มันลง git, log field `data` ของมัน, ให้สิทธิ์อ่านมันกว้าง ๆ)
+
+```yaml
+# k8s/ai-bug-catalog/secret-is-base64-not-encrypted.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-creds
+  namespace: bugcat-demo
+type: Opaque
+data:
+  password: UzNjcmV0UGFzcyE= # "encrypted" password -- this comment is the bug
+```
+
+**อาการ — output จริง:**
+
+```text
+$ kubectl get secret db-creds -n bugcat-demo -o jsonpath='{.data.password}'
+UzNjcmV0UGFzcyE=
+
+$ kubectl get secret db-creds -n bugcat-demo -o jsonpath='{.data.password}' | base64 -d
+S3cretPass!
+```
+
+คำสั่งเดียว ไม่ต้องใช้ key ไม่ต้องเข้าถึงคลัสเตอร์เกินกว่าสิทธิ์ RBAC `get secret` ธรรมดา ก็ได้ plaintext กลับมา ใครก็ตามที่ทำ `kubectl get secret -o yaml` object นี้ได้ก็มีรหัสผ่านจริงอยู่ในมือแล้ว
+
+**วิธีแก้:** ไม่มีการแก้ระดับ manifest สำหรับสิ่งที่ `Secret` เป็นโดยพื้นฐาน — การบรรเทาจริงอยู่ระดับคลัสเตอร์กับ RBAC: เปิด **encryption at rest** สำหรับ resource `Secret` ใน `EncryptionConfiguration` ของ API server (ปกป้องข้อมูลใน etcd ตอนพัก ไม่ใช่ป้องกัน `kubectl get` จากผู้เรียกที่มีสิทธิ์อยู่แล้ว), จำกัดขอบเขต RBAC ให้ `get`/`list` บน `secrets` หายากจริง ๆ, และปฏิบัติกับ YAML ของ `Secret` เหมือน credential อื่นทุกตัว — ไม่เคย commit เป็น plaintext สร้างจาก secret manager จริงแทน:
+
+```yaml
+# k8s/ai-bug-catalog/secret-is-base64-not-encrypted-fixed.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-creds
+  namespace: bugcat-demo
+type: Opaque
+data:
+  password: UzNjcmV0UGFzcyE= # base64-encoded, NOT encrypted -- readable by anyone who can `get` this Secret; real protection is RBAC scope + etcd encryption-at-rest (cluster-level, not per-object) + never committing this file with a real value
+```
+
+**จับได้ด้วย:** ไม่มีอะไรเลย — นี่คือความเข้าใจผิดระดับ documentation/comment ไม่ใช่ข้อบกพร่องของ schema หรือ runtime มีแค่ `base64 -d` จริง (พิสูจน์แล้วข้างต้น) หรือการรีวิวความปลอดภัยเท่านั้นที่จับข้อกล่าวอ้างที่ผิดนี้ได้
+
+## Security
+
+### 18. `privileged: true` เพื่อ "แก้ permission error"
+
+เมื่อเจอ error แบบ permission-denied ในคอนเทนเนอร์ คำตอบที่เร็วที่สุดที่ AI ผู้ช่วยหาได้แทบทุกครั้งคือ `securityContext.privileged: true` — มันทำให้ error หายไปจริง โดยให้ **ทุก** Linux capability กับคอนเทนเนอร์และปิดเกือบทุก security boundary ของ container แทนที่จะให้ capability เดียวเฉพาะเจาะจง (หรือค่า `runAsUser`/`fsGroup` เฉพาะเจาะจง) ที่ workload ต้องการจริง ๆ
+
+```yaml
+# k8s/ai-bug-catalog/privileged-container.yaml — @expect-error rejected under a namespace enforcing Pod Security "restricted"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: privileged-realistic
+  namespace: psa-demo
+spec:
+  containers:
+    - name: c
+      image: registry.k8s.io/pause:3.10
+      securityContext:
+        privileged: true
+```
+
+**อาการ — output จริง apply ใส่ namespace ที่ label `pod-security.kubernetes.io/enforce: restricted`:**
+
+```text
+$ kubectl apply -f privileged-container.yaml
+Error from server (Forbidden): error when creating "privileged-container.yaml": pods "privileged-realistic" is forbidden: violates PodSecurity "restricted:latest": privileged (container "c" must not set securityContext.privileged=true), allowPrivilegeEscalation != false (container "c" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (container "c" must set securityContext.capabilities.drop=["ALL"]), runAsNonRoot != true (pod or container "c" must set securityContext.runAsNonRoot=true), seccompProfile (pod or container "c" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+```
+
+นี่คือ API server เองที่ list ทุก field ที่ `restricted` ต้องการ — ใน namespace ที่ตั้งแค่ `warn` (ไม่ใช่ `enforce`) Pod เดียวกันนี้จะถูก admit โดยข้อความเดียวกันพิมพ์เป็น warning แบบไม่บล็อกแทนที่จะเป็นการปฏิเสธ
+
+ยังมีการปฏิเสธจริงระดับ API แบบไม่มีเงื่อนไขอีกอย่างที่ควรรู้ แม้ไม่มี Pod Security Admission ตั้งไว้เลยก็ตาม — `privileged: true` รวมกับ `allowPrivilegeEscalation: false` ที่ตั้งชัดเจนบน container เดียวกันคือความขัดแย้งเชิงโครงสร้างที่ API server ปฏิเสธเอง: `spec.containers[0].securityContext: Invalid value: ...: cannot set `allowPrivilegeEscalation` to false and `privileged` to true`
+
+**วิธีแก้:** ให้ Linux capability เฉพาะเจาะจงตัวเดียวที่ workload ต้องการจริง (`securityContext.capabilities.add`) หรือ field เฉพาะเจาะจงตัวเดียว (`runAsUser`, `fsGroup`) — ไม่ใช่ `privileged: true` แบบเหมารวม:
+
+```yaml
+# k8s/ai-bug-catalog/privileged-container-fixed.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hardened
+  namespace: psa-demo
+spec:
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: c
+      image: registry.k8s.io/pause:3.10
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ['ALL']
+```
+
+**จับได้ด้วย:** Pod Security Admission `warn`/`enforce` ที่ `restricted` (output จริงข้างต้น), `ValidatingAdmissionPolicy` สำหรับกฎเฉพาะองค์กร, การรีวิว ดู **[Pod & Cluster Security](/kubernetes/th/observability-and-security/pod-and-cluster-security/)**
+
+### 19. `capabilities` ไม่เคยถูก drop เลย แม้ image ไม่ต้องการอะไรเลย
+
+ชุด Linux capability ที่ container ทุกตัวได้รับเป็น default (`NET_RAW`, `CHOWN`, `SETUID`, และอีกโหลกว่า) กว้างกว่าที่ container แอปพลิเคชันเกือบทุกตัวใช้จริงมาก — `securityContext.capabilities.drop: ["ALL"]` (เพิ่มกลับมาเฉพาะตัวเดียวหรือสองตัวที่จำเป็นจริงผ่าน `capabilities.add`) คือ baseline ที่คลัสเตอร์ที่ hardened คาดหวัง และ manifest ที่ AI สร้างแทบไม่มีมันเลยถ้าไม่ได้ถูกขอชัดเจน เพราะ Pod รัน "ได้" โดยไม่มีมัน
+
+```yaml
+# k8s/ai-bug-catalog/capabilities-not-dropped.yaml — @expect-error rejected under Pod Security "restricted" — capabilities.drop is required
+apiVersion: v1
+kind: Pod
+metadata:
+  name: caps-only
+  namespace: psa-demo
+spec:
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: c
+      image: registry.k8s.io/pause:3.10
+      securityContext:
+        privileged: false
+        allowPrivilegeEscalation: false
+```
+
+**อาการ — output จริง; field อื่นทุกตัวของ `restricted` ถูกต้องแล้วบน Pod นี้ แยกให้เห็น violation เดียวชัด ๆ:**
+
+```text
+$ kubectl apply -f capabilities-not-dropped.yaml
+Error from server (Forbidden): error when creating "capabilities-not-dropped.yaml": pods "caps-only" is forbidden: violates PodSecurity "restricted:latest": unrestricted capabilities (container "c" must set securityContext.capabilities.drop=["ALL"])
+```
+
+**วิธีแก้:**
+
+```yaml
+# k8s/ai-bug-catalog/capabilities-not-dropped-fixed.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: caps-only
+  namespace: psa-demo
+spec:
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: c
+      image: registry.k8s.io/pause:3.10
+      securityContext:
+        privileged: false
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ['ALL']
+```
+
+**จับได้ด้วย:** Pod Security Admission `warn`/`enforce` ที่ `restricted` (output จริงข้างต้น), `kube-linter`/`polaris`/`kube-score` (ทุกตัว flag การไม่ drop capability เป็น default อยู่แล้ว), การรีวิว
+
+### 20. `automountServiceAccountToken` ปล่อยไว้ที่ default (`true`) สำหรับ workload ที่ไม่เคยเรียก API server
+
+Pod ทุกตัวได้ token ของ ServiceAccount ถูก mount ให้อัตโนมัติเป็น default ไม่ว่า workload จะเรียก Kubernetes API จริงหรือไม่ — web server ธรรมดา, batch job, หรือ sidecar ที่คุยกับ network เท่านั้นไม่เคยต้องการมันเลย และ token ที่ mount อยู่ใน filesystem คือ credential เป๊ะ ๆ ที่บั๊ก container-escape หรือ path-traversal จะไปหาก่อนเลย manifest ของ Pod ที่ AI สร้างแทบไม่เคยตั้ง `automountServiceAccountToken: false` เลย เพราะค่า default ก็ "ใช้ได้" อยู่แล้ว
+
+```yaml
+# k8s/ai-bug-catalog/serviceaccount-automount-not-disabled.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: token-default
+  namespace: bugcat-demo
+spec:
+  containers:
+    - name: c
+      image: busybox:1.38
+      command: ['sleep', '3600']
+```
+
+**อาการ — output จริง; Pod นี้ไม่เคยเรียก API server เลย แต่ token ก็อยู่ตรงนั้น:**
+
+```text
+$ kubectl exec token-default -- ls /var/run/secrets/kubernetes.io/serviceaccount/
+ca.crt
+namespace
+token
+```
+
+**วิธีแก้:**
+
+```yaml
+# k8s/ai-bug-catalog/serviceaccount-automount-not-disabled-fixed.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: token-noautomount
+  namespace: bugcat-demo
+spec:
+  automountServiceAccountToken: false
+  containers:
+    - name: c
+      image: busybox:1.38
+      command: ['sleep', '3600']
+```
+
+**อาการของวิธีแก้ พิสูจน์ในแบบเดียวกัน:**
+
+```text
+$ kubectl exec token-noautomount -- ls /var/run/secrets/kubernetes.io/serviceaccount/
+ls: /var/run/secrets/kubernetes.io/serviceaccount/: No such file or directory
+```
+
+**จับได้ด้วย:** ไม่มีอะไรอัตโนมัติเลย — Pod ที่ "ใช้งานได้" สมบูรณ์ทั้งสองแบบ มีแค่การเช็กที่ชัดเจน (`kubectl exec ... ls .../serviceaccount/`, หรือกฎของ policy engine) หรือการรีวิวเท่านั้นที่จับได้
+
+### 21. ServiceAccount ของ workload ผูกกับ `cluster-admin`
+
+`cluster-admin` คือ `ClusterRole` แบบ built-in ที่รวม aggregate ไว้ล่วงหน้า ให้ verb ทุกตัวบน resource ทุกตัว ทั่วทั้งคลัสเตอร์ การผูก ServiceAccount ของ **workload** เข้ากับมัน — ทางแก้ที่เร็วที่สุดสำหรับ `403 Forbidden` เกือบทุกอันที่ AI ผู้ช่วยเจอตอน debug RBAC — ให้ workload นั้น (และอะไรก็ตามที่ compromise มันได้) มีขอบเขตเท่ากับ cluster administrator ที่เป็นมนุษย์เป๊ะ ไม่ใช่แค่สอง-สาม verb เฉพาะเจาะจงที่มันต้องการจริง ๆ
+
+```yaml
+# k8s/ai-bug-catalog/rbac-cluster-admin-binding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: overprivileged-sa-admin
+subjects:
+  - kind: ServiceAccount
+    name: overprivileged-sa
+    namespace: bugcat-demo
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+```
+
+**อาการ — output จริง; ServiceAccount ตัวนี้ตั้งใจให้อ่าน ConfigMap ของ namespace ตัวเองเท่านั้น:**
+
+```text
+$ kubectl auth can-i delete secrets --as=system:serviceaccount:bugcat-demo:overprivileged-sa -A
+yes
+$ kubectl auth can-i delete nodes --as=system:serviceaccount:bugcat-demo:overprivileged-sa
+yes
+```
+
+container ที่ถูก compromise เพียงตัวเดียวที่รันด้วย identity นี้ลบ Secret **ไหนก็ได้** ใน namespace **ไหนก็ได้** และลบ Node ระดับคลัสเตอร์ได้ตรง ๆ เลย — ขอบเขตที่ไม่เกี่ยวอะไรกับการอ่าน ConfigMap เลย
+
+**วิธีแก้:** `Role` ระดับ namespace (หรือ `ClusterRole` ที่จำกัดขอบเขตแคบ ๆ จำกัดด้วย `resourceNames` ถ้าเป็นไปได้) บวกกับ binding ที่ให้แค่ verb ที่ workload เรียกจริง ๆ เท่านั้น:
+
+```yaml
+# k8s/ai-bug-catalog/rbac-cluster-admin-binding-fixed.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: configmap-reader
+  namespace: bugcat-demo
+rules:
+  - apiGroups: ['']
+    resources: ['configmaps']
+    verbs: ['get', 'list', 'watch']
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: configmap-reader-binding
+  namespace: bugcat-demo
+subjects:
+  - kind: ServiceAccount
+    name: overprivileged-sa
+    namespace: bugcat-demo
+roleRef:
+  kind: Role
+  name: configmap-reader
+  apiGroup: rbac.authorization.k8s.io
+```
+
+**จับได้ด้วย:** `kubectl auth can-i --list --as=<sa>` (output จริงข้างต้น), การรีวิว (`ClusterRoleBinding` ไหนก็ตามที่อ้าง `cluster-admin` โดยมี ServiceAccount ของ workload เป็น subject ควรถูกมองซ้ำอีกครั้งอย่างจริงจัง) ดู **[RBAC & Service Accounts](/kubernetes/th/observability-and-security/rbac-and-service-accounts/)** ที่พิสูจน์ output ของ `can-i` เดียวกันเป๊ะ
+
+## Observability
+
+### 22. ไม่มี `readinessProbe` บน Deployment ที่อยู่หลัง Service
+
+ถ้าไม่มี `readinessProbe` ตั้งไว้ container จะถือว่า "Ready" ทันทีที่ kubelet รายงานว่า process **กำลังรัน** — ไม่ใช่ทันทีที่แอปพลิเคชันข้างในเริ่มทำงานเสร็จจริงและกำลัง listen บน port แล้ว Endpoints controller ของ Service เพิ่ม IP ของ Pod ทันทีที่ `Ready` เป็น true ซึ่งอาจเกิดก่อนที่แอปที่ start ช้ากว่าจะ bind listening socket เลยด้วยซ้ำ
+
+```yaml
+# k8s/ai-bug-catalog/readiness-probe-missing-behind-service.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slow-start
+  namespace: bugcat-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: slow-start }
+  template:
+    metadata:
+      labels: { app: slow-start }
+    spec:
+      containers:
+        - name: web
+          image: python:3.13-alpine
+          command: ['sh', '-c', 'sleep 8 && python3 -m http.server 8080']
+          ports: [{ containerPort: 8080 }]
+          # no readinessProbe -- Ready flips true as soon as the process is Running, 8s before it's actually listening
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slow-start
+  namespace: bugcat-demo
+spec:
+  selector: { app: slow-start }
+  ports: [{ port: 80, targetPort: 8080 }]
+```
+
+**อาการ — output จริง; request ที่ส่งทันทีหลัง Pod รายงาน `1/1 Running`:**
+
+```text
+$ kubectl get pod -l app=slow-start -n bugcat-demo -o wide
+NAME                          READY   STATUS    AGE
+slow-start-76487cb657-mjpxr   1/1     Running   8s
+
+$ kubectl run curler --image=busybox:1.38 --restart=Never --rm -it -- wget -qO- --timeout=1 http://slow-start.bugcat-demo.svc.cluster.local
+wget: can't connect to remote host (10.96.4.64): Connection refused
+```
+
+Service list Pod นี้เป็น Endpoint แล้ว — `READY 1/1` บอกอย่างนั้น — แล้วการเชื่อมต่อก็ถูกปฏิเสธอยู่ดี เพราะแอปพลิเคชันข้างในยังอยู่กลาง `sleep`
+
+**วิธีแก้:** `readinessProbe` ที่เช็ก port/endpoint ที่แอปพลิเคชันกำลัง listen จริง ไม่ใช่แค่ process ยังมีชีวิตอยู่:
+
+```yaml
+# k8s/ai-bug-catalog/readiness-probe-missing-behind-service-fixed.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slow-start
+  namespace: bugcat-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: slow-start }
+  template:
+    metadata:
+      labels: { app: slow-start }
+    spec:
+      containers:
+        - name: web
+          image: python:3.13-alpine
+          command: ['sh', '-c', 'sleep 8 && python3 -m http.server 8080']
+          ports: [{ containerPort: 8080 }]
+          readinessProbe:
+            httpGet: { path: /, port: 8080 }
+            periodSeconds: 2
+            failureThreshold: 2
+```
+
+**จับได้ด้วย:** ไม่มีอะไรตอน apply เลย — request จริงในช่วงเวลา startup พอดี (พิสูจน์แล้วข้างต้น) คือทางเดียวที่จะเห็นมัน เพราะ request ถัดไปหลังแอป start เสร็จก็สำเร็จปกติทันที ดู **[Probes: Liveness, Readiness, Startup](/kubernetes/th/observability-and-security/probes-liveness-readiness-startup/)** สำหรับสิ่งที่ readiness probe กันจริง ๆ
+
+### 23. `livenessProbe` กับ `readinessProbe` ชี้ไปที่ endpoint เดียวกัน โดยไม่มีช่วงผ่อนผันให้ startup
+
+การใช้ HTTP endpoint เดียวซ้ำสำหรับทั้งสอง probe ดูมีประสิทธิภาพ — จนกว่าแอปพลิเคชันจะมี warm-up ที่ช้าจริง ๆ liveness probe ที่เริ่มเช็กทันที (`initialDelaySeconds: 0` ค่า default) และยอมแพ้หลังจากพยายามไม่กี่ครั้งจะฆ่า Pod ที่ยังกำลัง start ตามปกติซ้ำแล้วซ้ำเล่า เพราะทุกครั้งที่ restart นาฬิกา warm-up จะถูกรีเซ็ตกลับไปศูนย์
+
+```yaml
+# k8s/ai-bug-catalog/liveness-readiness-same-endpoint.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: slow-warmer-bad
+  namespace: probes-demo
+spec:
+  containers:
+    - name: c
+      image: python:3.13-alpine
+      command: ['sh', '-c', 'sleep 20 && python3 -m http.server 8080']
+      ports: [{ containerPort: 8080 }]
+      livenessProbe:
+        httpGet: { path: /, port: 8080 }
+        periodSeconds: 2
+        failureThreshold: 2
+      readinessProbe:
+        httpGet: { path: /, port: 8080 }
+        periodSeconds: 2
+        failureThreshold: 2
+```
+
+**อาการ — output จริง; warm-up 20 วินาที เจอ liveness probe ที่ยอมแพ้ใน 4 วินาที (`periodSeconds: 2` × `failureThreshold: 2`):**
+
+```text
+$ kubectl get pod slow-warmer-bad -n probes-demo
+NAME              READY   STATUS    RESTARTS      AGE
+slow-warmer-bad   0/1     Running   1 (5s ago)    40s
+
+$ kubectl get events -n probes-demo --field-selector involvedObject.name=slow-warmer-bad --sort-by=.lastTimestamp
+LAST SEEN   TYPE      REASON      MESSAGE
+1s          Warning   Unhealthy   Readiness probe failed: Get "http://10.244.2.21:8080/": dial tcp 10.244.2.21:8080: connect: connection refused
+1s          Warning   Unhealthy   Liveness probe failed: Get "http://10.244.2.21:8080/": dial tcp 10.244.2.21:8080: connect: connection refused
+1s          Normal    Killing     Container c failed liveness probe, will be restarted
+```
+
+`RESTARTS` ไต่ขึ้น — container ถูกฆ่าโดย liveness probe ของตัวเองก่อนที่ warm-up 20 วินาทีจะเสร็จเลยด้วยซ้ำ เป็น restart loop ที่เกิดจากตัวเองล้วน ๆ ไม่ใช่บั๊กของแอปพลิเคชัน
+
+**วิธีแก้:** `startupProbe` ให้เวลา container ที่ start ช้าได้บูตเต็มที่ ด้วย budget ของตัวเอง ก่อนที่ `livenessProbe` จะเริ่มเช็กเลยด้วยซ้ำ — `readinessProbe` ก็ควรแยกต่างหาก เพื่อให้ "ยังไม่พร้อม" (เอาออกจาก Service) กับ "ตายจริง ฆ่าแล้วสร้างใหม่" ไม่เคยเป็นสัญญาณเดียวกัน:
+
+```yaml
+# k8s/ai-bug-catalog/liveness-readiness-same-endpoint-fixed.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: slow-warmer-fixed
+  namespace: probes-demo
+spec:
+  containers:
+    - name: c
+      image: python:3.13-alpine
+      command: ['sh', '-c', 'sleep 20 && python3 -m http.server 8080']
+      ports: [{ containerPort: 8080 }]
+      startupProbe:
+        httpGet: { path: /, port: 8080 }
+        periodSeconds: 2
+        failureThreshold: 15 # up to 30s to finish starting, before liveness ever runs
+      livenessProbe:
+        httpGet: { path: /, port: 8080 }
+        periodSeconds: 10
+        failureThreshold: 3
+      readinessProbe:
+        httpGet: { path: /, port: 8080 }
+        periodSeconds: 5
+        failureThreshold: 2
+```
+
+**จับได้ด้วย:** ไม่มีอะไรตอน apply เลย — `RESTARTS`/event จริงและปัจจุบันตามเวลาจริง (พิสูจน์แล้วข้างต้น) คือสัญญาณเดียว ดู **[Probes: Liveness, Readiness, Startup](/kubernetes/th/observability-and-security/probes-liveness-readiness-startup/)** ที่พิสูจน์กลไก restart loop เดียวกันเป๊ะและวิธีแก้ด้วย `startupProbe`
+
+### 24. สมมติว่า `kubectl exec -it <pod> -- /bin/sh` ใช้ได้เสมอ
+
+image แบบ minimal หรือ **distroless** (build ด้วย `FROM scratch` หรือ `gcr.io/distroless/*`) ไม่มี shell และไม่มี coreutils เลย — `kubectl exec` ต้องการให้ container runtime เริ่ม binary ที่ระบุชื่อ *ใน filesystem ของ container ตัวเดียวกันนั้น* และไม่มีอะไรอยู่ตรงนั้นให้เริ่มเลย คำแนะนำ debug ที่ AI สร้างมักใช้ `kubectl exec -it <pod> -- sh` หรือ `-- /bin/bash` เป็น default เพราะมันเป็นคำตอบที่ถูกต้องสำหรับ base image ส่วนใหญ่มาก ๆ แค่ไม่ใช่ตัวนี้
+
+```bash
+# scripts/kubectl-exec-distroless.sh — @expect-error the target image ships no shell at all
+kubectl exec -it distroless-app -- sh
+```
+
+**อาการ — output จริง; Pod ที่รัน `registry.k8s.io/pause:3.10` (ไม่มี shell ไม่มี binary ใดนอกจาก pause loop เอง):**
+
+```text
+$ kubectl exec distroless-app -- sh
+error: Internal error occurred: Internal error occurred: error executing command in container: failed to exec in container: failed to start exec "...": OCI runtime exec failed: exec failed: unable to start container process: exec: "sh": executable file not found in $PATH
+```
+
+**วิธีแก้:** **ephemeral container** (GA ตั้งแต่ Kubernetes **1.25**) แนบ container ที่สอง ใช้แล้วทิ้ง — ด้วย image ของตัวเอง ปกติ — เข้าไปใน process namespace ที่ Pod ที่กำลังรันแชร์กันอยู่ ทำให้มันเห็นและโต้ตอบกับ process ของ target container ได้โดยไม่ต้องติดตั้งอะไรข้างใน target เลย:
+
+```bash
+# scripts/kubectl-debug-distroless-fixed.sh
+kubectl debug distroless-app --image=busybox:1.38 --target=app -- sh -c 'ps aux'
+```
+
+**อาการของวิธีแก้ พิสูจน์ในแบบเดียวกัน — ephemeral container แนบเข้าไปแล้วเห็น process tree ของ target เอง:**
+
+```text
+$ kubectl debug distroless-app --image=busybox:1.38 --target=app -- sh -c 'ps aux'
+Targeting container "app". If you don't see processes from this container it may be because the container runtime doesn't support this feature.
+Defaulting debug container name to debugger-zqmxs.
+
+PID   USER     TIME  COMMAND
+    1 65535     0:00 /pause
+```
+
+PID 1 (`/pause` process จริงของ target container เอง) มองเห็นได้จากข้างในของ debug container ที่แนบเข้าไป — พิสูจน์ว่าสอง container นี้แชร์ process namespace เดียวกันจริง ไม่ใช่แค่ Pod ใหม่ที่ไม่เกี่ยวข้องเผอิญเริ่มขึ้นมาใกล้ ๆ
+
+**จับได้ด้วย:** ไม่มีอะไรแบบ static เลย — นี่คือข้อเท็จจริงระดับ runtime ล้วน ๆ เกี่ยวกับ target image ดู **[Logging & Metrics](/kubernetes/th/observability-and-security/logging-and-metrics/)** ที่พิสูจน์ error `OCI runtime exec failed` เดียวกันเป๊ะและวิธีแก้ด้วย `kubectl debug --target` แบบเจาะลึก รวมถึงการ debug ทั้ง Node ด้วยวิธีเดียวกัน
+
+## Mental Model
+
+<Mermaid title="มีแค่หนึ่งในสามของบั๊กเหล่านี้เท่านั้นที่ถูกจับได้ก่อนที่จะมีอะไรถูกสร้าง" code={bugCatalogDiagram} />
+
+export const bugCatalogDiagram = `flowchart TD
+  Y["YAML ที่ AI สร้าง"] --> D{"kubectl apply<br/>--dry-run=server"}
+  D -- "ปฏิเสธ (8 จาก 24)" --> R["apiVersion ที่ถูกลบ, field ที่ immutable,<br/>enum ที่ invalid, strict-decoding mismatch"]
+  D -- "รับผ่านสะอาด (16 จาก 24)" --> S["Object ถูกสร้างขึ้น<br/>และดูสมบูรณ์แข็งแรง"]
+  S --> B["พฤติกรรมจริงเท่านั้น:<br/>describe / events / curl / reschedule / drain"]
+  B --> F1["การตั้งค่าผิดแบบเงียบ ๆ ค่อยโผล่มา --<br/>NXDOMAIN, HPA target &lt;unknown&gt;,<br/>EndpointSlice ว่างเปล่า, DNS ถูกบล็อก,<br/>ข้อมูลตกอยู่บน node ผิด"]
+`;
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"ถ้า `kubectl apply --dry-run=server` ผ่าน manifest ก็ถูกต้อง"** พิสูจน์แล้วข้างต้น: **16 จาก 24 แพทเทิร์นนี้ apply ผ่านสะอาด** — StatefulSet ที่ไม่มี headless Service, Service ที่ selector พิมพ์ผิด, PodDisruptionBudget ที่บล็อกการ drain ในอนาคตทุกครั้ง ล้วนผ่าน dry-run=server โดยไม่มีการบ่นเลย ความถูกต้องตาม schema กับความถูกต้องเชิงปฏิบัติการเป็นคำถามคนละอันกัน
+- **"apiVersion ที่ถูกลบไปแล้วจะถูกจับได้ในการรีวิวแน่นอน"** มันคือแพทเทิร์นความผิดพลาดที่โค้ดที่ AI สร้างขายว่าลื่นไหลและทันสมัยพอดี — รูปร่างของ YAML มักไม่เปลี่ยนเลยด้วยซ้ำ (Deployment ใต้ `extensions/v1beta1` อ่านเหมือนกับตัวใต้ `apps/v1` ทุกประการ) ดังนั้นการไล่ดูด้วยตามนุษย์ก็ไม่มีทางจับได้ง่ายกว่าการดู `kubectl apply` สำเร็จเฉย ๆ เลย
+- **"`privileged: true` เป็นแค่เวอร์ชันที่แรงกว่าของ capability เฉพาะที่ฉันต้องการ"** มันเป็นการให้สิทธิ์คนละประเภทเลย — มันปิด security boundary ของ container ทั้งหมดพร้อมกัน ไม่ใช่แค่เพิ่ม Linux capability เดียว (`NET_ADMIN`, `SYS_PTRACE`, อะไรก็ตามที่มันต้องการจริง) ที่ workload ต้องการ
+- **"เนื้อหาของ Secret ถูก encrypt"** พิสูจน์แล้วข้างต้น: `base64 -d` บน field `data` ไม่ต้องใช้ key ไม่ต้องมีสิทธิ์เข้าถึงพิเศษเกินกว่าสิทธิ์ `get secret` ธรรมดาเลย
+
+<Callout title="สรุปหนึ่งบรรทัด">
+มีแค่ 8 จาก 24 แพทเทิร์นนี้เท่านั้นที่ทำให้ `kubectl apply --dry-run=server` ล้มเหลว — อีก 16 ที่เหลือสร้าง object ที่ดูสมบูรณ์แข็งแรงแล้วพังทีหลังแบบเงียบ ๆ ใน `describe`, event, curl, การ drain, หรือการ reschedule อ่าน manifest ทุกตัวตามลำดับที่ **[index](/kubernetes/th/reading-k8s/)** วางไว้ — apiVersion กับรูปร่างก่อน แล้วจึง workload, scheduling, networking, storage กับ config, security, แล้วจึง observability — เพราะ "apply ผ่านโดยไม่มี error" ตอบคำถามใน catalog นี้ได้แทบไม่ตรงเลย
+</Callout>
+
+export const quizAiBugCatalog = [
+  {
+    q: "ทำไมข้อ 9 (StatefulSet ที่ `serviceName` ชี้ไปที่ไม่มีอะไรเลย) ถึงไม่มี error อะไรเลยตอน apply?",
+    options: [
+      "Because StatefulSets don't need a Service",
+      "Because `serviceName` is a plain string field the API server never validates against a real, existing Service object at creation time — the mismatch only ever shows up as a DNS lookup failure, never a validation error",
+      "Because kind clusters don't run CoreDNS",
+      "Because this only fails on a real cloud cluster, never on kind",
+    ],
+    answer: 1,
+    explain: "พิสูจน์โดยตรง: StatefulSet และ Pod ทั้งสองตัวขึ้นมา 2/2 Running สมบูรณ์แข็งแรง — ร่องรอยเดียวของบั๊กที่ไหนเลยคือ nslookup จริงที่คืนค่า NXDOMAIN สำหรับชื่อ DNS ต่อ Pod",
+  },
+  {
+    q: "```text\n$ kubectl apply -f hpa-v1-v2-mixed-shape.yaml\nError from server (BadRequest): ... strict decoding error: unknown field \"spec.metrics\"\n```\nทำไมการปน HPA แบบ `autoscaling/v1` กับ field `metrics` ที่มีแค่ใน `v2` ถึงล้มเหลวทันที ต่างจาก catalog นี้ส่วนใหญ่?",
+    options: [
+      "HPA objects are always rejected on kind clusters",
+      "Server-side strict field validation runs at decode time, before any business logic — an unrecognized field on a structural, built-in type like this is a hard, current BadRequest, not a schema warning",
+      "metrics is deprecated and always ignored",
+      "This only fails when metrics-server is missing",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ข้างต้น: คำสั่งเดียวกันเป๊ะที่รันกับ API server 1.37.0 จริง คืน BadRequest จริงที่ระบุชื่อ field ที่ไม่รู้จักทันทีที่ object ถูก decode เป็น v1 — นี่คือหนึ่งใน 8 ข้อของ catalog นี้เท่านั้นที่ API server ปฏิเสธตรง ๆ",
+  },
+  {
+    q: "NetworkPolicy ของข้อ 14 list `policyTypes: [Ingress]` เท่านั้น โดยตั้งใจจะบล็อกการเรียกออกของ Pod เอง การทดสอบ curl จริงพิสูจน์อะไร?",
+    options: [
+      "The policy blocks both directions anyway, since podSelector matches the Pod",
+      "The Pod's outbound (egress) traffic reaches its target completely unrestricted — Egress was never listed in policyTypes, so nothing about that direction is enforced at all",
+      "The request fails with a permission error",
+      "NetworkPolicy objects only ever affect Ingress, regardless of policyTypes",
+    ],
+    answer: 1,
+    explain: "พิสูจน์โดยตรงด้วย curl จริงจากในคลัสเตอร์: response กลับมาสะอาด ('Thank you for using nginx') — policyTypes ควบคุมแค่และเฉพาะทิศทางที่ระบุไว้เท่านั้น ทิศทางที่ไม่ได้ระบุไม่ถูกจำกัดเลย ไม่ว่าชื่อหรือความตั้งใจของ policy จะบอกว่าอย่างไร",
+  },
+  {
+    q: "ทำไมวิธีแก้ของข้อ 24 (`kubectl debug --target`) ถึงเห็น process จริงของ target container เอง (`/pause`, PID 1) จากข้างในของ busybox container ธรรมดาที่แยกกันเลยได้?",
+    options: [
+      "kubectl debug secretly restarts the target container with a shell added",
+      "An ephemeral container added with --target is attached into the SAME Pod, sharing its process namespace with the targeted container — it can see and signal that container's real processes without anything needing to be installed inside it",
+      "It copies the target's filesystem into a new container",
+      "This only works if the target image is not actually distroless",
+    ],
+    answer: 1,
+    explain: "พิสูจน์โดยตรง: `ps aux` ในตัว ephemeral container ที่แนบเข้าไป list PID 1 เป็น /pause — process จริงและดั้งเดิมของ target container ที่เป็น distroless — ยืนยันว่าสอง container แชร์ process namespace เดียวกัน ไม่ใช่ debug container เป็น Pod ที่ไม่เกี่ยวข้องอยู่ใกล้ ๆ",
+  },
+  {
+    q: "PodDisruptionBudget ที่ `minAvailable` เท่ากับจำนวน `replicas` เต็มของ Deployment apply สำเร็จและแสดง `ALLOWED DISRUPTIONS: 0` ทันที ตัวเลขนั้นหมายถึงอะไรในทางปฏิบัติ?",
+    options: [
+      "Nothing yet — it only matters once a drain is attempted",
+      "Zero voluntary disruptions (drains, cordons ahead of upgrades, cluster-autoscaler scale-downs) can ever be allowed against this workload while all replicas are healthy — proven above, a real drain retries the same eviction rejection indefinitely",
+      "It means the Deployment is unhealthy",
+      "It only affects involuntary disruptions like node crashes",
+    ],
+    answer: 1,
+    explain: "พิสูจน์โดยตรง: `kubectl get pdb` แสดง ALLOWED DISRUPTIONS: 0 ก่อนที่จะแม้แต่ลอง drain เลย และการ drain จริงกับ node ที่มี Pod เหล่านี้อยู่ก็ retry ข้อความ 'Cannot evict pod as it would violate the pod's disruption budget' ไม่หยุด ตรงกับที่ตัวเลขนั้นทำนายไว้เป๊ะ",
+  },
+  {
+    q: "ทำไม catalog นี้ถึงบรรยาย `privileged: true` ว่าเป็นการให้สิทธิ์คนละประเภทกับการเพิ่ม Linux capability เฉพาะเจาะจงตัวเดียว แทนที่จะเป็นแค่เวอร์ชันที่แรงกว่าของสิ่งเดียวกัน?",
+    options: [
+      "They are functionally identical, just with different syntax",
+      "privileged disables nearly every container security boundary at once (all capabilities, most seccomp/AppArmor confinement, device access) — none of which is what a container needing exactly one specific capability like NET_ADMIN actually requires",
+      "privileged only affects networking",
+      "capabilities.add always requires privileged to be set first",
+    ],
+    answer: 1,
+    explain: "พิสูจน์ผ่านการปฏิเสธ PodSecurity 'restricted' จริง: ข้อความเดียวกันระบุ field แยกกันห้าอัน (privileged, allowPrivilegeEscalation, capabilities, runAsNonRoot, seccompProfile) — privileged=true คือกรณีเหมารวมที่ทำผิดทั้งห้าหมวดพร้อมกัน ไม่ใช่การตั้งค่าที่แรงกว่าของหมวดไหนหมวดหนึ่ง",
+  },
+];
+
+<Quiz client:visible id="reading-k8s/ai-bug-catalog" questions={quizAiBugCatalog} />
+
+<ProgressTracker client:visible id="reading-k8s/ai-bug-catalog" />
