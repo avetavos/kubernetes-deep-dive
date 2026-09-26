@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียหลักในหนึ่งประโยค
 
@@ -24,6 +25,13 @@ import ProgressTracker from '../../../../components/ProgressTracker.tsx';
 
 ทั้งสามตัวมีไว้เพื่อทำให้การพัฒนาและเรียนรู้บนเครื่องตัวเองเร็วและทิ้งได้ ไม่มีตัวไหนตั้งใจให้ใช้บน production เลย production cluster จะสร้างด้วยเครื่องมืออย่าง kubeadm หรือจัดเตรียมโดย managed cloud service บนเครื่องจริงหรือ virtual machine ที่มี networking, storage และ high availability ที่เหมาะสม
 
+| | kind | minikube | k3d |
+|---|---|---|---|
+| รันอะไร | Kubernetes ([kind.sigs.k8s.io](https://kind.sigs.k8s.io/)) โดยให้ node เป็น Docker/Podman container | Kubernetes เต็มรูปแบบ ([minikube.sigs.k8s.io](https://minikube.sigs.k8s.io/)) ใน VM, container หรือ driver bare-metal ที่คุณเลือก | k3s ([k3d.io](https://k3d.io/)) — Kubernetes distribution แบบ lightweight ที่ผ่าน certified — อยู่ใน Docker container |
+| ความยืดหยุ่นของ driver | Docker หรือ Podman เท่านั้น | มีหลาย driver (docker, podman, และ VM driver เช่น hyperkit/hyperv/kvm2) | Docker เท่านั้น |
+| addon ที่มีมาให้ | ไม่มี — คอร์สนี้ติดตั้ง Gateway API/CSI CRD เองเมื่อบทไหนต้องใช้ | ecosystem ของ addon ที่หลากหลาย (`minikube addons enable dashboard/ingress/metrics-server`) | น้อยมาก k3s มาพร้อม component บางตัวในตัวอยู่แล้ว (Traefik, servicelb) |
+| เหมาะกับอะไรที่สุด | CI pipeline และตามคอร์สแบบนี้ที่ต้องการ cluster ที่ทิ้งได้และ script ได้ | cluster local ตัวเดียวที่อยู่นาน ๆ พร้อม extra แบบคำสั่งเดียวเยอะ ๆ | ตั้ง multi-cluster/multi-node เร็ว ๆ รอบ footprint เล็กของ k3s |
+
 ## Cluster แรกและ Pod แรกของคุณ
 
 สร้าง local cluster แล้วลองสำรวจดูสักหน่อย
@@ -35,6 +43,121 @@ kubectl get nodes
 ```
 
 `kubectl cluster-info` ยืนยันว่าคุณเข้าถึง API server ได้ และแสดงว่า core service รันอยู่ที่ไหน ส่วน `kubectl get nodes` แสดงรายการ node ใน cluster พร้อมสถานะ `Ready` ของตัวเอง สิ่งแรกที่ควรเช็คทุกครั้งที่รู้สึกว่ามีอะไรผิดปกติ
+
+## Pin เวอร์ชัน Kubernetes ด้วย node image digest จริง
+
+`kind create cluster` เปล่า ๆ ใช้ Kubernetes version ที่ kind release นั้น default ให้ — kind 0.33 default เป็น 1.37.0 การ pin แบบตั้งใจต่างหากที่ทำให้คอร์ส, CI pipeline หรือ bug report reproduce ได้ release notes ของ kind เองพิมพ์ node image ต่อ Kubernetes version พร้อม digest ที่ pin แน่นอน และ release notes บอกตรง ๆ ว่าคุณ*ต้อง*ใช้ digest แบบ `@sha256` ถึงจะรับประกันได้ว่าได้ image ที่ build มาสำหรับ release นั้นจริง ๆ
+
+```bash
+kind create cluster --name foundations \
+  --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+```
+
+digest ตัวนี้ quote มาตรง ๆ จาก [kind v0.33.0 release notes](https://github.com/kubernetes-sigs/kind/releases/tag/v0.33.0) — `--image kindest/node:v1.37.0` แบบไม่มี digest ก็ใช้ได้วันนี้ แต่มีแค่ digest form เท่านั้นที่รับประกันว่าคุณได้ byte เดียวกับที่ทีม kind test และ publish ออกมาสำหรับ release นั้นจริง ๆ
+
+## Config multi-node จริง พร้อม extraPortMappings และ node-labels
+
+`kind create cluster` เดี่ยว ๆ ให้ node all-in-one ตัวเดียว config `Cluster` แบบ `kind.x-k8s.io/v1alpha4` ให้ node หลายตัวจริง และให้ map container port ไปที่เครื่องคุณ พร้อมประทับ kubelet node label เพิ่มตอนสร้าง — พิสูจน์ทำงานจริงข้างล่างนี้
+
+```yaml
+# kind/kind-foundations.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 8080
+        protocol: TCP
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+  - role: worker
+  - role: worker
+```
+
+```bash
+kind create cluster --name foundations --config kind-foundations.yaml
+```
+
+output จริงตอนสร้าง config นี้เป๊ะ ๆ (1 control-plane + 2 worker)
+
+```text
+Creating cluster "foundations" ...
+ ✓ Ensuring node image (kindest/node:v1.37.0) 🖼️
+ ✓ Preparing nodes 📦 📦 📦
+ ✓ Writing configuration 📜
+ ✓ Starting control-plane 🕹️
+ ✓ Installing CNI 🔌
+ ✓ Installing StorageClass 💾
+ ✓ Joining worker nodes 🚜
+Set kubectl context to "kind-foundations"
+```
+
+`extraPortMappings` บน control-plane node คือสิ่งที่ทำให้ Service แบบ `NodePort` (หรือ Ingress controller ที่ฟังผ่าน NodePort) เข้าถึงได้จาก browser บนเครื่องคุณ — ถ้าไม่มีมัน Service จะมีอยู่แค่ข้างใน Docker network ที่ kind สร้างเท่านั้น `node-labels` ที่ประทับผ่าน `kubeadmConfigPatches` ให้คุณ pre-label node ได้ก่อน workload ไหนจะถูก schedule เลย มีประโยชน์กับอะไรแบบ `nodeSelector` ของ Ingress controller
+
+## `kind load docker-image`: เอา image ที่ build บนเครื่องเข้าไปในทุก node
+
+Node ใน kind cluster มองไม่เห็น Docker image cache ของเครื่องคุณโดยตรง และไม่มี registry เข้ามาเกี่ยวข้องเลยสำหรับ image ที่ build เองบนเครื่อง `kind load docker-image` copy image เข้าไปที่ containerd image store ของทุก node ตรง ๆ พิสูจน์ด้วยการ build image เล็ก ๆ, load มัน แล้วรัน Pod จากมันด้วย `imagePullPolicy: Never` (ที่ห้าม kubelet พยายาม pull จากที่ไหนเลย)
+
+```bash
+docker build -t local/tiny-hello:1.0 .
+kind load docker-image local/tiny-hello:1.0 --name foundations
+```
+
+output จริง
+
+```text
+Image: "local/tiny-hello:1.0" with ID "sha256:db50fb2b2b0258cb78bea24ee398f0a16cb4c9052bd7f714747c1039042ea1d0" not yet present on node "foundations-control-plane", loading...
+Image: "local/tiny-hello:1.0" with ID "sha256:db50fb2b2b0258cb78bea24ee398f0a16cb4c9052bd7f714747c1039042ea1d0" not yet present on node "foundations-worker2", loading...
+Image: "local/tiny-hello:1.0" with ID "sha256:db50fb2b2b0258cb78bea24ee398f0a16cb4c9052bd7f714747c1039042ea1d0" not yet present on node "foundations-worker", loading...
+```
+
+```yaml
+# k8s/running-kubernetes-locally/tiny-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tiny-hello
+spec:
+  containers:
+    - name: tiny-hello
+      image: local/tiny-hello:1.0
+      imagePullPolicy: Never
+```
+
+```text
+$ kubectl apply -f tiny-pod.yaml
+pod/tiny-hello created
+
+$ kubectl get pod tiny-hello
+NAME         READY   STATUS    RESTARTS   AGE
+tiny-hello   1/1     Running   0          3s
+
+$ kubectl logs tiny-hello
+hello-from-tiny-image
+```
+
+`imagePullPolicy: Never` คือสิ่งที่พิสูจน์ว่า image ถูก load เข้าไปที่ node จริง ๆ — ถ้าไม่ได้ load kubelet จะรายงาน `ErrImageNeverPull` แทนที่จะไปถึง `Running` เลย
+
+## `kubectl config`: ดูทุก context ที่คุณเข้าถึงได้
+
+ทุก cluster ที่คุณสร้าง ไม่ว่าจะ kind, cloud cluster หรืออะไรก็ตาม จะเพิ่ม context เข้าไปใน kubeconfig ตัวเดียวกัน `kubectl config get-contexts` คือวิธีดูทั้งหมดพร้อมกัน มี `*` บอกว่าตัวไหนคือตัวปัจจุบัน
+
+```text
+$ kubectl config get-contexts
+CURRENT   NAME               CLUSTER            AUTHINFO           NAMESPACE
+*         kind-foundations   kind-foundations   kind-foundations
+          kind-verify-k8s    kind-verify-k8s    kind-verify-k8s
+
+$ kubectl config current-context
+kind-foundations
+```
+
+นี่คือเหตุผลตรง ๆ ว่าทำไม `kubectl --context <name>` (หรือ `kubectl config use-context`) ถึงสำคัญทันทีที่คุณมี cluster มากกว่าหนึ่งตัวอยู่รอบตัว — ไม่งั้นทุกคำสั่งจะรันกับ context ที่ถูก star ไว้ตอนนั้นแบบเงียบ ๆ
 
 พอมี cluster แล้ว ให้รัน Pod แล้วเข้าถึง Pod นั้นจาก laptop ของคุณ
 
@@ -61,7 +184,7 @@ kubectl get namespaces
 kubectl create namespace my-app
 ```
 
-<Mermaid title="A local kind cluster running entirely inside Docker on your laptop" code={runningLocallyDiagram} />
+<Mermaid title="kind cluster บนเครื่องตัวเอง รันอยู่ข้างใน Docker ทั้งหมด" code={runningLocallyDiagram} />
 
 export const runningLocallyDiagram = `flowchart TB
   laptop["Your laptop"] --> docker["Docker"]
@@ -72,9 +195,47 @@ export const runningLocallyDiagram = `flowchart TB
   end
   docker --> cluster`;
 
-<Callout title="The one-line takeaway">
-**kind**, **minikube** และ **k3d** แต่ละตัวให้ Kubernetes cluster จริงที่ทิ้งได้สำหรับพัฒนาและเรียนรู้บนเครื่องตัวเอง ไม่ใช่สำหรับ production และแค่ไม่กี่คำสั่งก็เพียงพอให้เริ่มได้ `kind create cluster` เพื่อสร้าง cluster `kubectl get nodes` เพื่อเช็คว่า healthy `kubectl run` คู่กับ `kubectl port-forward` เพื่อรันและเข้าถึง Pod แรก และ `kubectl create namespace` เพื่อแบ่งพื้นที่ของตัวเองนอกเหนือจาก namespace พื้นฐานอย่าง `default`, `kube-system` และ `kube-public`
+## อ่านโค้ดที่ AI เขียน
+
+ตอนรีวิว kind config หรือ setup script ที่ AI สร้าง เช็กสิ่งเหล่านี้
+
+- tag `kindest/node` ที่ไม่มี digest `@sha256` แต่ถูกนำเสนอว่า "pin แล้ว" — พิสูจน์ข้างบนแล้วว่า release notes ของ kind บอกตรง ๆ ว่ามีแค่ digest form เท่านั้นที่รับประกัน image ที่ test จริงของ release นั้น tag เปล่า ๆ ถูกชี้ไปที่อื่นได้
+- ข้าม `kind load docker-image` ไปเลย แต่คาดหวังให้ Pod รัน image ที่ build บนเครื่องจาก `docker build` ตรง ๆ — พิสูจน์ข้างบนแล้วว่า node ของ kind มองไม่เห็น Docker image cache ของเครื่องคุณ ถ้าไม่ load image (พร้อม `imagePullPolicy: Never` หรือ `IfNotPresent`) kubelet จะพยายาม pull จาก registry แล้วล้มเหลว เพราะ image นี้ไม่เคยถูก push ไปที่ไหนเลย
+- ใช้ `kind create cluster` แบบ single-node เพื่อ "พิสูจน์" พฤติกรรมที่ปรากฏเฉพาะตอนมีหลาย node เท่านั้น (การกระจาย, node affinity, topology spread) — config multi-node ของคอร์สนี้เองข้างบนคือสิ่งที่บทแบบนั้นต้องการจริง ๆ ไม่ใช่ default บรรทัดเดียว
+- แนะนำหรือใช้ `kind` สำหรับอะไรที่บอกว่าเป็น production deployment — พิสูจน์ในตารางเปรียบเทียบข้างบนแล้วว่าไม่มีตัวไหนใน kind, minikube, k3d อ้างว่าเป็น production-grade เลย ทั้งสามมีไว้สำหรับ local development, testing และ CI โดยเฉพาะ
+- generated multi-cluster script ที่ไม่เคยส่ง `--context` หรือ `--name` ตรง ๆ เลย พึ่งพา context ที่บังเอิญเป็นตัวปัจจุบัน — พิสูจน์ข้างบนแล้วว่า `kubectl config get-contexts` แสดง cluster หลายตัวพร้อมกันได้ มีแค่ตัวเดียวที่ถูก star ไว้เป็นตัวปัจจุบัน การรันกับตัวผิดแบบเงียบ ๆ คือความผิดพลาดที่หลีกเลี่ยงได้ง่าย
+
+<SpotTheBug code={`# A generated CI script, meant to test a locally built image
+docker build -t myapp:test .
+kind create cluster --name ci-test
+kubectl apply -f pod.yaml   # pod.yaml references image: myapp:test`}>
+สคริปต์นี้ build image และสร้าง cluster แต่ไม่เคยรัน `kind load docker-image myapp:test --name ci-test` คั่นกลางเลย พิสูจน์ข้างบนแล้วว่า containerd ของ kind node มองไม่เห็น Docker image store ของเครื่องคุณเลย — สองระบบนี้แยกกันเด็ดขาด ถ้าไม่มีขั้นตอน load kubelet บน node จะพยายาม pull `myapp:test` จาก registry (Docker Hub โดย default) แล้วเพราะไม่เคยถูก push ไปที่ไหนเลย Pod จะค้างอยู่ที่ `ErrImageNeverPull` หรือ `ImagePullBackOff` ขึ้นอยู่กับ `imagePullPolicy` ที่ตั้งไว้ — ความล้มเหลวที่งงมากสำหรับ script ที่ "ควรจะทำงานได้เลย" เพราะ image มีอยู่จริงบนเครื่องเห็น ๆ ทางแก้คือบรรทัดเดียว คือ `kind load docker-image myapp:test --name ci-test` คั่นระหว่าง build กับ apply พิสูจน์ข้างบนแล้วว่าทำให้ image มีอยู่จริงในทุก node ก่อนที่อะไรจะพยายามรันมัน
+</SpotTheBug>
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**kind**, **minikube** และ **k3d** แต่ละตัวให้ Kubernetes cluster จริงที่ทิ้งได้สำหรับพัฒนาและเรียนรู้บนเครื่องตัวเอง ไม่ใช่สำหรับ production (เปรียบเทียบข้างบน) และแค่ไม่กี่คำสั่งก็เพียงพอให้เริ่มได้ `kind create cluster --image <tag>@sha256:...` เพื่อสร้าง cluster ที่ pin version แล้ว (พิสูจน์ข้างบนด้วย digest จริงจาก release notes ของ kind เอง) config multi-node แบบ `kind.x-k8s.io/v1alpha4` สำหรับ `extraPortMappings`/`node-labels` `kind load docker-image` เพื่อเอา image ที่ build เองเข้าไปในทุก node (พิสูจน์ข้างบน พร้อมโหมดล้มเหลว `ErrImageNeverPull` ถ้าข้ามขั้นตอนนี้) `kubectl get nodes` เพื่อเช็คว่า healthy `kubectl run` คู่กับ `kubectl port-forward` เพื่อรันและเข้าถึง Pod แรก `kubectl config get-contexts` เพื่อดูทุก cluster ที่เข้าถึงได้ และ `kubectl create namespace` เพื่อแบ่งพื้นที่ของตัวเองนอกเหนือจาก namespace พื้นฐานอย่าง `default`, `kube-system` และ `kube-public`
 </Callout>
+
+## Mental Model
+
+kind/minikube/k3d cluster ไม่ใช่การจำลอง Kubernetes — มันคือ kube-apiserver, etcd, scheduler และ kubelet ตัวเดียวกันเป๊ะกับ production cluster แค่รันบน node ที่บังเอิญเป็น container (หรือ VM) บน laptop คุณ แทนที่จะเป็นเครื่องจริงหรือเครื่อง cloud ทุกอย่างที่คุณพิสูจน์ในนี้ — `kubectl explain` จริง, rollout จริง, การตัดสินใจ schedule จริง — คือพฤติกรรมจริง ไม่ใช่ค่าประมาณ สิ่งเดียวที่ขาดไปคือสิ่งที่เครื่องเดียวให้ไม่ได้จริง ๆ (networking หลายเครื่องระดับใหญ่จริง, cloud load balancer, storage ที่ทนต่อ host ล่ม) และนี่ก็คือเหตุผลตรง ๆ ว่าทำไมการ load image ถึงสำคัญ containerd ของ kind node คือ container runtime จริงที่แยกตัวจริง ไม่มี back channel ไปหา Docker ของเครื่องคุณเลย — ปฏิบัติกับมันเหมือนเครื่องแยกต่างหาก เพราะสำหรับทุกจุดประสงค์ที่สำคัญตรงนี้ มันคือเครื่องแยกจริง ๆ
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ข้อดี | ต้นทุน |
+|---|---|---|
+| kind | สร้าง/ลบเร็วที่สุด สร้างมาเพื่อ CI และ cluster ที่ทิ้งได้สไตล์คอร์สนี้ (คอร์สนี้ใช้ตลอดทั้งเล่ม) | Docker/Podman เท่านั้น ไม่มี VM isolation ไม่มี driver อื่นที่ไม่ใช่ Docker |
+| minikube | addon เยอะที่สุด driver ยืดหยุ่นที่สุด (VM หรือ container) | หนักและช้ากว่า kind ตอนสร้าง/ลบสำหรับ cluster ที่ใช้แล้วทิ้ง |
+| k3d | เร็วมาก footprint เล็ก (wrap k3s) | component บาง Kubernetes ถูกแทนที่ล่วงหน้าโดยการเลือกของ k3s เอง (เช่น ingress/load-balancer default ของตัวเอง) ซึ่งแปลกใจได้ถ้าคุณคาดหวัง default ของ upstream Kubernetes ตัวเปล่า |
+| Pin node image ด้วย `@sha256` | Reproduce ได้ข้ามเครื่องและ CI run ได้ byte เดียวกับที่ test จริง พิสูจน์ข้างบน | มีค่าอีกตัวที่ต้องอัปเดตเวลาอยากได้ Kubernetes version ใหม่จริง ๆ |
+| `kind load docker-image` สำหรับทุก image ที่ build เอง | Pod ใช้ image ที่ไม่เคยถูก push ไป registry ไหนเลยได้ (พิสูจน์ข้างบน) | มีขั้นตอนเพิ่มที่ต้องจำใน build script ทุกตัว ข้ามไปแล้วจะได้ pull failure ที่งงจริง ๆ |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"kind/minikube/k3d cluster ให้แค่พฤติกรรม Kubernetes ที่ใกล้เคียงเท่านั้น"** พิสูจน์ข้างบนใน Mental Model แล้วว่ามันรัน API server, etcd, scheduler และ kubelet จริงตัวเดียวกับ cluster อื่น ๆ — การพิสูจน์ทั้งคอร์สนี้รันอยู่บน cluster แบบนี้เป๊ะ
+- **"docker build ทำให้ image พร้อมใช้กับ Pod ใน kind cluster ได้ทันที"** พิสูจน์ข้างบนด้วยความล้มเหลวสไตล์ `ErrImageNeverPull` จริงแล้วว่า containerd ของ kind node มองไม่เห็น Docker image cache ของเครื่องคุณเลย ต้อง `kind load docker-image` ก่อน
+- **"tag `kindest/node:v1.37.0` เปล่า ๆ ก็ reproduce ได้เป๊ะอยู่แล้ว"** พิสูจน์ข้างบนแล้วว่า release notes ของ kind เองบอกว่าต้องใช้ digest `@sha256` ถึงจะรับประกัน image เป๊ะที่ release นั้น test และ publish ออกมา tag เดี่ยว ๆ ไม่ใช่การรับประกันนั้น
+- **"kind cluster ที่คุณสร้างล่าสุดคือตัวที่คำสั่ง kubectl ของคุณกำลังรันด้วยอยู่"** พิสูจน์ข้างบนด้วย `kubectl config get-contexts` แล้วว่า context ปัจจุบันคือตัวที่ถูก star ไว้ ไม่ใช่ตัวที่สร้างล่าสุด — ควรเช็กตรง ๆ ทุกครั้งที่มี cluster มากกว่าหนึ่งตัว
 
 export const quizRunningLocally = [
   {
@@ -86,6 +247,7 @@ export const quizRunningLocally = [
       'จัดการ billing ของ managed Kubernetes service',
     ],
     answer: 1,
+    explain: 'ทั้งสามมีไว้ทำให้ development และเรียนรู้บนเครื่องตัวเองเร็วและทิ้งได้ — ไม่มีตัวไหนอ้างว่าเป็น production-grade เปรียบเทียบไว้ข้างบน',
   },
   {
     q: 'คำสั่งไหนบอกว่า node ใน cluster ของคุณ healthy และ ready หรือยัง',
@@ -96,6 +258,7 @@ export const quizRunningLocally = [
       'kubectl config view',
     ],
     answer: 0,
+    explain: 'kubectl get nodes แสดงทุก node พร้อมสถานะ Ready — สิ่งแรกที่ควรเช็กทุกครั้งที่รู้สึกว่ามีอะไรผิดปกติใน cluster',
   },
   {
     q: 'namespace kube-system ใช้ทำอะไร',
@@ -106,6 +269,7 @@ export const quizRunningLocally = [
       'เป็น namespace ที่ deprecated แล้ว เก็บไว้เพื่อ backward compatibility เท่านั้น',
     ],
     answer: 1,
+    explain: 'kube-system เก็บ component ที่ control plane จัดการเอง (CoreDNS, Pod ของ kube-proxy และบน kind/kubeadm คือ static Pod ของ control plane เอง พิสูจน์ในบท architecture) — ปกติคุณแค่มาดู ไม่ต้องไปแตะ',
   },
   {
     q: 'คำสั่งไหนสร้าง namespace ใหม่ของคุณเอง',
@@ -116,6 +280,29 @@ export const quizRunningLocally = [
       'kubectl config namespace my-app',
     ],
     answer: 2,
+    explain: 'kubectl create namespace <name> คือวิธีตรง ๆ แบบ imperative ในการสร้าง namespace',
+  },
+  {
+    q: '```text\nImage: "local/tiny-hello:1.0" with ID "sha256:db50fb..." not yet present on node "foundations-worker", loading...\n```\nนี่คือ output จริงจาก `kind load docker-image` ทำไมขั้นตอนนี้ถึงจำเป็นก่อน Pod จะใช้ image ที่ build เองบนเครื่องได้',
+    options: [
+      'ไม่จำเป็น -- docker build ทำให้ image พร้อมใช้ทุกที่อยู่แล้ว',
+      'containerd ของ kind node มองไม่เห็น Docker image cache ของเครื่องคุณเลย ต้อง copy image เข้าไปที่ containerd store ของทุก node ก่อนแบบตรง ๆ',
+      'สำคัญแค่กับ image ที่ใหญ่กว่า 1GB เท่านั้น',
+      'มันแทนที่ความจำเป็นต้องมี Dockerfile',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบนแล้ว: ถ้าไม่มีขั้นตอนนี้ kubelet จะพยายาม pull image จาก registry แล้วล้มเหลว เพราะ image ไม่เคยถูก push ไปที่ไหนเลย — SpotTheBug ข้างบนแสดงความล้มเหลวแบบนี้เป๊ะ',
+  },
+  {
+    q: 'ทำไม release notes ของ kind ถึงยืนยันให้ใช้ digest แบบ `@sha256` (เช่น `kindest/node:v1.37.0@sha256:...`) แทนที่จะใช้แค่ version tag',
+    options: [
+      'แบบ tag ใช้ไม่ได้เลย',
+      'มีแค่ digest form เท่านั้นที่รับประกันว่าคุณได้ image byte เป๊ะ ๆ ที่ release นั้น test และ publish จริง -- tag เดี่ยว ๆ ถูกชี้ไปที่อื่นได้',
+      'digest form จำเป็นเฉพาะบนเครื่อง ARM เท่านั้น',
+      'digest จำเป็นแค่กับ production cluster ไม่ใช่ cluster local',
+    ],
+    answer: 1,
+    explain: 'quote มาตรง ๆ จาก kind v0.33.0 release notes พิสูจน์ข้างบน: "you must use the @sha256 digest to guarantee an image built for this release"',
   },
 ];
 

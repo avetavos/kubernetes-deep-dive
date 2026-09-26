@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
@@ -55,6 +56,38 @@ spec:
 
 `apiVersion` and `kind` say which API group and object type you mean. `metadata` carries identity and bookkeeping — `name`, optional `namespace`, and the `labels` and `annotations` you attach yourself. `spec` is the desired state you author — everything above is `spec` for a Pod. Kubernetes adds a fifth field on its own, `status`, once the object exists: that one you never write, only read, since it reflects observed reality rather than what you asked for.
 
+## `kubectl explain`: checking a field actually exists
+
+An AI assistant (or a half-remembered YAML from an old blog post) will confidently invent a field that sounds plausible but has never existed. `kubectl explain <kind>.<field.path>` asks the live API server's own OpenAPI schema whether a field is real — it is the single fastest way to check a generated manifest before you apply it. A real field, queried on a 1.37 cluster:
+
+```text
+$ kubectl explain deployment.spec.strategy.rollingUpdate.maxSurge
+GROUP:      apps
+KIND:       Deployment
+VERSION:    v1
+
+FIELD: maxSurge <IntOrString>
+
+DESCRIPTION:
+    The maximum number of pods that can be scheduled above the desired number of
+    pods. Value can be an absolute number (ex: 5) or a percentage of desired
+    pods (ex: 10%). This can not be 0 if MaxUnavailable is 0. Absolute number is
+    calculated from percentage by rounding up. Defaults to 25%.
+```
+
+An invented field, on the same live cluster:
+
+```text
+$ kubectl explain deployment.spec.strategy.rollingUpdate.maxSurgePercentageOfNodes
+GROUP:      apps
+KIND:       Deployment
+VERSION:    v1
+
+error: field "maxSurgePercentageOfNodes" does not exist
+```
+
+That `error: field "..." does not exist` is the exact signal that a generated manifest is quoting a field that was never part of the schema — no plausible-sounding name survives `kubectl explain`, because it reads the schema the API server itself validates against, not documentation that might be stale.
+
 ## apply vs create, and labels as the gluing mechanism
 
 `kubectl apply -f file.yaml` is declarative: it diffs your file against the object's last-applied configuration (tracked in an annotation) and patches only what changed, creating the object if it does not exist yet. That makes it safe to re-run the same command over and over, which is exactly what you want in scripts and CI. `kubectl create -f file.yaml` is imperative instead — it creates the object once and errors out if it already exists. This course uses `apply` throughout.
@@ -66,6 +99,162 @@ kubectl create -f pod.yaml
 
 Labels are arbitrary key-value pairs you attach to objects, like `app: web` in the Pod above. On their own they do nothing — their power comes from **selectors**, which other objects use to find the Pods labeled a certain way. A Service with `selector: { app: web }` routes traffic to every Pod carrying that label; a Deployment's ReplicaSet uses a `matchLabels` selector to know which Pods are "its" Pods to keep at the desired replica count. This label-and-selector pattern is the fundamental way objects in Kubernetes find each other, and you will see it again in nearly every later module.
 
+## Scaffolding a manifest instead of writing one by hand
+
+`kubectl create --dry-run=client -o yaml` builds a real manifest from flags without sending anything to the cluster — a fast, correct starting point instead of copying an old YAML file and hoping every field still applies:
+
+```bash
+kubectl create deployment web --image=nginx:1.31 --replicas=3 --dry-run=client -o yaml
+```
+
+Real output:
+
+```text
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: web
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  strategy: {}
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - image: nginx:1.31
+        name: nginx
+        resources: {}
+status: {}
+```
+
+## `kubectl diff`: seeing the change before you make it
+
+`kubectl diff -f <file>` shows exactly what `apply` would change, without changing anything — run it before every `apply` in a script or a CI pipeline you don't fully trust yet. Real output diffing a brand-new Deployment manifest against a cluster where it does not exist yet (a create shows as an entirely new file, `diff`'s exit code is non-zero whenever there would be a change):
+
+```text
+$ kubectl diff -f web-deploy.yaml
+diff -u -N /tmp/LIVE-.../apps.v1.Deployment.foundations-demo.web /tmp/MERGED-.../apps.v1.Deployment.foundations-demo.web
+--- /tmp/LIVE-.../apps.v1.Deployment.foundations-demo.web
++++ /tmp/MERGED-.../apps.v1.Deployment.foundations-demo.web
+@@ -0,0 +1,43 @@
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  creationTimestamp: "2026-09-26T08:31:54Z"
++  name: web
++  namespace: foundations-demo
++spec:
++  progressDeadlineSeconds: 600
++  replicas: 3
++  revisionHistoryLimit: 10
++  selector:
++    matchLabels:
++      app: web
++  strategy:
++    rollingUpdate:
++      maxSurge: 25%
++      maxUnavailable: 25%
+...
+$ echo $?
+1
+```
+
+## Server-Side Apply: the API server does the merging, not your laptop
+
+Classic `kubectl apply` — **client-side apply** — computes its three-way merge locally, comparing your file, the live object, and a copy of your *last* applied config that it stashes in the `kubectl.kubernetes.io/last-applied-configuration` annotation on the object itself. That annotation only exists because the merge logic runs on your machine and has no other way to remember what it applied last time.
+
+**Server-side apply** (`--server-side`, GA since 1.22) moves that merge into the API server. Instead of one blob of "everything I applied last time," the API server tracks **field ownership** per manager in `metadata.managedFields` — which manager last set which field, and whether it did so via `Apply` or `Update`. Because ownership is tracked per-field on the server, SSA never needs the `last-applied-configuration` annotation at all — there is no local diff to reconstruct, the server already knows who owns what.
+
+```bash
+kubectl apply --server-side -f web-deploy.yaml
+```
+
+Real `managedFields` after a plain client-side `kubectl apply` (note the manager name and `operation: Update`):
+
+```text
+$ kubectl get deployment web -o yaml --show-managed-fields
+  managedFields:
+  - manager: kubectl-client-side-apply
+    operation: Update
+    apiVersion: apps/v1
+    fieldsV1:
+      f:spec:
+        f:replicas: {}
+        f:selector: {}
+        f:template: {...}
+  - manager: kube-controller-manager
+    operation: Update
+    subresource: status
+```
+
+## A real field-manager conflict
+
+Field ownership only protects you if a *different* manager tries to change an owned field — and this is exactly the case a generated script can hit: applying the same object with `kubectl apply` (client-side) and then later with `kubectl apply --server-side --field-manager=someone-else` (a different manager, changing `replicas` from `3` to `5`), with no force flag:
+
+```text
+$ kubectl apply --server-side --field-manager=someone-else -f web-deploy-changed.yaml
+error: Apply failed with 1 conflict: conflict with "kubectl-client-side-apply" using apps/v1: .spec.replicas
+Please review the fields above--they currently have other managers. Here
+are the ways you can resolve this warning:
+* If you intend to manage all of these fields, please re-run the apply
+  command with the `--force-conflicts` flag.
+* If you do not intend to manage all of the fields, please edit your
+  manifest to remove references to the fields that should keep their
+  current managers.
+* You may co-own fields by updating your manifest to match the existing
+  value; in this case, you'll become the manager if the other manager(s)
+  stop managing the field (remove it from their configuration).
+```
+
+That is the real, exact API-server error — proven on a live 1.37 cluster, not a guess at the message format. `--force-conflicts` takes ownership anyway:
+
+```text
+$ kubectl apply --server-side --field-manager=someone-else --force-conflicts -f web-deploy-changed.yaml
+deployment.apps/web serverside-applied
+```
+
+There is one important, easy-to-miss wrinkle: if you *don't* pass `--field-manager` at all, `kubectl apply --server-side` defaults to the field manager name `kubectl` — and kubectl treats that specific default as a **deliberate migration path** from client-side apply, silently taking over fields previously owned by `kubectl-client-side-apply` with no conflict at all. The conflict above only happens because `--field-manager=someone-else` names a manager that *isn't* part of that built-in migration compatibility. In other words: migrating your own object from `kubectl apply` to `kubectl apply --server-side` (same default manager) is conflict-free by design; two genuinely different tools or teams applying the same object is exactly when you should expect, and want, a conflict.
+
+## `kubectl apply --prune`: still Alpha in kubectl 1.36
+
+`--prune` deletes objects that used to be created by a previous `apply` but are no longer in your files — useful for "the directory is the source of truth," dangerous if you get the label selector wrong. Checked directly against kubectl 1.36's own help text:
+
+```text
+$ kubectl apply --help
+ Alpha Disclaimer: the --prune functionality is not yet complete. Do not use unless you are aware of what the current state is. See https://issues.k8s.io/34274.
+```
+
+It is still Alpha as of kubectl 1.36 — not deprecated, not GA, exactly what the disclaimer has said for years. Treat it as something to read about, not something to run unattended in CI without `--prune-allowlist` and a very deliberate label selector.
+
+## Reading state back out: `jsonpath` and `custom-columns`
+
+`kubectl get -o jsonpath` and `-o custom-columns` pull exactly the fields you want out of an object, instead of parsing full YAML in a script:
+
+```bash
+kubectl get deployment web -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,IMAGE:.spec.template.spec.containers[0].image'
+kubectl get deployment web -o jsonpath='{.metadata.name}{"\t"}{.spec.replicas}{"\t"}{.spec.template.spec.containers[0].image}{"\n"}'
+```
+
+Real output, side by side:
+
+```text
+$ kubectl get deployment web -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,IMAGE:.spec.template.spec.containers[0].image'
+NAME   REPLICAS   IMAGE
+web    5          nginx:1.31
+
+$ kubectl get deployment web -o jsonpath='{.metadata.name}{"\t"}{.spec.replicas}{"\t"}{.spec.template.spec.containers[0].image}{"\n"}'
+web	5	nginx:1.31
+```
+
+`custom-columns` is friendlier to read at a glance; `jsonpath` composes better inside a shell script that needs a single bare value.
+
 <Mermaid title="A declarative apply flows through the API server into etcd" code={kubectlYamlDiagram} />
 
 export const kubectlYamlDiagram = `flowchart LR
@@ -73,9 +262,51 @@ export const kubectlYamlDiagram = `flowchart LR
   api --> etcd["etcd"]
   api --> ctrl["Controllers notice the change and react"]`;
 
+## Reading AI-generated code
+
+When reviewing a generated manifest or a generated `kubectl` sequence, check for:
+
+- A field name that sounds right but isn't — run it through `kubectl explain <kind>.<field.path>` against a real cluster, proven above: a real field prints a description, an invented one prints `error: field "..." does not exist`.
+- `apiVersion` values from stale training data (`extensions/v1beta1` for Deployments/Ingress, `apps/v1beta1`, `apps/v1beta2`) — all removed for years; the API server rejects these outright rather than silently downgrading behavior.
+- A sequence of imperative commands (`kubectl run`, `kubectl expose`, `kubectl scale`) pasted into a runbook or CI script as if it were "infrastructure" — none of it is re-runnable or diffable the way a manifest plus `apply`/`diff` is, and there is no file to code-review.
+- The same object applied with plain `kubectl apply` in one place and `kubectl apply --server-side` in another (e.g. a human's laptop vs. a GitOps controller) — proven above, mixing the two is exactly what produces a field-manager conflict the moment their field manager names diverge from kubectl's default migration-compatible one.
+- `--force` or `--force-conflicts` added to "fix" a conflict without reading which field is contested — proven above, the conflict error already names the exact field and the exact other manager; force should be a deliberate "yes, I want this field" decision, not a reflex.
+- `kubectl apply -f ./manifests/` applied against a whole directory that also contains a `values.yaml` or other non-manifest YAML (a Helm chart's own config file, a CI config) sitting in the same folder — `apply -f` on a directory does not know the difference and will try to apply every `.yaml` it finds.
+
+<SpotTheBug code={`# A "safety" script someone added before every deploy
+kubectl apply --server-side --force-conflicts -f web-deploy.yaml`}>
+This "fixes" every conflict without ever reading what it force-took ownership of. Proven above: the real conflict error already names the exact contested field (`.spec.replicas`) and the exact other manager (`"kubectl-client-side-apply"`) —
+
+```text
+error: Apply failed with 1 conflict: conflict with "kubectl-client-side-apply" using apps/v1: .spec.replicas
+```
+
+`--force-conflicts` should be typed in response to reading that specific message and deciding this manager should own that specific field, not pasted into every deploy script as a blanket "make the error go away." Used unconditionally, it silently steals ownership of any field another manager (a human's `kubectl apply`, a controller, a different pipeline) currently owns — including fields this manifest never intended to touch, if the file is ever edited to add one back accidentally.
+</SpotTheBug>
+
 <Callout title="The one-line takeaway">
-`kubectl` sends **manifests** — YAML built from the same four top-level fields, `apiVersion`, `kind`, `metadata`, and `spec` — to the cluster, scoped by **context** and **namespace**; `kubectl apply` is the **declarative**, idempotent, re-runnable way to do that (diffing against last-applied configuration), unlike the imperative `kubectl create`; and **labels** paired with **selectors** are how Services, ReplicaSets, and everything else in Kubernetes finds the Pods it should manage.
+`kubectl` sends **manifests** — YAML built from the same four top-level fields, `apiVersion`, `kind`, `metadata`, and `spec` — to the cluster, scoped by **context** and **namespace**; `kubectl explain <kind>.<field>` checks a field is real against the live schema (proven above with a real and an invented field); `kubectl apply` is the **declarative**, idempotent, re-runnable way to send state, and `kubectl diff -f` shows the change first. **Server-side apply** (`--server-side`) moves the merge to the API server and tracks field ownership per manager in `managedFields` instead of a `last-applied-configuration` annotation — a genuine conflict between two different field managers is a real, named API-server error (proven above), resolved deliberately with `--force-conflicts`, never as a reflex. `--prune` is still Alpha in kubectl 1.36. **Labels** paired with **selectors** are how Services, ReplicaSets, and everything else in Kubernetes finds the Pods it should manage.
 </Callout>
+
+## Mental Model
+
+`kubectl` is a thin, stateless translator between you and one authoritative source of truth: the API server's own schema and its stored objects. Every feature in this lesson is really the same idea applied at a different point — `explain` asks the schema "is this field real," `diff` asks the server "what would change," `apply` asks it to make that change, and server-side apply asks it to also remember, per field, *who* asked. Nothing here is client cleverness; client-side apply's `last-applied-configuration` annotation is the one exception, and it exists only because the client (not the server) used to be the one doing the diffing — server-side apply removes that need by moving the bookkeeping to the one place that was always authoritative anyway.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| `kubectl apply` (client-side) | Works with older clusters, no server feature required | Diffing happens locally against a `last-applied-configuration` annotation that can drift or get wiped by another tool (proven above: `rollout undo` warns about exactly this in the Deployments lesson) |
+| `kubectl apply --server-side` | Field ownership is explicit and server-authoritative; safe multi-writer conflicts are real, named errors instead of silent overwrites (proven above) | A genuine conflict stops the apply until you decide `--force-conflicts` or edit your manifest — an extra decision client-side apply never forces on you |
+| `kubectl diff -f` before every apply | Catches an unexpected change before it lands, in CI or by hand | One more step in the loop; needs cluster read access wherever it runs |
+| `kubectl apply --prune` | One command keeps a whole directory's worth of objects in sync, including deletions | Still Alpha in kubectl 1.36 (proven above) — a wrong label selector can delete more than intended |
+
+## Common Misconceptions
+
+- **"Server-side apply is just client-side apply, but run on the server."** Proven above: they use fundamentally different bookkeeping — client-side apply reconstructs the diff from a `last-applied-configuration` annotation it maintains locally, server-side apply tracks per-field ownership in `managedFields` and needs no such annotation at all.
+- **"Migrating an object from `kubectl apply` to `kubectl apply --server-side` will always hit a field-manager conflict."** Proven above: it does not, by design — kubectl's own default `--server-side` field manager name is specifically treated as a migration path from `kubectl-client-side-apply`, with no conflict. The conflict only appears once a *different* field manager name touches an already-owned field.
+- **"`--force-conflicts` is the correct fix whenever `apply --server-side` returns an error."** Proven above: the error names the exact field and the exact current owner — the correct response is to decide whether you should really own that field, not to reflexively force every conflict away.
+- **"`kubectl explain` reads static documentation, so it can be out of date same as any doc."** Proven above: it queries the live API server's own OpenAPI schema — the same schema `apply` validates against — so a field it accepts is guaranteed to exist on that exact cluster version, unlike a blog post or a model's training data.
 
 export const quizKubectlYaml = [
   {
@@ -87,6 +318,7 @@ export const quizKubectlYaml = [
       'apply only works on Pods while create works on every object kind',
     ],
     answer: 0,
+    explain: 'kubectl apply is declarative and idempotent -- it diffs your file against the last-applied configuration and patches only the difference. kubectl create is imperative and errors out if the object already exists.',
   },
   {
     q: 'What does a label selector actually do?',
@@ -97,6 +329,7 @@ export const quizKubectlYaml = [
       'It pins a Pod to run on a specific node',
     ],
     answer: 1,
+    explain: 'Labels do nothing on their own; a selector is how another object (a Service routing traffic, a ReplicaSet managing replicas) finds the Pods carrying a given label.',
   },
   {
     q: 'Which four top-level fields does every Kubernetes object manifest have?',
@@ -107,6 +340,7 @@ export const quizKubectlYaml = [
       'cluster, namespace, context, kind',
     ],
     answer: 2,
+    explain: 'apiVersion and kind say which API group and object type; metadata carries identity (name, namespace, labels); spec is the desired state you author. status is added by the system, not written by you.',
   },
   {
     q: 'Which field on a live Kubernetes object is managed by the system and never something you author yourself?',
@@ -117,6 +351,40 @@ export const quizKubectlYaml = [
       'apiVersion',
     ],
     answer: 2,
+    explain: 'status reflects observed reality once the object exists -- you read it, you never write it in a manifest you apply.',
+  },
+  {
+    q: '```text\n$ kubectl explain deployment.spec.strategy.rollingUpdate.maxSurgePercentageOfNodes\nerror: field "maxSurgePercentageOfNodes" does not exist\n```\nWhat does this real output tell you about a generated manifest using this field?',
+    options: [
+      'The field exists but only in a beta API version',
+      'kubectl explain queried the live API server schema and confirmed this field was never part of it -- the manifest is wrong',
+      'The field exists but is deprecated',
+      'This is a client-side network error, not a schema error',
+    ],
+    answer: 1,
+    explain: 'kubectl explain reads the live API server\'s own OpenAPI schema. "error: field ... does not exist" means the schema the API server validates against has no such field -- proven above alongside a real field (maxSurge) that does print a description.',
+  },
+  {
+    q: '```text\n$ kubectl apply --server-side --field-manager=someone-else -f web-deploy.yaml\nerror: Apply failed with 1 conflict: conflict with "kubectl-client-side-apply" using apps/v1: .spec.replicas\n```\nWhy did this conflict happen, and what is the correct next step?',
+    options: [
+      'The YAML is invalid; fix the syntax and reapply',
+      'A different field manager tried to change a field already owned by kubectl-client-side-apply; decide deliberately whether to take ownership with --force-conflicts or edit the manifest to stop touching that field',
+      'This always happens on every server-side apply and should always be forced',
+      'The cluster is unreachable',
+    ],
+    answer: 1,
+    explain: 'Proven above: server-side apply tracks field ownership per manager. A conflict names the exact field and the exact other owner -- the fix is a deliberate choice (--force-conflicts to take it, or stop claiming the field), not a reflexive force.',
+  },
+  {
+    q: 'Why does server-side apply not need the kubectl.kubernetes.io/last-applied-configuration annotation that client-side apply relies on?',
+    options: [
+      'Because server-side apply skips validation entirely',
+      'Because the API server tracks field ownership per manager directly in managedFields, so there is no local diff to reconstruct from a stashed annotation',
+      'Because server-side apply never changes existing fields',
+      'Because the annotation is only used by kubectl create, not apply',
+    ],
+    answer: 1,
+    explain: 'Client-side apply computes its three-way merge locally and needs the annotation to remember what it applied last time. Server-side apply moves that bookkeeping to the API server itself, which already tracks per-field managers in managedFields.',
   },
 ];
 

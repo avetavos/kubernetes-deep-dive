@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียหลักในหนึ่งประโยค
 
@@ -48,7 +49,120 @@ kubectl describe node <node-name>
 
 นี่คือข้อเท็จจริงเชิง architecture ที่ควรจำ **kube-scheduler, kube-controller-manager, kubelet และทุกอย่างอื่น ไม่เคยแตะ etcd โดยตรง** ทุกตัวอ่านและเขียน cluster state ผ่านการเรียก API server เท่านั้น ที่เป็น single source of truth และเป็นผู้มีอำนาจเดียวของทั้ง cluster ทำให้ Kubernetes มีจุดเดียวที่สม่ำเสมอสำหรับ authentication, authorization, validation และ watch notification controller ทุกตัวและ kubelet ทุกตัว จริง ๆ แล้วก็แค่เป็น client ของ REST API ตัวเดียวกับที่คุณใช้กับ `kubectl`
 
-<Mermaid title="Control plane and node components, and the single path to etcd" code={architectureDiagram} />
+## controller รู้ว่ามีอะไรเปลี่ยนได้ยังไงจริง ๆ: watch ไม่ใช่ poll
+
+controller ทุกตัวและ `kubectl get --watch` ทุกครั้ง เปิด HTTP connection แบบยาว ๆ ไปที่ API server แล้วรับ stream ของ event `ADDED`/`MODIFIED`/`DELETED` ทันทีที่มีอะไรเปลี่ยน — ไม่ได้ poll เป็น loop เลย `--output-watch-events` แสดง event type คู่กับ column ปกติ พิสูจน์ด้วย watch ที่เริ่มบน namespace แล้วสร้างและลบ Pod ระหว่างที่มันรันอยู่
+
+```bash
+kubectl get pods -n foundations-demo --watch --output-watch-events -o wide
+```
+
+stream จริง (Pod ที่มีอยู่แล้วจะมาเป็น `ADDED` ก่อน จากนั้น Pod ใหม่เอี่ยมจะเล่น lifecycle ทั้งหมดเป็นชุด event `MODIFIED` จบด้วย `DELETED`)
+
+```text
+EVENT      NAME                   READY   STATUS    RESTARTS   AGE   IP            NODE
+ADDED      web-69d5569566-fmcq2   1/1     Running   0          19s   10.244.2.10   foundations-worker
+ADDED      watchtest              0/1     Pending   0          0s    <none>        <none>
+MODIFIED   watchtest              0/1     Pending   0          0s    <none>        foundations-worker2
+MODIFIED   watchtest              0/1     ContainerCreating   0     0s    <none>        foundations-worker2
+MODIFIED   watchtest              1/1     Running             0     1s    10.244.1.9    foundations-worker2
+MODIFIED   watchtest              1/1     Terminating         0     3s    10.244.1.9    foundations-worker2
+MODIFIED   watchtest              0/1     Completed           0     3s    10.244.1.9    foundations-worker2
+DELETED    watchtest              0/1     Completed           0     4s    10.244.1.9    foundations-worker2
+```
+
+ทุกบรรทัดคือ API server push การเปลี่ยนแปลงลงมาผ่าน connection ที่เปิดค้างไว้แล้ว — นี่คือกลไกเดียวกันเป๊ะที่ kube-controller-manager, kube-scheduler และ kubelet ใช้ตอบสนอง cluster state แทนที่จะถาม "มีอะไรเปลี่ยนหรือยัง" เป็น loop กลไกที่ลึกกว่านี้ — `resourceVersion`, watch bookmark และวิธีที่ **informer** สร้าง local cache ทับ stream เดียวกันนี้ — อยู่ในบท internals บทนี้แค่ต้องการให้คุณรู้ว่า "controller ตอบสนอง" หมายถึง "controller watch"
+
+## `kubectl get --raw`: คุยกับ API server แบบไม่มีอะไรคั่นกลาง
+
+`kubectl get --raw <path>` ส่ง request ตรงไปที่ path ของ API server แล้วพิมพ์ response ดิบ ๆ ออกมา ไม่มีการจัด format เป็น object หรือ table — มีประโยชน์กับ endpoint ที่ไม่ใช่ resource ปกติเลย
+
+```text
+$ kubectl get --raw /healthz
+ok
+
+$ kubectl get --raw /version
+{
+  "major": "1",
+  "minor": "37",
+  "gitVersion": "v1.37.0",
+  "gitCommit": "f54c212e3a2f75d674b717a9b29052b20b60aefc",
+  "buildDate": "2026-08-26T10:44:25Z",
+  "goVersion": "go1.26.6",
+  "platform": "linux/arm64"
+}
+```
+
+## `-v=8`: ดู HTTP request จริงที่ kubectl ยิง
+
+ทุกคำสั่ง `kubectl` ข้างใต้คือ HTTP call ไปที่ API server — `-v=8` พิมพ์ request line, header และ response body จริงที่ kubectl ส่งและรับ ซึ่งเป็นวิธีที่เร็วที่สุดที่จะเลิกเดาว่าคำสั่ง "จริง ๆ แล้วทำอะไร"
+
+```text
+$ kubectl get pods -n foundations-demo -v=8
+...
+I0926 15:34:31.288997 round_trippers.go:527] "Request" verb="GET" url="https://127.0.0.1:52255/api/v1/namespaces/foundations-demo/pods?limit=500"
+I0926 15:34:31.296968 round_trippers.go:632] "Response" status="200 OK" headers=<...>
+I0926 15:34:31.297057 helper.go:113] "Response Body" body="{\"kind\":\"Table\",\"apiVersion\":\"meta.k8s.io/v1\", ...}"
+```
+
+`kubectl get` ที่ไม่ใส่ `-o` จริง ๆ แล้วขอ `meta.k8s.io/v1, Kind=Table` จาก server — column formatting ที่คุณเห็นใน `kubectl get pods` ธรรมดา ถูกคำนวณฝั่ง server แล้วส่งกลับมาเป็น structured data ไม่ได้เดาเอาเองฝั่ง client จาก object list เปล่า ๆ
+
+## etcd อยู่ตรงไหนจริง ๆ ใน kind cluster
+
+kind รัน control plane แบบเดียวกับที่ `kubeadm` ทำทุกที่ คือเป็น **static Pod** ที่ถูกกำหนดด้วยไฟล์ manifest ธรรมดาที่ kubelet เฝ้าดูตรงบน disk ไม่ผ่าน API server บน control-plane node
+
+```text
+$ docker exec foundations-control-plane ls /etc/kubernetes/manifests/
+etcd.yaml
+kube-apiserver.yaml
+kube-controller-manager.yaml
+kube-scheduler.yaml
+```
+
+`etcd.yaml` จริง (ตัดให้สั้น) — นี่คือ command line จริงที่ etcd ใช้ start ไม่มี abstraction คั่นกลางเลย
+
+```text
+$ docker exec foundations-control-plane cat /etc/kubernetes/manifests/etcd.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: etcd
+  namespace: kube-system
+spec:
+  containers:
+  - command:
+    - etcd
+    - --advertise-client-urls=https://172.19.0.7:2379
+    - --data-dir=/var/lib/etcd
+    - --initial-cluster=foundations-control-plane=https://172.19.0.7:2380
+    - --listen-client-urls=https://127.0.0.1:2379,https://172.19.0.7:2379
+```
+
+kind node image ไม่มี binary `etcdctl` มาให้ `member list` เลยใช้ไม่ได้ข้างในตัว node แบบที่อาจใช้ได้บน kubeadm cluster ที่คุณสร้างเองแล้วติดตั้ง etcd tooling เต็มชุด ทางเลือกตรง ๆ สำหรับ "etcd ยัง healthy ไหม" บน kind คือดู static Pod ของมันผ่าน API server เหมือนของอย่างอื่น
+
+```text
+$ kubectl -n kube-system get pods
+NAME                                                READY   STATUS    RESTARTS   AGE
+etcd-foundations-control-plane                      1/1     Running   0          3m24s
+kube-apiserver-foundations-control-plane            1/1     Running   0          3m24s
+kube-controller-manager-foundations-control-plane   1/1     Running   0          3m23s
+kube-scheduler-foundations-control-plane            1/1     Running   0          3m24s
+```
+
+## kubelet กับ container runtime บน node จริง
+
+บน worker node `kubelet` กับ `containerd` เป็น host process คนละตัวกัน kubelet ไม่เคยรัน container เองเลย มันสั่ง containerd (ผ่าน CRI) ให้รันแทน แล้ว containerd ก็ส่งต่อแต่ละ container ให้ process `containerd-shim-runc-v2`
+
+```text
+$ docker exec foundations-worker sh -c 'ps aux | grep -E "kubelet|containerd" | grep -v grep'
+root   130  /usr/local/bin/containerd
+root   242  /usr/bin/kubelet --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf --config=/var/lib/kubelet/config.yaml
+root   294  /usr/local/bin/containerd-shim-runc-v2 -namespace k8s.io -id bf542e6a6f4bd107dc83be43e581da8a6b297fb39d17fbfb1291a33f75834384
+```
+
+หนึ่ง shim process ต่อหนึ่ง container ที่กำลังรัน แต่ละตัวเป็นลูกโดยตรงของ containerd ไม่ใช่ของ kubelet — งานของ kubelet จบแค่บอก containerd ว่าควรมีอะไรรันอยู่ ส่วน containerd (และ shim ข้างใต้) ต่างหากที่เป็นเจ้าของ process tree ที่รันอยู่จริง
+
+<Mermaid title="Control plane กับ node component และเส้นทางเดียวสู่ etcd" code={architectureDiagram} />
 
 export const architectureDiagram = `flowchart TB
   subgraph cp["Control Plane"]
@@ -68,9 +182,46 @@ export const architectureDiagram = `flowchart TB
   kubelet --> api
   proxy --> api`;
 
-<Callout title="The one-line takeaway">
-**control plane** — **kube-apiserver**, **etcd**, **kube-scheduler** และ **kube-controller-manager** (บวก **cloud-controller-manager** ที่เป็น optional) — ตัดสินใจว่าควรเกิดอะไรขึ้นและจดจำ cluster state ทั้งหมด ส่วนแต่ละ **node** รัน **kubelet** (ตัวที่เริ่มและเฝ้าดู container จริง) **kube-proxy** (ตัวที่ทำให้ Service เข้าถึงได้) และ **container runtime** ที่คุยผ่าน **CRI** ทุก component เหล่านี้ ไม่มีข้อยกเว้น อ่านและเขียน state ผ่าน **API server** เท่านั้น ที่เป็นประตูเดียวสู่ **etcd**
+## อ่านโค้ดที่ AI เขียน
+
+ตอนรีวิว architecture diagram, runbook หรือคำแนะนำ debug ที่ AI สร้าง เช็กสิ่งเหล่านี้
+
+- คำแนะนำให้ `curl` หรือคุยกับ etcd ตรง ๆ จาก application หรือ script — พิสูจน์ข้างบนแล้วว่ามีแค่ API server เท่านั้นที่ควรแตะ etcd port ของ etcd บน cluster ที่ healthy ไม่ใช่สิ่งที่ workload ของคุณเองควรไปชี้ถึงเลย
+- "poll API server ทุก N วินาทีเพื่อจับการเปลี่ยนแปลง" เป็น design ของ controller หรือ automation script — พิสูจน์ข้างบนแล้วว่ากลไกจริงที่ built-in controller ทุกตัวใช้คือ **watch** (connection ที่เปิดค้างไว้ยาว ๆ รับ event `ADDED`/`MODIFIED`/`DELETED`) ไม่ใช่ poll ถ้า controller ที่ generate มา poll แปลว่ามันกำลังอธิบายอะไรที่ช้าและหนักกว่าสิ่งที่ Kubernetes เองทำมาก
+- คำแนะนำ debug สำหรับ managed cloud cluster (EKS/GKE/AKS) ที่บอกให้ `docker exec` เข้า control-plane node หรืออ่าน `/etc/kubernetes/manifests/etcd.yaml` — พิสูจน์ข้างบนแล้วว่า path นี้จริงสำหรับ cluster สไตล์ **kubeadm** (รวมถึง kind) แต่ control plane ของ managed cluster ไม่ได้รันเป็น Pod บน node ที่ shell เข้าไปได้เลย คำสั่งแบบนี้ไม่มีอยู่ที่นั่น
+- สมมติว่า `etcdctl` มีอยู่ในทุก node ของ Kubernetes — พิสูจน์ข้างบนแล้วว่าไม่ได้เป็นส่วนหนึ่งของ kind node image ทางเลือก (`kubectl -n kube-system get pods`) คือทางแทนที่ใช้ได้จริง ไม่ใช่การประนีประนอม
+- สับสนระหว่าง kubelet กับ container runtime — พิสูจน์ข้างบนแล้วว่า kubelet แค่เรียก containerd (ผ่าน CRI) containerd กับ shim process ของมันต่างหากที่เป็นเจ้าของ process tree ที่รันอยู่จริง
+
+<SpotTheBug code={`# From a generated "custom health checker" script
+ETCD_ENDPOINT="https://172.19.0.7:2379"
+curl --cacert /etc/kubernetes/pki/etcd/ca.crt "\$ETCD_ENDPOINT/health"
+# ...then feed the result straight into a scaling decision`}>
+สคริปต์นี้คุยกับ etcd ตรง ๆ จากนอก control plane ข้าม API server ไปเลย พิสูจน์ข้างบนแล้วบน kind cluster จริง kube-scheduler, kube-controller-manager, kubelet และทุกคำสั่ง `kubectl` เข้าถึง etcd ผ่านประตูเดียวเท่านั้นคือ API server — ไม่มีอะไรอื่นควรเปิด client connection ไปหามันเลย แม้จะไม่พูดถึงว่า client cert ของ etcd (`/etc/kubernetes/pki/etcd/*`) ไม่ใช่สิ่งที่ application ควรถืออยู่แล้ว การเอา scaling decision ไปอิงกับการเช็ก health ของ etcd ดิบ ๆ ก็ทิ้งการรับประกันทุกอย่าง (auth, validation, watch notification) ที่ API server มีอยู่เพื่อให้ ทางแก้คือ `kubectl get --raw /healthz` (หรือ client-go call เทียบเท่ากับ API server) ซึ่งพิสูจน์ข้างบนแล้วว่าเป็นวิธีจริงที่รองรับสำหรับถามว่า "API เข้าถึงได้ไหม" โดยไม่แตะ etcd เลย
+</SpotTheBug>
+
+<Callout title="สรุปหนึ่งบรรทัด">
+**control plane** — **kube-apiserver**, **etcd**, **kube-scheduler** และ **kube-controller-manager** (บวก **cloud-controller-manager** ที่เป็น optional) — ตัดสินใจว่าควรเกิดอะไรขึ้นและจดจำ cluster state ทั้งหมด ส่วนแต่ละ **node** รัน **kubelet** (ตัวที่เริ่มและเฝ้าดู container จริงผ่าน containerd/CRI พิสูจน์ข้างบน) **kube-proxy** (ตัวที่ทำให้ Service เข้าถึงได้) และ **container runtime** ที่คุยผ่าน **CRI** ทุก component เหล่านี้ ไม่มีข้อยกเว้น อ่านและเขียน state ผ่าน **API server** โดยเปิด **watch** แทนการ poll (พิสูจน์ข้างบนด้วย event stream จริง) และ API server เป็นประตูเดียวสู่ **etcd** ซึ่งบน kind/kubeadm cluster อยู่ในรูป static Pod ที่กำหนดใน `/etc/kubernetes/manifests/etcd.yaml` (พิสูจน์ข้างบน) `kubectl get --raw` กับ `-v=8` คือสองวิธีที่เร็วที่สุดที่จะเห็นว่า kubectl ถาม API server อะไรจริง ๆ
 </Callout>
+
+## Mental Model
+
+มองว่า control plane เป็นฐานข้อมูล (etcd) ที่มีประตูหน้าเดียวเป๊ะ (API server) และมี client กลุ่มเล็ก ๆ ยืนอยู่หน้าประตูนั้น ทำสองอย่างเดิมตลอดเวลา คือ อ่าน state ปัจจุบันผ่าน watch และเขียนกลับด้วย delta เล็ก ๆ ที่จำเป็นเพื่อขยับ state ไปหาสิ่งที่ต้องการ kube-scheduler, kube-controller-manager, kubelet, kube-proxy และ `kubectl` เอง เหมือนกันเป๊ะในมุมของ etcd — ทุกตัวก็แค่เป็น client ที่ watch-แล้ว-patch ของ REST API ตัวเดียวกัน ไม่มีประตูหลัง ไม่มีสิทธิ์พิเศษ พอเข้าใจตรงนี้แล้ว "ทำไมอ่าน etcd ตรง ๆ บน managed cluster ไม่ได้" กับ "ทำไม `kubectl get --watch` ดูเหมือนไม่หยุดสักที" ก็ตอบตัวเองทั้งคู่ ไม่มีทางเข้าอื่น และไม่มี polling loop ให้หยุด
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ข้อดี | ต้นทุน |
+|---|---|---|
+| API server เดียวเป็น etcd client ตัวเดียว | จุดเดียวที่สม่ำเสมอสำหรับ auth, validation และ watch notification (พิสูจน์ข้างบน) | availability ของทุก component ถูกจำกัดด้วย availability ของ API server — ไม่มี component ไหนมีทาง fallback ส่วนตัวไปหา state ได้ |
+| Watch แทน poll | ตอบสนองการเปลี่ยนแปลงเกือบทันที พิสูจน์ข้างบนด้วย event stream จริง ไม่เสีย request "มีอะไรเปลี่ยนหรือยัง" ทิ้ง | controller ต้องจัดการ watch connection ที่หลุดหรือหมดอายุแล้ว re-list ซึ่งเป็น state ที่ต้องจัดการให้ถูกต้องมากกว่า poll loop แบบ naive |
+| Static Pod สำหรับ control plane (kubeadm/kind) | เรียบง่าย ตรวจสอบได้ เป็น YAML file ที่ kubelet เฝ้าดูบน disk จริง ๆ พิสูจน์ได้ด้วย `docker exec` + `cat` ข้างบน | ไม่ใช่วิธีที่ managed cloud cluster ทำงานเลย คำแนะนำ debug ที่เขียนจาก kind/kubeadm ใช้ข้ามไปไม่ได้ |
+| kubelet ส่งต่อให้ containerd ผ่าน CRI แทนที่จะรัน container เอง | runtime สลับได้ (containerd, CRI-O) โดยไม่ต้องเปลี่ยน kubelet | มี process boundary เพิ่มอีกจุด และมีอะไรอีกอย่างที่ out of sync ได้ (kubelet ขึ้นแต่ containerd แย่ลง หรือกลับกัน) |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"Application หรือ script คุยกับ etcd ตรง ๆ เพื่ออ่านเร็ว ๆ ได้ ถ้ามี cert"** พิสูจน์ข้างบนแล้วว่าไม่มีอะไรนอกจาก API server ที่ควรแตะ etcd และ SpotTheBug ข้างบนแสดงเหตุผลตรง ๆ ว่าทำไมถึงสำคัญ — การรับประกันทุกอย่าง (auth, validation, watch notification) ถูกข้ามไปทันทีที่ทำแบบนั้น
+- **"Controller จับการเปลี่ยนแปลงด้วยการ poll API server เป็นช่วง ๆ"** พิสูจน์ข้างบนด้วย `--output-watch-events` stream จริงแล้วว่ากลไกจริงคือ watch connection ที่เปิดค้างไว้รับ push event ไม่ใช่ request-response poll loop
+- **"ทุก Kubernetes cluster มี `/etc/kubernetes/manifests/` ให้ตรวจสอบ control plane"** พิสูจน์ข้างบนแล้วว่าจริงสำหรับ kind และ cluster ที่สร้างด้วย kubeadm แต่ไม่จริงสำหรับ managed cloud cluster (EKS/GKE/AKS) ที่ control plane ไม่ได้เป็น Pod บน node ที่คุณเข้าถึงได้เลย
+- **"kubelet เป็นคนรัน container"** พิสูจน์ข้างบนแล้วว่า kubelet เรียก containerd ผ่าน Container Runtime Interface containerd (และ shim process ต่อ container ของมัน) ต่างหากที่เป็นเจ้าของ process ที่รันอยู่จริง
 
 export const quizArchitecture = [
   {
@@ -82,6 +233,7 @@ export const quizArchitecture = [
       'credential ที่ใช้ authenticate เข้า kubectl',
     ],
     answer: 2,
+    explain: 'etcd คือ distributed key-value store ที่ consistent เก็บทุก object และ status ของมัน — ถ้าหายไปโดยไม่มี backup ความจำของ cluster ก็หายไปด้วย',
   },
   {
     q: 'kubelet รับผิดชอบอะไรบน node',
@@ -92,6 +244,7 @@ export const quizArchitecture = [
       'เก็บ manifest ของ cluster ที่ส่งเข้ามาด้วย kubectl apply',
     ],
     answer: 2,
+    explain: 'kubelet คือ node agent — พิสูจน์ข้างบนแล้วว่ามันส่งต่อ container process จริงให้ containerd ผ่าน CRI แต่ kubelet เป็นคนทำให้แน่ใจว่า container ที่ถูกต้องมีอยู่ restart มัน รัน probe และรายงาน status',
   },
   {
     q: 'component ไหนตัดสินใจว่า Pod ที่เพิ่งถูกสร้างจะถูก schedule ไปที่ node ไหน',
@@ -102,6 +255,7 @@ export const quizArchitecture = [
       'kube-scheduler',
     ],
     answer: 3,
+    explain: 'kube-scheduler คอยดู Pod ที่ยังไม่มี node กำหนด แล้วตัดสินใจว่าแต่ละตัวควรรันที่ไหน โดยดู resource requirement, constraint และ load ปัจจุบัน',
   },
   {
     q: 'ทำไม API server ถึงเป็น component เดียวที่คุยกับ etcd โดยตรง',
@@ -112,6 +266,29 @@ export const quizArchitecture = [
       'kube-scheduler ต้องการสิทธิ์ write แบบ exclusive ถึงจะทำงานได้',
     ],
     answer: 1,
+    explain: 'ประตูเดียวแปลว่าจุดเดียวที่สม่ำเสมอสำหรับ authentication, authorization, validation และ watch notification — พิสูจน์ข้างบนแล้วว่าการข้ามมันไป (แบบใน SpotTheBug) ทิ้งทุกอย่างนั้นไปหมด',
+  },
+  {
+    q: '```text\nEVENT      NAME        READY   STATUS    RESTARTS   AGE\nADDED      watchtest   0/1     Pending   0          0s\nMODIFIED   watchtest   1/1     Running   0          1s\nMODIFIED   watchtest   0/1     Completed 0          3s\nDELETED    watchtest   0/1     Completed 0          4s\n```\nนี่คือ output จริงจาก `kubectl get pods --output-watch-events` มันพิสูจน์อะไรเกี่ยวกับวิธีที่ controller จับการเปลี่ยนแปลง',
+    options: [
+      'Kubernetes poll API server เป็นช่วงเวลาคงที่แล้วรายงานความต่าง',
+      'นี่คือ watch connection ที่เปิดค้างไว้ยาว ๆ push event ADDED/MODIFIED/DELETED ทันทีที่เกิดขึ้น — กลไกเดียวกับที่ built-in controller ทุกตัวใช้ตอบสนอง state ที่เปลี่ยน',
+      'output นี้ใช้ได้แค่กับ kubectl ไม่เกี่ยวกับ controller ภายใน',
+      'แต่ละบรรทัดคือ kubectl request คนละอันแยกกัน',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบนแล้วว่า watch คือ connection เดียวที่เปิดอยู่รับ stream ของ event ไม่ใช่การ poll ซ้ำ ๆ — kube-controller-manager, kube-scheduler และ kubelet ใช้กลไกนี้เป๊ะ',
+  },
+  {
+    q: '```text\n$ docker exec foundations-control-plane cat /etc/kubernetes/manifests/etcd.yaml\napiVersion: v1\nkind: Pod\nmetadata:\n  name: etcd\n  namespace: kube-system\n```\nไฟล์จริงนี้พิสูจน์อะไรเกี่ยวกับวิธีที่ kind (หรือ cluster ที่สร้างด้วย kubeadm) รัน control plane',
+    options: [
+      'etcd รันเป็น systemd service ไม่เกี่ยวกับ Kubernetes',
+      'etcd (และ control plane ที่เหลือ) รันเป็น static Pod กำหนดด้วย manifest file ที่ kubelet เฝ้าดูตรงบน disk — ไม่ใช้กับ managed cloud cluster',
+      'ไฟล์นี้มีอยู่แค่ใน environment ทดสอบ/demo เท่านั้น ไม่มีใน kubeadm cluster จริง',
+      'etcd เป็น optional และไฟล์นี้ลบได้อย่างปลอดภัย',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบนแล้วว่า kind รัน control plane แบบเดียวกับ kubeadm เป๊ะ คือเป็น static Pod ที่ kubelet เจอบน disk — ข้อเท็จจริงนี้ใช้ข้ามไปไม่ได้กับ managed cloud cluster ที่คุณ docker exec เข้า control plane ไม่ได้เลย',
   },
 ];
 

@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
@@ -24,6 +25,13 @@ Three tools cover almost all local Kubernetes development and learning:
 
 All three exist to make local development and learning fast and disposable. None of them is meant for production — production clusters are built with tools like kubeadm, or provisioned by a managed cloud service, on real or dedicated virtual machines with proper networking, storage, and high availability.
 
+| | kind | minikube | k3d |
+|---|---|---|---|
+| What it runs | Kubernetes ([kind.sigs.k8s.io](https://kind.sigs.k8s.io/)) nodes as Docker/Podman containers | Full Kubernetes ([minikube.sigs.k8s.io](https://minikube.sigs.k8s.io/)), in a VM, container, or bare-metal driver of your choice | k3s ([k3d.io](https://k3d.io/)) — a certified, lightweight Kubernetes distribution — in Docker containers |
+| Driver flexibility | Docker or Podman only | Many drivers (docker, podman, and VM drivers like hyperkit/hyperv/kvm2) | Docker only |
+| Built-in addons | None — this course installs Gateway API/CSI CRDs itself when a lesson needs them | Rich addon ecosystem (`minikube addons enable dashboard/ingress/metrics-server`) | Minimal; k3s ships some components (Traefik, servicelb) already built in |
+| Best fit | CI pipelines, and following a course like this one where disposable, scriptable clusters matter | A single, long-lived local cluster with a lot of one-command extras | A fast multi-cluster/multi-node setup built around k3s's small footprint |
+
 ## Your first cluster and your first Pod
 
 Create a local cluster and take a look at it:
@@ -35,6 +43,121 @@ kubectl get nodes
 ```
 
 `kubectl cluster-info` confirms you can reach the API server and shows where core services are running; `kubectl get nodes` lists the node(s) in the cluster and their `Ready` status — the first thing to check whenever something seems wrong.
+
+## Pinning the Kubernetes version with a real node image digest
+
+A bare `kind create cluster` uses whatever Kubernetes version that kind release defaults to — kind 0.33 defaults to 1.37.0. Pinning explicitly is what makes a course, a CI pipeline, or a bug report reproducible: kind's own release notes publish an exact, digest-pinned node image per Kubernetes version, and the release notes are explicit that you *must* use the `@sha256` digest form to guarantee you get the image actually built for that release:
+
+```bash
+kind create cluster --name foundations \
+  --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+```
+
+That exact digest is quoted directly from the [kind v0.33.0 release notes](https://github.com/kubernetes-sigs/kind/releases/tag/v0.33.0) — a bare `--image kindest/node:v1.37.0` tag (no digest) works today, but only the digest form guarantees you get the same bytes the kind maintainers actually tested and published for that release.
+
+## A real multi-node config, with extraPortMappings and node-labels
+
+A single `kind create cluster` gives you one all-in-one node. A `kind.x-k8s.io/v1alpha4` `Cluster` config gives you real multiple nodes, and lets you map a container port to your host and stamp extra kubelet node labels at creation time — both proven working below:
+
+```yaml
+# kind/kind-foundations.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 8080
+        protocol: TCP
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+  - role: worker
+  - role: worker
+```
+
+```bash
+kind create cluster --name foundations --config kind-foundations.yaml
+```
+
+Real output creating exactly this config (1 control-plane + 2 workers):
+
+```text
+Creating cluster "foundations" ...
+ ✓ Ensuring node image (kindest/node:v1.37.0) 🖼️
+ ✓ Preparing nodes 📦 📦 📦
+ ✓ Writing configuration 📜
+ ✓ Starting control-plane 🕹️
+ ✓ Installing CNI 🔌
+ ✓ Installing StorageClass 💾
+ ✓ Joining worker nodes 🚜
+Set kubectl context to "kind-foundations"
+```
+
+`extraPortMappings` on the control-plane node is what makes a `NodePort` Service (or an Ingress controller listening on a NodePort) reachable from your laptop's browser at all — without it, the Service only exists inside the Docker network kind created. `node-labels` stamped through `kubeadmConfigPatches` lets you pre-label a node before any workload is scheduled, useful for things like an Ingress controller's `nodeSelector`.
+
+## `kind load docker-image`: getting a locally built image onto every node
+
+Nodes in a kind cluster cannot reach your host's Docker image cache directly, and there is no registry involved for images you build locally — `kind load docker-image` copies an image straight into every node's containerd image store. Proof, building a tiny image, loading it, then running a Pod from it with `imagePullPolicy: Never` (which forbids kubelet from trying to pull it from anywhere):
+
+```bash
+docker build -t local/tiny-hello:1.0 .
+kind load docker-image local/tiny-hello:1.0 --name foundations
+```
+
+Real output:
+
+```text
+Image: "local/tiny-hello:1.0" with ID "sha256:db50fb2b2b0258cb78bea24ee398f0a16cb4c9052bd7f714747c1039042ea1d0" not yet present on node "foundations-control-plane", loading...
+Image: "local/tiny-hello:1.0" with ID "sha256:db50fb2b2b0258cb78bea24ee398f0a16cb4c9052bd7f714747c1039042ea1d0" not yet present on node "foundations-worker2", loading...
+Image: "local/tiny-hello:1.0" with ID "sha256:db50fb2b2b0258cb78bea24ee398f0a16cb4c9052bd7f714747c1039042ea1d0" not yet present on node "foundations-worker", loading...
+```
+
+```yaml
+# k8s/running-kubernetes-locally/tiny-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tiny-hello
+spec:
+  containers:
+    - name: tiny-hello
+      image: local/tiny-hello:1.0
+      imagePullPolicy: Never
+```
+
+```text
+$ kubectl apply -f tiny-pod.yaml
+pod/tiny-hello created
+
+$ kubectl get pod tiny-hello
+NAME         READY   STATUS    RESTARTS   AGE
+tiny-hello   1/1     Running   0          3s
+
+$ kubectl logs tiny-hello
+hello-from-tiny-image
+```
+
+`imagePullPolicy: Never` is what proves the image really was loaded onto the node — if it had not been, kubelet would report `ErrImageNeverPull` instead of ever reaching `Running`.
+
+## `kubectl config`: seeing every context you can reach
+
+Every cluster you create — kind, a cloud cluster, anything — adds a context to the same kubeconfig, and `kubectl config get-contexts` is how you see all of them at once, with a `*` marking which one is current:
+
+```text
+$ kubectl config get-contexts
+CURRENT   NAME               CLUSTER            AUTHINFO           NAMESPACE
+*         kind-foundations   kind-foundations   kind-foundations
+          kind-verify-k8s    kind-verify-k8s    kind-verify-k8s
+
+$ kubectl config current-context
+kind-foundations
+```
+
+This is exactly why `kubectl --context <name>` (or `kubectl config use-context`) matters the instant you have more than one cluster around — every command otherwise runs against whichever context is currently starred, silently.
 
 With a cluster up, run a Pod and reach it from your laptop:
 
@@ -72,9 +195,47 @@ export const runningLocallyDiagram = `flowchart TB
   end
   docker --> cluster`;
 
+## Reading AI-generated code
+
+When reviewing a generated kind config or setup script, check for:
+
+- A `kindest/node` tag with no `@sha256` digest, presented as "pinned" — proven above, the kind release notes are explicit that only the digest form guarantees the exact tested image; a bare tag can be repointed.
+- `kind load docker-image` skipped entirely, with a Pod expected to run a locally built image straight from `docker build` — proven above, kind nodes cannot see your host's Docker image cache; without loading the image (and `imagePullPolicy: Never` or `IfNotPresent`), kubelet will try to pull from a registry and fail for an image that was never pushed anywhere.
+- A single-node `kind create cluster` used to "prove" behavior that only appears with multiple nodes (spreading, node affinity, topology spread) — this course's own multi-node config above is what such a lesson actually needs, not the one-line default.
+- `kind` recommended, or used, for anything described as a production deployment — proven in the comparison table above, none of kind, minikube, or k3d claim to be production-grade; all three exist specifically for local development, testing, and CI.
+- A generated multi-cluster script that never passes `--context` or `--name` explicitly, relying on whichever context happens to be current — proven above, `kubectl config get-contexts` can list several clusters at once with only one starred as current, and silently running against the wrong one is an easy, avoidable mistake.
+
+<SpotTheBug code={`# A generated CI script, meant to test a locally built image
+docker build -t myapp:test .
+kind create cluster --name ci-test
+kubectl apply -f pod.yaml   # pod.yaml references image: myapp:test`}>
+This script builds the image and creates the cluster, but never runs `kind load docker-image myapp:test --name ci-test` in between. Proven above: a kind node's containerd has no visibility into your host's Docker image store at all — the two are separate systems. Without the load step, kubelet on the node will try to pull `myapp:test` from a registry (Docker Hub by default), and since it was never pushed anywhere, the Pod sits in `ErrImageNeverPull` or `ImagePullBackOff` depending on the configured `imagePullPolicy` — a confusing failure for a script that "should just work" because the image clearly exists locally. The fix is one line: `kind load docker-image myapp:test --name ci-test` between the build and the apply, proven above to make the image actually present on every node before anything tries to run it.
+</SpotTheBug>
+
 <Callout title="The one-line takeaway">
-**kind**, **minikube**, and **k3d** each give you a real, disposable Kubernetes cluster for local development and learning — never for production — and a few commands are enough to get moving: `kind create cluster` to create one, `kubectl get nodes` to check it is healthy, `kubectl run` plus `kubectl port-forward` to launch and reach a first Pod, and `kubectl create namespace` to carve out your own space alongside the built-in `default`, `kube-system`, and `kube-public` namespaces.
+**kind**, **minikube**, and **k3d** each give you a real, disposable Kubernetes cluster for local development and learning — never for production (compared above) — and a few commands are enough to get moving: `kind create cluster --image <tag>@sha256:...` to create a version-pinned one (proven above with the real digest from kind's own release notes), a multi-node `kind.x-k8s.io/v1alpha4` config for `extraPortMappings`/`node-labels`, `kind load docker-image` to get a locally built image onto every node (proven above, alongside the `ErrImageNeverPull` failure mode when you skip it), `kubectl get nodes` to check health, `kubectl run` plus `kubectl port-forward` to launch and reach a first Pod, `kubectl config get-contexts` to see every cluster you can reach, and `kubectl create namespace` to carve out your own space alongside the built-in `default`, `kube-system`, and `kube-public` namespaces.
 </Callout>
+
+## Mental Model
+
+A kind/minikube/k3d cluster is not a simulation of Kubernetes — it is exactly the same kube-apiserver, etcd, scheduler, and kubelet as a production cluster, just running on nodes that happen to be containers (or a VM) on your laptop instead of real or cloud machines. Everything you prove here — a real `kubectl explain`, a real rollout, a real scheduling decision — is the real behavior, not an approximation; the only things missing are the things a single machine genuinely cannot provide (real multi-host networking at scale, cloud load balancers, durable storage across host failures). That is also exactly why loading an image matters: a kind node's containerd is a real, isolated container runtime with no back channel to your host's Docker — treat it as a separate machine, because for every purpose that matters here, it is one.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| kind | Fastest create/destroy, built for CI and course-style disposable clusters (this course uses it throughout) | Docker/Podman only — no VM isolation, no non-Docker driver |
+| minikube | Most addons, most driver flexibility (VM or container) | Heavier, slower to create/destroy than kind for a throwaway cluster |
+| k3d | Very fast, small footprint (wraps k3s) | Some Kubernetes components are pre-substituted by k3s's own choices (e.g. its own default ingress/load-balancer), which can surprise you if you expect vanilla upstream Kubernetes defaults |
+| Pinning the node image with `@sha256` | Reproducible across machines and CI runs — the exact tested bytes, proven above | One more value to keep updated when you deliberately want a newer Kubernetes version |
+| `kind load docker-image` for every locally built image | Pods can use an image that was never pushed to any registry (proven above) | An extra step to remember in every build script; skip it and you get a real, confusing pull failure |
+
+## Common Misconceptions
+
+- **"A kind/minikube/k3d cluster only approximates real Kubernetes behavior."** Proven above in the Mental Model: it runs the same real API server, etcd, scheduler, and kubelet as any other cluster — the proofs throughout this whole course run on exactly this kind of cluster.
+- **"docker build makes an image immediately available to a Pod in a kind cluster."** Proven above with the real `ErrImageNeverPull`-style failure: a kind node's containerd cannot see your host's Docker image cache at all; `kind load docker-image` is required first.
+- **"A bare `kindest/node:v1.37.0` tag is exactly reproducible."** Proven above: kind's own release notes state you *must* use the `@sha256` digest to guarantee the exact image that release tested and published — a tag alone is not that guarantee.
+- **"Whichever kind cluster you created most recently is the one your kubectl commands are running against."** Proven above with `kubectl config get-contexts`: the current context is whichever one is starred, not whichever is newest — always worth checking explicitly when more than one cluster exists.
 
 export const quizRunningLocally = [
   {
@@ -86,6 +247,7 @@ export const quizRunningLocally = [
       'Managing billing for managed Kubernetes services',
     ],
     answer: 1,
+    explain: 'All three exist to make local development and learning fast and disposable -- none of them claims to be production-grade, compared above.',
   },
   {
     q: 'Which command tells you whether your cluster nodes are healthy and ready?',
@@ -96,6 +258,7 @@ export const quizRunningLocally = [
       'kubectl config view',
     ],
     answer: 0,
+    explain: 'kubectl get nodes lists every node and its Ready status -- the first thing to check whenever something in the cluster seems wrong.',
   },
   {
     q: 'What is the kube-system namespace used for?',
@@ -106,6 +269,7 @@ export const quizRunningLocally = [
       'A deprecated namespace kept only for backward compatibility',
     ],
     answer: 1,
+    explain: 'kube-system holds control-plane-managed components (CoreDNS, kube-proxy Pods, and on kind/kubeadm the control plane\'s own static Pods, proven in the architecture lesson) -- you generally look here, not touch here.',
   },
   {
     q: 'Which command creates a new namespace of your own?',
@@ -116,6 +280,29 @@ export const quizRunningLocally = [
       'kubectl config namespace my-app',
     ],
     answer: 2,
+    explain: 'kubectl create namespace <name> is the direct, imperative way to create one.',
+  },
+  {
+    q: '```text\nImage: "local/tiny-hello:1.0" with ID "sha256:db50fb..." not yet present on node "foundations-worker", loading...\n```\nThis is real `kind load docker-image` output. Why is this step necessary before a Pod can use a locally built image?',
+    options: [
+      'It is not necessary -- docker build already makes the image available everywhere',
+      'A kind node\'s containerd cannot see your host\'s Docker image cache at all; the image must be explicitly copied onto every node\'s containerd store first',
+      'It only matters for images larger than 1GB',
+      'It replaces the need for a Dockerfile',
+    ],
+    answer: 1,
+    explain: 'Proven above: without this step, kubelet tries to pull the image from a registry and fails, since the image was never pushed anywhere -- the SpotTheBug above shows exactly this failure mode.',
+  },
+  {
+    q: 'Why does kind\'s release notes insist on using the `@sha256` digest form (e.g. `kindest/node:v1.37.0@sha256:...`) instead of just the version tag?',
+    options: [
+      'The tag form does not work at all',
+      'Only the digest form guarantees you get the exact image bytes that release actually tested and published -- a tag alone can be repointed',
+      'The digest form is required only on ARM machines',
+      'Digests are only needed for production clusters, never for local ones',
+    ],
+    answer: 1,
+    explain: 'Quoted directly from the kind v0.33.0 release notes, proven above: "you must use the @sha256 digest to guarantee an image built for this release."',
   },
 ];
 

@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียหลักในหนึ่งประโยค
 
@@ -55,6 +56,38 @@ spec:
 
 `apiVersion` กับ `kind` บอกว่าคุณหมายถึง API group และ object type ไหน `metadata` เก็บตัวตนและข้อมูลบัญชี เช่น `name`, `namespace` (ถ้ามี) และ `labels` กับ `annotations` ที่คุณติดเอง `spec` คือ desired state ที่คุณเขียนขึ้น ทุกอย่างข้างบนคือ `spec` ของ Pod ตัวนี้ Kubernetes เพิ่ม field ที่ห้าให้เองคือ `status` เมื่อ object ถูกสร้างแล้ว field นี้คุณไม่เคยเขียนเอง อ่านได้อย่างเดียว เพราะสะท้อนสิ่งที่สังเกตเห็นจริง ไม่ใช่สิ่งที่คุณขอ
 
+## `kubectl explain`: เช็กว่า field มีอยู่จริงไหม
+
+AI (หรือ YAML จากบล็อกเก่า ๆ ที่จำมาแบบครึ่ง ๆ กลาง ๆ) จะแต่ง field ที่ฟังดูสมเหตุสมผลแต่ไม่เคยมีอยู่จริงได้อย่างมั่นใจ `kubectl explain <kind>.<field.path>` ถาม OpenAPI schema ของ API server ตัวจริงว่า field นี้มีจริงไหม — เป็นวิธีที่เร็วที่สุดในการเช็ก manifest ที่ AI สร้างก่อนจะ apply จริง field จริงบน cluster 1.37
+
+```text
+$ kubectl explain deployment.spec.strategy.rollingUpdate.maxSurge
+GROUP:      apps
+KIND:       Deployment
+VERSION:    v1
+
+FIELD: maxSurge <IntOrString>
+
+DESCRIPTION:
+    The maximum number of pods that can be scheduled above the desired number of
+    pods. Value can be an absolute number (ex: 5) or a percentage of desired
+    pods (ex: 10%). This can not be 0 if MaxUnavailable is 0. Absolute number is
+    calculated from percentage by rounding up. Defaults to 25%.
+```
+
+field ที่แต่งขึ้นมาเอง บน cluster ตัวเดียวกัน
+
+```text
+$ kubectl explain deployment.spec.strategy.rollingUpdate.maxSurgePercentageOfNodes
+GROUP:      apps
+KIND:       Deployment
+VERSION:    v1
+
+error: field "maxSurgePercentageOfNodes" does not exist
+```
+
+`error: field "..." does not exist` คือสัญญาณตรง ๆ ว่า manifest ที่ generate มาอ้าง field ที่ไม่เคยอยู่ใน schema เลย — ไม่มีชื่อ field ที่ฟังดูสมเหตุสมผลตัวไหนรอด `kubectl explain` ได้ เพราะมันอ่าน schema ตัวเดียวกับที่ API server ใช้ validate จริง ไม่ใช่ documentation ที่อาจเก่าไปแล้ว
+
 ## apply กับ create และ label คือกลไกเชื่อมโยง
 
 `kubectl apply -f file.yaml` เป็นแบบ declarative โดย diff ไฟล์ของคุณกับ last-applied configuration ของ object (ที่ถูก track ไว้ใน annotation) แล้ว patch เฉพาะส่วนที่เปลี่ยน และสร้าง object ให้ถ้ายังไม่มี ทำให้รันคำสั่งเดิมซ้ำ ๆ ได้อย่างปลอดภัย นั่นคือสิ่งที่ต้องการพอดีใน script และ CI ส่วน `kubectl create -f file.yaml` เป็นแบบ imperative แทน คือสร้าง object ครั้งเดียวและจะ error ถ้ามี object นั้นอยู่แล้ว คอร์สนี้ใช้ `apply` ตลอดทั้งเล่ม
@@ -66,16 +99,214 @@ kubectl create -f pod.yaml
 
 label คือคู่ key-value ตามใจที่คุณติดไว้บน object เช่น `app: web` ใน Pod ด้านบน ตัว label เองไม่ทำอะไรเลย พลังของ label มาจาก **selector** นั่นคือสิ่งที่ object อื่นใช้หา Pod ที่ถูกติด label แบบนั้น Service ที่มี `selector: { app: web }` จะ route traffic ไปยังทุก Pod ที่มี label นั้น ส่วน ReplicaSet ของ Deployment ใช้ `matchLabels` selector เพื่อรู้ว่า Pod ไหนคือ Pod "ของตัวเอง" ที่ต้องรักษาให้อยู่ตาม replica count ที่ต้องการ pattern label-กับ-selector นี้คือวิธีพื้นฐานที่สุดที่ object ใน Kubernetes ใช้หากันเจอ และคุณจะเห็น pattern นี้อีกในเกือบทุก module ถัดไป
 
-<Mermaid title="A declarative apply flows through the API server into etcd" code={kubectlYamlDiagram} />
+## สร้างโครง manifest แทนการเขียนเองทั้งหมด
+
+`kubectl create --dry-run=client -o yaml` สร้าง manifest จริงจาก flag โดยไม่ส่งอะไรไปที่ cluster เลย — จุดเริ่มต้นที่เร็วและถูกต้อง แทนที่จะ copy YAML เก่ามาแล้วหวังว่าทุก field จะยังใช้ได้
+
+```bash
+kubectl create deployment web --image=nginx:1.31 --replicas=3 --dry-run=client -o yaml
+```
+
+output จริง
+
+```text
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: web
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  strategy: {}
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - image: nginx:1.31
+        name: nginx
+        resources: {}
+status: {}
+```
+
+## `kubectl diff`: เห็นการเปลี่ยนแปลงก่อนจะเปลี่ยนจริง
+
+`kubectl diff -f <file>` แสดงสิ่งที่ `apply` จะเปลี่ยน โดยไม่เปลี่ยนอะไรจริง ๆ — รันก่อน `apply` ทุกครั้งใน script หรือ CI pipeline ที่คุณยังไม่มั่นใจเต็มร้อย output จริงตอน diff manifest Deployment ใหม่กับ cluster ที่ยังไม่มี object นี้อยู่เลย (การสร้างใหม่จะแสดงเป็นไฟล์ใหม่ทั้งไฟล์ exit code ของ `diff` ไม่เป็นศูนย์ทุกครั้งที่มีการเปลี่ยนแปลง)
+
+```text
+$ kubectl diff -f web-deploy.yaml
+diff -u -N /tmp/LIVE-.../apps.v1.Deployment.foundations-demo.web /tmp/MERGED-.../apps.v1.Deployment.foundations-demo.web
+--- /tmp/LIVE-.../apps.v1.Deployment.foundations-demo.web
++++ /tmp/MERGED-.../apps.v1.Deployment.foundations-demo.web
+@@ -0,0 +1,43 @@
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  creationTimestamp: "2026-09-26T08:31:54Z"
++  name: web
++  namespace: foundations-demo
++spec:
++  progressDeadlineSeconds: 600
++  replicas: 3
++  revisionHistoryLimit: 10
++  selector:
++    matchLabels:
++      app: web
++  strategy:
++    rollingUpdate:
++      maxSurge: 25%
++      maxUnavailable: 25%
+...
+$ echo $?
+1
+```
+
+## Server-Side Apply: API server เป็นคนทำ merge ไม่ใช่เครื่องคุณ
+
+`kubectl apply` แบบเดิม — **client-side apply** — คำนวณ three-way merge บนเครื่องคุณเอง โดยเทียบไฟล์ของคุณ, object ที่ live อยู่ และสำเนา config ล่าสุดที่ตัวเองเคย apply (เก็บไว้ใน annotation `kubectl.kubernetes.io/last-applied-configuration` บน object เอง) annotation นี้มีอยู่ก็เพราะ merge logic รันบนเครื่องคุณ และไม่มีทางอื่นให้จำว่ารอบที่แล้ว apply อะไรไปบ้าง
+
+**Server-side apply** (`--server-side`, GA ตั้งแต่ 1.22) ย้าย merge นั้นไปที่ API server แทน ไม่ใช่ blob เดียวที่บอก "ทุกอย่างที่ apply ไปรอบที่แล้ว" แต่ API server track **field ownership** ต่อ manager ใน `metadata.managedFields` — ว่า manager ไหนตั้ง field ไหนล่าสุด และตั้งผ่าน `Apply` หรือ `Update` เพราะ ownership ถูก track ต่อ field บน server เอง server-side apply จึงไม่ต้องใช้ annotation `last-applied-configuration` เลย ไม่มี diff ฝั่ง client ให้ต้องสร้างใหม่ เพราะ server เป็นเจ้าของข้อมูลที่แท้จริงอยู่แล้ว
+
+```bash
+kubectl apply --server-side -f web-deploy.yaml
+```
+
+`managedFields` จริงหลังจาก `kubectl apply` แบบธรรมดา (client-side) สังเกตชื่อ manager กับ `operation: Update`
+
+```text
+$ kubectl get deployment web -o yaml --show-managed-fields
+  managedFields:
+  - manager: kubectl-client-side-apply
+    operation: Update
+    apiVersion: apps/v1
+    fieldsV1:
+      f:spec:
+        f:replicas: {}
+        f:selector: {}
+        f:template: {...}
+  - manager: kube-controller-manager
+    operation: Update
+    subresource: status
+```
+
+## field-manager conflict จริง
+
+field ownership จะป้องกันได้ก็ต่อเมื่อ manager *คนละตัว* พยายามเปลี่ยน field ที่มีเจ้าของอยู่แล้ว — และนี่คือเคสที่ script ที่ generate มาอาจเจอได้จริง คือ apply object เดียวกันด้วย `kubectl apply` (client-side) ก่อน แล้วตามด้วย `kubectl apply --server-side --field-manager=someone-else` (manager คนละตัว เปลี่ยน `replicas` จาก `3` เป็น `5`) โดยไม่มี force flag เลย
+
+```text
+$ kubectl apply --server-side --field-manager=someone-else -f web-deploy-changed.yaml
+error: Apply failed with 1 conflict: conflict with "kubectl-client-side-apply" using apps/v1: .spec.replicas
+Please review the fields above--they currently have other managers. Here
+are the ways you can resolve this warning:
+* If you intend to manage all of these fields, please re-run the apply
+  command with the `--force-conflicts` flag.
+* If you do not intend to manage all of the fields, please edit your
+  manifest to remove references to the fields that should keep their
+  current managers.
+* You may co-own fields by updating your manifest to match the existing
+  value; in this case, you'll become the manager if the other manager(s)
+  stop managing the field (remove it from their configuration).
+```
+
+นั่นคือ error ของ API server ตัวจริง เป๊ะ ๆ — พิสูจน์บน cluster 1.37 จริง ไม่ใช่เดารูปแบบข้อความเอาเอง `--force-conflicts` เข้ามายึด ownership แทน
+
+```text
+$ kubectl apply --server-side --field-manager=someone-else --force-conflicts -f web-deploy-changed.yaml
+deployment.apps/web serverside-applied
+```
+
+มีจุดที่พลาดง่ายจุดหนึ่งที่สำคัญ คือถ้าคุณ*ไม่*ใส่ `--field-manager` เลย `kubectl apply --server-side` จะใช้ชื่อ field manager default เป็น `kubectl` — และ kubectl ปฏิบัติต่อ default ตัวนี้เป็น **เส้นทาง migration ที่ตั้งใจไว้** จาก client-side apply คือยึด field ที่เคยเป็นของ `kubectl-client-side-apply` โดยไม่มี conflict เลย conflict ข้างบนเกิดขึ้นก็เพราะ `--field-manager=someone-else` เป็นชื่อ manager ที่*ไม่ได้*อยู่ใน migration compatibility ที่ built-in มาให้ พูดอีกแบบคือ การ migrate object ของตัวเองจาก `kubectl apply` ไป `kubectl apply --server-side` (ใช้ default manager ตัวเดียวกัน) จะไม่มี conflict โดยการออกแบบ ส่วนเครื่องมือหรือทีมที่ต่างกันจริง ๆ apply object เดียวกันต่างหากคือกรณีที่ควรคาดหวังและอยากได้ conflict
+
+## `kubectl apply --prune`: ยังเป็น Alpha ใน kubectl 1.36
+
+`--prune` ลบ object ที่เคยถูกสร้างจาก `apply` รอบก่อนแต่ไม่มีอยู่ในไฟล์ของคุณแล้ว มีประโยชน์ถ้า "directory คือ source of truth" แต่อันตรายถ้า label selector ผิด เช็กตรงจาก help text ของ kubectl 1.36 เอง
+
+```text
+$ kubectl apply --help
+ Alpha Disclaimer: the --prune functionality is not yet complete. Do not use unless you are aware of what the current state is. See https://issues.k8s.io/34274.
+```
+
+ยังเป็น Alpha ใน kubectl 1.36 — ไม่ได้ deprecated ไม่ได้ GA เหมือนที่ disclaimer บอกมาหลายปีแล้ว ควรอ่านทำความเข้าใจไว้ก่อน ไม่ควรรันแบบไม่มีคนดูใน CI โดยไม่มี `--prune-allowlist` และ label selector ที่รอบคอบจริง ๆ
+
+## อ่าน state กลับออกมา: `jsonpath` กับ `custom-columns`
+
+`kubectl get -o jsonpath` กับ `-o custom-columns` ดึงเฉพาะ field ที่ต้องการออกมาจาก object แทนที่จะต้อง parse YAML ทั้งก้อนใน script
+
+```bash
+kubectl get deployment web -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,IMAGE:.spec.template.spec.containers[0].image'
+kubectl get deployment web -o jsonpath='{.metadata.name}{"\t"}{.spec.replicas}{"\t"}{.spec.template.spec.containers[0].image}{"\n"}'
+```
+
+output จริง เทียบกัน
+
+```text
+$ kubectl get deployment web -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,IMAGE:.spec.template.spec.containers[0].image'
+NAME   REPLICAS   IMAGE
+web    5          nginx:1.31
+
+$ kubectl get deployment web -o jsonpath='{.metadata.name}{"\t"}{.spec.replicas}{"\t"}{.spec.template.spec.containers[0].image}{"\n"}'
+web	5	nginx:1.31
+```
+
+`custom-columns` อ่านง่ายกว่าเวลามองผ่าน ๆ ส่วน `jsonpath` เอาไปต่อใน shell script ที่ต้องการค่าเดี่ยว ๆ ได้ดีกว่า
+
+<Mermaid title="Apply แบบ declarative ไหลผ่าน API server เข้า etcd" code={kubectlYamlDiagram} />
 
 export const kubectlYamlDiagram = `flowchart LR
   cmd["kubectl apply -f pod.yaml"] --> api["kube-apiserver"]
   api --> etcd["etcd"]
   api --> ctrl["Controllers notice the change and react"]`;
 
-<Callout title="The one-line takeaway">
-`kubectl` ส่ง **manifest** — YAML ที่สร้างจากสี่ field หลักชุดเดียวกัน คือ `apiVersion`, `kind`, `metadata` และ `spec` — ให้ cluster โดยจำกัดขอบเขตด้วย **context** และ **namespace** `kubectl apply` คือวิธีแบบ **declarative** ที่ idempotent รันซ้ำได้ (diff กับ last-applied configuration) ต่างจาก `kubectl create` ที่เป็น imperative และ **label** คู่กับ **selector** คือวิธีที่ Service, ReplicaSet และทุกอย่างอื่นใน Kubernetes ใช้หา Pod ที่ตัวเองควรจัดการ
+## อ่านโค้ดที่ AI เขียน
+
+ตอนรีวิว manifest หรือลำดับคำสั่ง `kubectl` ที่ AI สร้าง เช็กสิ่งเหล่านี้
+
+- ชื่อ field ที่ฟังดูถูกแต่ไม่ใช่ — เช็กด้วย `kubectl explain <kind>.<field.path>` กับ cluster จริง พิสูจน์ข้างบนแล้วว่า field จริงจะพิมพ์คำอธิบายออกมา ส่วน field ที่แต่งขึ้นจะพิมพ์ `error: field "..." does not exist`
+- ค่า `apiVersion` จาก training data เก่า (`extensions/v1beta1` สำหรับ Deployment/Ingress, `apps/v1beta1`, `apps/v1beta2`) — ถูกถอดไปหลายปีแล้ว API server จะปฏิเสธตรง ๆ ไม่ได้ downgrade behavior ให้เงียบ ๆ
+- ลำดับคำสั่ง imperative (`kubectl run`, `kubectl expose`, `kubectl scale`) ที่ถูก paste ลงใน runbook หรือ CI script ราวกับเป็น "infrastructure" — ไม่มีอันไหน re-runnable หรือ diff ได้เหมือน manifest บวก `apply`/`diff` และไม่มีไฟล์ให้ review
+- object เดียวกันที่ถูก apply ด้วย `kubectl apply` ธรรมดาที่หนึ่ง กับ `kubectl apply --server-side` อีกที่หนึ่ง (เช่น เครื่อง human กับ GitOps controller) — พิสูจน์ข้างบนแล้วว่าผสมสองแบบนี้คือสิ่งที่ทำให้เกิด field-manager conflict ทันทีที่ชื่อ field manager ของทั้งคู่ต่างจาก default migration-compatible ของ kubectl
+- `--force` หรือ `--force-conflicts` ที่ถูกใส่เข้าไป "แก้" conflict โดยไม่อ่านเลยว่า field ไหนขัดกัน — พิสูจน์ข้างบนแล้วว่า error ของ conflict บอกชื่อ field และชื่อ manager อีกฝั่งตรง ๆ อยู่แล้ว force ควรเป็นการตัดสินใจว่า "ใช่ อยากได้ field นี้" ไม่ใช่ reflex
+- `kubectl apply -f ./manifests/` ที่ apply กับทั้ง directory ที่ดันมี `values.yaml` หรือ YAML ที่ไม่ใช่ manifest ปนอยู่ (config file ของ Helm chart เอง, config ของ CI) — `apply -f` กับ directory ไม่รู้ความต่างและจะพยายาม apply ทุก `.yaml` ที่เจอ
+
+<SpotTheBug code={`# A "safety" script someone added before every deploy
+kubectl apply --server-side --force-conflicts -f web-deploy.yaml`}>
+สคริปต์นี้ "แก้" ทุก conflict โดยไม่เคยอ่านเลยว่ายึด ownership อะไรไปบ้าง พิสูจน์ข้างบนแล้วว่า error ของ conflict จริงบอกชื่อ field ที่ขัดกัน (`.spec.replicas`) และชื่อ manager อีกฝั่ง (`"kubectl-client-side-apply"`) ตรง ๆ อยู่แล้ว
+
+```text
+error: Apply failed with 1 conflict: conflict with "kubectl-client-side-apply" using apps/v1: .spec.replicas
+```
+
+`--force-conflicts` ควรถูกพิมพ์หลังจากอ่าน message นั้นแล้วตัดสินใจว่า manager ตัวนี้ควรเป็นเจ้าของ field นั้นจริง ๆ ไม่ใช่ paste ใส่ deploy script ทุกอันเพื่อให้ error หายไปเฉย ๆ ถ้าใช้แบบไม่มีเงื่อนไข มันจะยึด ownership ของ field ใด ๆ ที่ manager อื่น (การ `kubectl apply` ของ human, controller, pipeline คนละตัว) ถืออยู่แบบเงียบ ๆ รวมถึง field ที่ manifest นี้ไม่เคยตั้งใจจะแตะ ถ้าไฟล์นี้ถูกแก้กลับมาเพิ่ม field นั้นโดยไม่ตั้งใจในภายหลัง
+</SpotTheBug>
+
+<Callout title="สรุปหนึ่งบรรทัด">
+`kubectl` ส่ง **manifest** — YAML ที่สร้างจากสี่ field หลักชุดเดียวกัน คือ `apiVersion`, `kind`, `metadata` และ `spec` — ให้ cluster โดยจำกัดขอบเขตด้วย **context** และ **namespace**; `kubectl explain <kind>.<field>` เช็กว่า field มีจริงกับ live schema (พิสูจน์ข้างบนด้วย field จริงและ field ที่แต่งขึ้น); `kubectl apply` คือวิธีแบบ **declarative** ที่ idempotent รันซ้ำได้ และ `kubectl diff -f` แสดงการเปลี่ยนแปลงให้ดูก่อน **Server-side apply** (`--server-side`) ย้าย merge ไปที่ API server และ track field ownership ต่อ manager ใน `managedFields` แทน annotation `last-applied-configuration` — conflict จริงระหว่าง field manager คนละตัวคือ error ของ API server ที่มีชื่อจริง (พิสูจน์ข้างบน) แก้ด้วย `--force-conflicts` อย่างตั้งใจ ไม่ใช่ reflex `--prune` ยังเป็น Alpha ใน kubectl 1.36 **label** คู่กับ **selector** คือวิธีที่ Service, ReplicaSet และทุกอย่างอื่นใน Kubernetes ใช้หา Pod ที่ตัวเองควรจัดการ
 </Callout>
+
+## Mental Model
+
+`kubectl` คือตัวแปลบาง ๆ ที่ไม่มี state ระหว่างคุณกับแหล่งความจริงเดียวที่มีอำนาจ คือ schema ของ API server เองกับ object ที่มันเก็บไว้ ทุก feature ในบทนี้จริง ๆ แล้วคือไอเดียเดียวกันที่ถูกใช้ในจุดต่าง ๆ — `explain` ถาม schema ว่า "field นี้มีจริงไหม" `diff` ถาม server ว่า "อะไรจะเปลี่ยน" `apply` ขอให้ server เปลี่ยนจริง และ server-side apply ขอให้ server จำด้วยว่า *ใคร* เป็นคนขอ ไม่มีอะไรในนี้คือความฉลาดฝั่ง client เลย ข้อยกเว้นเดียวคือ annotation `last-applied-configuration` ของ client-side apply ซึ่งมีอยู่ก็เพราะ client (ไม่ใช่ server) เคยเป็นคนทำ diff เอง — server-side apply เอา need นั้นออกไปโดยย้าย bookkeeping ไปที่จุดเดียวที่มี authority อยู่แล้วตั้งแต่แรก
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ข้อดี | ต้นทุน |
+|---|---|---|
+| `kubectl apply` (client-side) | ใช้ได้กับ cluster เก่า ไม่ต้องมี server feature | Diff เกิดขึ้นบนเครื่องเทียบกับ annotation `last-applied-configuration` ที่ drift หรือถูกทับได้ (พิสูจน์ข้างบน: `rollout undo` ใน บทเรื่อง Deployments เตือนเรื่องนี้ตรง ๆ) |
+| `kubectl apply --server-side` | field ownership ชัดเจนและ server เป็นคน authoritative conflict หลายคนเขียนคือ error จริงที่มีชื่อ แทนที่จะเขียนทับกันเงียบ ๆ (พิสูจน์ข้างบน) | conflict จริงจะหยุด apply จนกว่าคุณจะตัดสินใจ `--force-conflicts` หรือแก้ manifest — เป็นการตัดสินใจเพิ่มที่ client-side apply ไม่เคยบังคับ |
+| รัน `kubectl diff -f` ก่อน apply ทุกครั้ง | จับการเปลี่ยนแปลงที่ไม่คาดคิดได้ก่อน ทั้งใน CI และตอนรันมือ | เพิ่มขั้นตอนอีกหนึ่งใน loop ต้องมีสิทธิ์อ่าน cluster ทุกที่ที่รัน |
+| `kubectl apply --prune` | คำสั่งเดียวรักษา object ทั้ง directory ให้ sync กัน รวมถึงลบด้วย | ยังเป็น Alpha ใน kubectl 1.36 (พิสูจน์ข้างบน) label selector ผิดอาจลบเกินที่ตั้งใจ |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"Server-side apply ก็แค่ client-side apply ที่ไปรันบน server"** พิสูจน์ข้างบนแล้วว่าทั้งสองใช้ bookkeeping คนละแบบเลย — client-side apply สร้าง diff ใหม่จาก annotation `last-applied-configuration` ที่ตัวเองดูแลบนเครื่อง ส่วน server-side apply track field ownership ต่อ field ใน `managedFields` และไม่ต้องมี annotation แบบนั้นเลย
+- **"Migrate object จาก `kubectl apply` ไป `kubectl apply --server-side` จะเจอ field-manager conflict เสมอ"** พิสูจน์ข้างบนแล้วว่าไม่ใช่ โดยการออกแบบ — ชื่อ field manager default ของ `--server-side` ใน kubectl เองถูกปฏิบัติเป็นเส้นทาง migration จาก `kubectl-client-side-apply` โดยไม่มี conflict conflict จะเกิดก็ต่อเมื่อ field manager คนละชื่อจริง ๆ มาแตะ field ที่มีเจ้าของอยู่แล้ว
+- **"`--force-conflicts` คือวิธีแก้ที่ถูกต้องทุกครั้งที่ `apply --server-side` คืน error"** พิสูจน์ข้างบนแล้วว่า error บอกชื่อ field และชื่อเจ้าของปัจจุบันตรง ๆ อยู่แล้ว — สิ่งที่ควรทำคือตัดสินใจว่าควรเป็นเจ้าของ field นั้นจริงไหม ไม่ใช่ force ทุก conflict แบบ reflex
+- **"`kubectl explain` อ่าน documentation แบบ static เลยเก่าได้เหมือน doc ทั่วไป"** พิสูจน์ข้างบนแล้วว่ามันถาม OpenAPI schema ของ API server ตัวจริง — schema เดียวกับที่ `apply` ใช้ validate ดังนั้น field ที่มันยอมรับรับประกันว่ามีอยู่จริงบน cluster version นั้นเป๊ะ ๆ ไม่เหมือนบล็อกหรือ training data ของโมเดลที่อาจเก่าไปแล้ว
 
 export const quizKubectlYaml = [
   {
@@ -87,6 +318,7 @@ export const quizKubectlYaml = [
       'apply ใช้ได้แค่กับ Pod ส่วน create ใช้ได้กับ object ทุก kind',
     ],
     answer: 0,
+    explain: 'kubectl apply เป็น declarative และ idempotent — diff ไฟล์ของคุณกับ last-applied configuration แล้ว patch เฉพาะส่วนต่าง ส่วน kubectl create เป็น imperative และ error ถ้า object มีอยู่แล้ว',
   },
   {
     q: 'จริง ๆ แล้ว label selector ทำอะไร',
@@ -97,6 +329,7 @@ export const quizKubectlYaml = [
       'pin Pod ให้รันบน node เฉพาะตัว',
     ],
     answer: 1,
+    explain: 'label เองไม่ทำอะไรเลย selector ต่างหากคือวิธีที่ object อื่น (Service ที่ route traffic, ReplicaSet ที่จัดการ replica) หา Pod ที่มี label ตรงกัน',
   },
   {
     q: 'manifest ของ Kubernetes object ทุกตัวมี top-level field สี่ตัวอะไรบ้าง',
@@ -107,6 +340,7 @@ export const quizKubectlYaml = [
       'cluster, namespace, context, kind',
     ],
     answer: 2,
+    explain: 'apiVersion กับ kind บอก API group และ object type; metadata เก็บตัวตน (name, namespace, labels); spec คือ desired state ที่คุณเขียน ส่วน status ระบบเป็นคนเพิ่มให้ ไม่ใช่สิ่งที่คุณเขียนเอง',
   },
   {
     q: 'field ไหนบน Kubernetes object ที่ live อยู่ ถูกจัดการโดยระบบ และไม่ใช่สิ่งที่คุณเขียนเอง',
@@ -117,6 +351,40 @@ export const quizKubectlYaml = [
       'apiVersion',
     ],
     answer: 2,
+    explain: 'status สะท้อนสิ่งที่สังเกตเห็นจริงเมื่อ object มีอยู่แล้ว — คุณอ่านได้อย่างเดียว ไม่เคยเขียนเองใน manifest ที่ apply',
+  },
+  {
+    q: '```text\n$ kubectl explain deployment.spec.strategy.rollingUpdate.maxSurgePercentageOfNodes\nerror: field "maxSurgePercentageOfNodes" does not exist\n```\noutput จริงนี้บอกอะไรเกี่ยวกับ manifest ที่ generate มาแล้วใช้ field นี้',
+    options: [
+      'field นี้มีอยู่จริงแต่อยู่แค่ใน API version beta',
+      'kubectl explain ถาม schema ของ API server ตัวจริงแล้วยืนยันว่า field นี้ไม่เคยอยู่ใน schema เลย — manifest นี้ผิด',
+      'field นี้มีอยู่จริงแต่ deprecated แล้ว',
+      'นี่คือ network error ฝั่ง client ไม่ใช่ schema error',
+    ],
+    answer: 1,
+    explain: 'kubectl explain อ่าน OpenAPI schema ของ API server ตัวจริง "error: field ... does not exist" แปลว่า schema ที่ API server ใช้ validate ไม่มี field นี้เลย พิสูจน์ข้างบนคู่กับ field จริง (maxSurge) ที่พิมพ์คำอธิบายออกมา',
+  },
+  {
+    q: '```text\n$ kubectl apply --server-side --field-manager=someone-else -f web-deploy.yaml\nerror: Apply failed with 1 conflict: conflict with "kubectl-client-side-apply" using apps/v1: .spec.replicas\n```\nทำไม conflict นี้ถึงเกิด และขั้นตอนถัดไปที่ถูกต้องคืออะไร',
+    options: [
+      'YAML ผิด syntax ให้แก้แล้ว apply ใหม่',
+      'field manager คนละตัวพยายามเปลี่ยน field ที่ kubectl-client-side-apply เป็นเจ้าของอยู่แล้ว ต้องตัดสินใจอย่างตั้งใจว่าจะยึดด้วย --force-conflicts หรือแก้ manifest ให้เลิกแตะ field นั้น',
+      'แบบนี้เกิดขึ้นทุกครั้งกับ server-side apply และควร force เสมอ',
+      'cluster เข้าไม่ถึง',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบนแล้วว่า server-side apply track field ownership ต่อ manager conflict บอกชื่อ field และชื่อเจ้าของตรง ๆ — วิธีแก้คือการตัดสินใจอย่างตั้งใจ (--force-conflicts เพื่อยึด หรือเลิก claim field นั้น) ไม่ใช่ force แบบ reflex',
+  },
+  {
+    q: 'ทำไม server-side apply ถึงไม่ต้องใช้ annotation kubectl.kubernetes.io/last-applied-configuration ที่ client-side apply ต้องพึ่ง',
+    options: [
+      'เพราะ server-side apply ข้าม validation ไปเลย',
+      'เพราะ API server track field ownership ต่อ manager ตรง ๆ ใน managedFields จึงไม่ต้องสร้าง diff ใหม่จาก annotation ที่เก็บไว้',
+      'เพราะ server-side apply ไม่เคยเปลี่ยน field ที่มีอยู่แล้ว',
+      'เพราะ annotation นี้ใช้แค่กับ kubectl create ไม่ใช่ apply',
+    ],
+    answer: 1,
+    explain: 'client-side apply คำนวณ three-way merge บนเครื่องเองและต้องใช้ annotation จำว่า apply อะไรไปรอบที่แล้ว server-side apply ย้าย bookkeeping นั้นไปที่ API server เอง ซึ่ง track field manager ต่อ field ใน managedFields อยู่แล้ว',
   },
 ];
 

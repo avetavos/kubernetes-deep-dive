@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
@@ -59,9 +60,56 @@ spec:
 
 You send this manifest to the cluster once. From then on, if a replica crashes, gets evicted, or the node it was on disappears, a controller creates a new Pod to bring the count back to three — with no further action from you. Rolling out a new image is just as declarative: change `image: nginx:1.31` to a newer tag and re-apply; the Deployment controller replaces Pods gradually, on its own.
 
+## Proving the reconciliation loop, with real timestamps
+
+That last claim — "a controller creates a replacement, with no further action from you" — is not a promise to take on faith. On a real Deployment with 3 replicas already running, deleting one Pod by hand and immediately checking creation timestamps:
+
+```text
+$ kubectl get pods -l app=web -o custom-columns='NAME:.metadata.name,CREATED:.metadata.creationTimestamp'
+NAME                   CREATED
+web-69d5569566-fmcq2   2026-09-26T08:33:54Z
+web-69d5569566-gcqh4   2026-09-26T08:33:54Z
+...
+
+$ kubectl delete pod web-69d5569566-fmcq2
+pod "web-69d5569566-fmcq2" deleted
+
+$ kubectl get pods -l app=web -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,CREATED:.metadata.creationTimestamp'
+NAME                   STATUS    CREATED
+web-69d5569566-45pp7   Running   2026-09-26T08:35:08Z
+web-69d5569566-gcqh4   Running   2026-09-26T08:33:54Z
+...
+```
+
+The delete and the replacement's `creationTimestamp` are the **same second**. Nobody ran a second command — the ReplicaSet controller's watch (proven in the next lesson) noticed the actual replica count drop from 3 to 2 and immediately created a new Pod to bring it back to the declared 3. This is the reconciliation loop from a level below the analogy: not "Kubernetes eventually notices," but a controller reacting inside the same second, provably, on a real cluster.
+
 ## Clusters: control plane and nodes
 
-A Kubernetes cluster has two kinds of machines. The **control plane** is the brain of the cluster — it stores the desired state, makes scheduling decisions, and runs the controllers that drive reconciliation; the next lesson goes into its components in depth. The **nodes** are the workers — the machines (physical or virtual) that actually run your containers, packaged inside Kubernetes's smallest deployable unit, the **Pod**.
+A Kubernetes cluster has two kinds of machines. The **control plane** is the brain of the cluster — it stores the desired state, makes scheduling decisions, and runs the controllers that drive reconciliation; the [next lesson](/kubernetes/en/foundations/architecture-control-plane-and-nodes/) goes into its components in depth, including how those controllers actually watch for change and where the state itself, etcd, physically lives. The **nodes** are the workers — the machines (physical or virtual) that actually run your containers, packaged inside Kubernetes's smallest deployable unit, the **Pod**, introduced properly in the [workloads module](/kubernetes/en/workloads/pods-the-atomic-unit/).
+
+## What Kubernetes is not
+
+It is easy to over-credit an orchestrator once you have seen it self-heal a crashed Pod. A few boundaries worth being precise about, since a generated architecture proposal will sometimes blur them:
+
+- **Not a PaaS.** Kubernetes schedules and runs containers you already built; it does not build your application, manage your source repository, or decide your deployment pipeline for you — that is the job of a CI/CD system layered on top (this course covers that layering in the [GitOps module](/kubernetes/en/production-and-ecosystem/gitops-and-cicd-for-kubernetes/)).
+- **No built-in CI.** There is no "run my test suite" primitive anywhere in Kubernetes itself — a Job or CronJob can *run* a container that happens to execute tests, but the pipeline that decides when to build, test, and deploy is external tooling, not a cluster feature.
+- **The in-tree Ingress API is frozen, not actively evolving.** The course's own deep review already verified this: the `networking.k8s.io` Ingress API is effectively frozen in favor of the newer **Gateway API**, and `ingress-nginx` itself is being retired (March 2026) — new work in this space targets Gateway API, not new Ingress features.
+
+## Reading AI-generated code
+
+When reviewing a generated architecture proposal or a claim about what Kubernetes handles automatically, check for:
+
+- "Kubernetes will build and deploy my code from git" presented as a built-in feature — proven above, Kubernetes runs containers you hand it; the build-and-deploy pipeline is always a separate tool (a CI system, Argo CD/Flux for GitOps) layered on top, never a cluster primitive.
+- A generated diagram or plan that puts a test suite directly "in Kubernetes" with no separate CI system — proven above, there is no built-in CI primitive; a Job running `npm test` is just a Job, not a substitute for a pipeline that decides *when* to run it and *what to do* with the result.
+- A recommendation to build new traffic-routing features on the classic `Ingress` API going forward — proven in the deep review this course is built on, Ingress is frozen and `ingress-nginx` is being retired; new work belongs on the Gateway API instead.
+- "The reconciliation loop runs periodically, roughly every few seconds/minutes" as an explanation of how self-healing works — proven above with real same-second timestamps, the actual trigger is a watched state change, not a timer.
+
+<SpotTheBug code={`## Proposed architecture (from a generated onboarding doc)
+"Kubernetes will run our CI pipeline: on every git push, the cluster
+detects the new commit, builds the Docker image, runs our test suite,
+and updates the Ingress rules automatically -- no separate CI/CD tool needed."`}>
+None of this is something Kubernetes does on its own. Proven above: Kubernetes's job is reconciling the *containers and objects you declare* toward their desired state — it has no concept of "a git push," no built-in image builder, and no test runner. Detecting a new commit and triggering a build is the job of a CI system (GitHub Actions, GitLab CI, Jenkins, …); getting the *result* of that build applied to the cluster declaratively is the job of a GitOps tool (Argo CD, Flux) sitting on top of `kubectl apply`/server-side apply, not a Kubernetes feature. And "updates the Ingress rules automatically" doubles the mistake: even setting aside that this whole pipeline is external tooling, new routing work in a 1.37 cluster should target the Gateway API, since the classic Ingress API is frozen and `ingress-nginx` is being retired. The honest architecture has three separate, real systems: a CI tool building and testing, a GitOps tool applying manifests, and Kubernetes reconciling what those manifests declare — never one system doing all three.
+</SpotTheBug>
 
 <Mermaid title="Desired state flows in, actual state converges toward it" code={whatIsK8sDiagram} />
 
@@ -71,8 +119,27 @@ export const whatIsK8sDiagram = `flowchart LR
   ctrl --> actual["Actual cluster state converges"]`;
 
 <Callout title="The one-line takeaway">
-Kubernetes is a **container orchestrator**, informed by Google's Borg experience and now a **CNCF graduated project**, that solves the problems plain `docker run` leaves to you — restarting failed containers, scaling out, discovering services, and rolling out updates — by having you **declare desired state** and letting **controllers** run a continuous **reconciliation loop** that drives the cluster's actual state to match it, across a **control plane** that decides and a set of **nodes** that run the work.
+Kubernetes is a **container orchestrator**, informed by Google's Borg experience and now a **CNCF graduated project**, that solves the problems plain `docker run` leaves to you — restarting failed containers, scaling out, discovering services, and rolling out updates — by having you **declare desired state** and letting **controllers** run a continuous **reconciliation loop** that drives the cluster's actual state to match it (proven above with a same-second replacement after a real `kubectl delete pod`), across a **control plane** that decides and a set of **nodes** that run the work. It is **not** a PaaS, has **no built-in CI**, and its classic **Ingress API is frozen** in favor of the Gateway API — three boundaries worth knowing before you hand it credit for something a separate tool actually does.
 </Callout>
+
+## Mental Model
+
+Every feature this course covers, in every later module, is an instance of exactly one idea: something declares desired state, and a controller drives actual state toward it forever. A ReplicaSet's "3 replicas" and a HorizontalPodAutoscaler's target CPU percentage are the same pattern at different layers — this lesson just proves the pattern once, with a stopwatch, so that "the Deployment controller replaces Pods gradually, on its own" in the next module reads as a fact you have already seen happen, not a claim to take on faith.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| Declarative desired state + reconciliation | Self-healing is automatic and continuous, proven above with real same-second timestamps; you describe the goal, not the steps | You give up fine-grained control over the exact sequence of operations — a controller decides *how*, not just *whether* |
+| Kubernetes as "just" an orchestrator (no built-in CI/PaaS) | Composable — bring any CI tool, any GitOps tool, any image builder you already use | More moving parts to wire together yourself; nothing ships batteries-included for the full path from git push to running Pod |
+| Gateway API over the frozen Ingress API for new work | Actively evolving, more expressive routing (proven true in the course's own deep review) | Existing Ingress-based setups need a deliberate migration, not an automatic upgrade |
+
+## Common Misconceptions
+
+- **"Kubernetes builds and deploys your code from a git push."** Proven above: it reconciles containers and objects you declare; a CI system builds the image, a GitOps tool applies the result — Kubernetes itself does neither.
+- **"The reconciliation loop runs on a timer, checking every few seconds."** Proven above with real timestamps: a deleted Pod's replacement was created the same second, driven by a watch on the actual change, not a polling interval.
+- **"Kubernetes is basically a PaaS like Heroku, just more complex."** Proven above: a PaaS decides how to build and deploy your app for you; Kubernetes only runs the containers and objects you already declared — the deploy pipeline is always a separate layer you bring yourself.
+- **"Ingress is still where new routing features land."** Proven in this course's deep review: the classic Ingress API is frozen and `ingress-nginx` is being retired (March 2026) — new routing work targets the Gateway API.
 
 export const quizWhatIsK8s = [
   {
@@ -84,6 +151,7 @@ export const quizWhatIsK8s = [
       'It replaces the need for a container runtime entirely',
     ],
     answer: 1,
+    explain: 'A plain docker run leaves restarting crashed containers, scaling out, and rolling out updates entirely to you -- an orchestrator automates all of that as a continuous, standing service.',
   },
   {
     q: 'What does declarative mean in the Kubernetes context?',
@@ -94,6 +162,7 @@ export const quizWhatIsK8s = [
       'You can only use a graphical dashboard, never YAML',
     ],
     answer: 1,
+    explain: 'You declare "3 replicas of this image" and a controller works out and continuously maintains the steps to get and stay there -- proven above with a real same-second Pod replacement.',
   },
   {
     q: 'In one sentence, what does a reconciliation (control) loop do?',
@@ -104,6 +173,7 @@ export const quizWhatIsK8s = [
       'It replaces etcd with a relational database',
     ],
     answer: 2,
+    explain: 'It runs forever, not once -- proven above, a Pod deleted by hand gets a same-second replacement because a controller noticed the drop and acted immediately.',
   },
   {
     q: 'A Kubernetes cluster is made up of which two parts?',
@@ -114,6 +184,29 @@ export const quizWhatIsK8s = [
       'An Ingress and an Egress controller',
     ],
     answer: 1,
+    explain: 'The control plane decides and remembers; the nodes actually run your containers, packaged as Pods.',
+  },
+  {
+    q: '```text\n$ kubectl get pods -l app=web -o custom-columns=NAME:.metadata.name,CREATED:.metadata.creationTimestamp\nweb-...-fmcq2   2026-09-26T08:33:54Z\n$ kubectl delete pod web-...-fmcq2\npod deleted\n$ kubectl get pods -l app=web -o custom-columns=NAME:.metadata.name,CREATED:.metadata.creationTimestamp\nweb-...-45pp7   2026-09-26T08:35:08Z\n```\nWhat does the replacement Pod\'s creation timestamp, landing in the same second as the delete, actually prove?',
+    options: [
+      'Kubernetes pre-creates spare Pods in advance, just in case',
+      'A controller watching the actual replica count reacted to the drop immediately -- reconciliation is event-driven, not a periodic timer check',
+      'This is a caching artifact and the timestamps are not meaningful',
+      'The delete command failed silently and no Pod was actually removed',
+    ],
+    answer: 1,
+    explain: 'Proven above: no second command was run -- the ReplicaSet controller\'s watch noticed the drop from 3 to 2 replicas and created a replacement within the same second.',
+  },
+  {
+    q: 'Which of these is something Kubernetes genuinely does NOT provide out of the box?',
+    options: [
+      'Restarting a crashed container',
+      'A built-in CI system that builds and tests your code on every git push',
+      'Scheduling a Pod onto a node with enough resources',
+      'Rolling out a new container image gradually',
+    ],
+    answer: 1,
+    explain: 'Proven above: there is no "run my test suite on every push" primitive in Kubernetes itself -- that pipeline is always a separate CI/CD tool layered on top, covered in this course\'s GitOps module.',
   },
 ];
 

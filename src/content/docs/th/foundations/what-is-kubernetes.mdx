@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## ไอเดียหลักในหนึ่งประโยค
 
@@ -59,20 +60,86 @@ spec:
 
 คุณส่ง manifest นี้ให้ cluster แค่ครั้งเดียว จากนั้นถ้า replica ตัวไหน crash ถูก evict หรือ node ที่อยู่หายไป controller จะสร้าง Pod ใหม่ขึ้นมาให้จำนวนกลับเป็น 3 โดยคุณไม่ต้องทำอะไรเพิ่ม การ roll out image ใหม่ก็ declarative เหมือนกัน แค่เปลี่ยน `image: nginx:1.31` เป็น tag ใหม่แล้ว apply ซ้ำ Deployment controller จะทยอยแทนที่ Pod ให้เองทีละส่วน
 
+## พิสูจน์ reconciliation loop ด้วย timestamp จริง
+
+คำกล่าวอ้างข้างบน — "controller สร้าง Pod มาแทน โดยคุณไม่ต้องทำอะไรเพิ่ม" — ไม่ใช่สิ่งที่ต้องเชื่อเฉย ๆ บน Deployment จริงที่มี 3 replica รันอยู่แล้ว ลบ Pod หนึ่งตัวด้วยมือแล้วเช็ก creation timestamp ทันที
+
+```text
+$ kubectl get pods -l app=web -o custom-columns='NAME:.metadata.name,CREATED:.metadata.creationTimestamp'
+NAME                   CREATED
+web-69d5569566-fmcq2   2026-09-26T08:33:54Z
+web-69d5569566-gcqh4   2026-09-26T08:33:54Z
+...
+
+$ kubectl delete pod web-69d5569566-fmcq2
+pod "web-69d5569566-fmcq2" deleted
+
+$ kubectl get pods -l app=web -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,CREATED:.metadata.creationTimestamp'
+NAME                   STATUS    CREATED
+web-69d5569566-45pp7   Running   2026-09-26T08:35:08Z
+web-69d5569566-gcqh4   Running   2026-09-26T08:33:54Z
+...
+```
+
+การ delete กับ `creationTimestamp` ของตัวแทนคือ**วินาทีเดียวกัน** ไม่มีใครรันคำสั่งที่สองเลย — watch ของ ReplicaSet controller (พิสูจน์ในบทถัดไป) เห็น replica count ที่แท้จริงลดจาก 3 เหลือ 2 แล้วสร้าง Pod ใหม่ทันทีเพื่อให้กลับไปเป็น 3 ตามที่ declare ไว้ นี่คือ reconciliation loop ในระดับที่ลึกกว่าคำอุปมา ไม่ใช่ "Kubernetes จะสังเกตเห็นในที่สุด" แต่คือ controller ที่ตอบสนองภายในวินาทีเดียวกัน พิสูจน์ได้จริงบน cluster จริง
+
 ## Cluster ประกอบด้วย control plane และ node
 
-Kubernetes cluster มีเครื่องสองแบบ **control plane** คือสมองของ cluster เก็บ desired state ตัดสินใจเรื่อง scheduling และรัน controller ที่ขับเคลื่อน reconciliation — บทถัดไปจะลงลึกถึง component ของตัวเอง ส่วน **node** คือ worker คือเครื่อง (physical หรือ virtual) ที่รัน container ของคุณจริง ๆ โดยห่อหุ้มอยู่ใน unit ที่เล็กที่สุดที่ deploy ได้ของ Kubernetes เรียกว่า **Pod**
+Kubernetes cluster มีเครื่องสองแบบ **control plane** คือสมองของ cluster เก็บ desired state ตัดสินใจเรื่อง scheduling และรัน controller ที่ขับเคลื่อน reconciliation — [บทถัดไป](/kubernetes/th/foundations/architecture-control-plane-and-nodes/) จะลงลึกถึง component ของตัวเอง รวมถึงวิธีที่ controller เหล่านั้น watch การเปลี่ยนแปลงจริง ๆ และ state เอง คือ etcd อยู่ตรงไหนจริง ๆ ส่วน **node** คือ worker คือเครื่อง (physical หรือ virtual) ที่รัน container ของคุณจริง ๆ โดยห่อหุ้มอยู่ใน unit ที่เล็กที่สุดที่ deploy ได้ของ Kubernetes เรียกว่า **Pod** ซึ่งจะแนะนำอย่างจริงจังใน [module workloads](/kubernetes/th/workloads/pods-the-atomic-unit/)
 
-<Mermaid title="Desired state flows in, actual state converges toward it" code={whatIsK8sDiagram} />
+## Kubernetes ไม่ใช่อะไร
+
+การเห็น orchestrator ซ่อม Pod ที่ crash ให้เองครั้งหนึ่งก็ทำให้ให้เครดิตมันเกินได้ง่าย ๆ มีขอบเขตบางอย่างที่ควรพูดให้ชัด เพราะ architecture proposal ที่ generate มามักจะทำให้เส้นแบ่งพวกนี้เบลอ
+
+- **ไม่ใช่ PaaS** Kubernetes schedule และรัน container ที่คุณ build มาแล้ว มันไม่ build application ให้คุณ ไม่จัดการ source repository ของคุณ และไม่ตัดสินใจ deployment pipeline ให้คุณ — นั่นเป็นหน้าที่ของระบบ CI/CD ที่วางทับไว้ข้างบน (คอร์สนี้ครอบคลุมชั้นนั้นใน [module GitOps](/kubernetes/th/production-and-ecosystem/gitops-and-cicd-for-kubernetes/))
+- **ไม่มี CI ในตัว** ไม่มี primitive "รัน test suite ของฉัน" อยู่ใน Kubernetes เองที่ไหนเลย Job หรือ CronJob รัน container ที่บังเอิญไปรัน test ได้ แต่ pipeline ที่ตัดสินใจว่าเมื่อไหร่จะ build, test และ deploy คือ tooling ภายนอก ไม่ใช่ feature ของ cluster
+- **Ingress API แบบเดิมแช่แข็งแล้ว ไม่ได้พัฒนาต่อ** deep review ของคอร์สนี้เองยืนยันแล้ว Ingress API ของ `networking.k8s.io` แช่แข็งแล้วจริง ๆ เพื่อให้ **Gateway API** ตัวใหม่มาแทน และ `ingress-nginx` เองก็กำลังจะ retire (มีนาคม 2026) — งานใหม่ในพื้นที่นี้เล็งไปที่ Gateway API ไม่ใช่ feature ใหม่ของ Ingress
+
+<Mermaid title="Desired state ไหลเข้าไป actual state converge เข้าหามัน" code={whatIsK8sDiagram} />
 
 export const whatIsK8sDiagram = `flowchart LR
   you["You declare desired state (YAML)"] --> api["API server stores it"]
   api --> ctrl["Controllers watch & reconcile"]
   ctrl --> actual["Actual cluster state converges"]`;
 
-<Callout title="The one-line takeaway">
-Kubernetes เป็น **container orchestrator** ที่มาจากประสบการณ์ Borg ของ Google และตอนนี้เป็น **CNCF graduated project** โดยแก้ปัญหาที่ `docker run` เฉย ๆ ทิ้งให้คุณจัดการเอง ไม่ว่าจะเป็นการ restart container ที่ล้ม การ scale out การ discover service และการ roll out update ด้วยการให้คุณ **declare desired state** แล้วปล่อยให้ **controller** รัน **reconciliation loop** ต่อเนื่องเพื่อดัน actual state ของ cluster ให้ตรงกับ desired state นั้น ผ่าน **control plane** ที่ตัดสินใจ และ **node** ชุดหนึ่งที่รันงานจริง
+## อ่านโค้ดที่ AI เขียน
+
+ตอนรีวิว architecture proposal ที่ generate มา หรือคำกล่าวอ้างว่า Kubernetes จัดการอะไรให้อัตโนมัติ เช็กสิ่งเหล่านี้
+
+- "Kubernetes จะ build และ deploy โค้ดจาก git push ให้" ที่ถูกนำเสนอเป็น built-in feature — พิสูจน์ข้างบนแล้วว่า Kubernetes รัน container ที่คุณส่งให้ pipeline build-and-deploy เป็นเครื่องมือแยกเสมอ (ระบบ CI, Argo CD/Flux สำหรับ GitOps) วางทับไว้ข้างบน ไม่เคยเป็น primitive ของ cluster
+- diagram หรือ plan ที่ generate มาแล้วเอา test suite ไปวางไว้ "ใน Kubernetes" ตรง ๆ โดยไม่มีระบบ CI แยก — พิสูจน์ข้างบนแล้วว่าไม่มี primitive CI ในตัว Job ที่รัน `npm test` ก็แค่ Job ไม่ใช่ตัวแทน pipeline ที่ตัดสินใจว่า*เมื่อไหร่*จะรัน และ*จะทำอะไร*กับผลลัพธ์
+- คำแนะนำให้สร้าง traffic-routing feature ใหม่บน `Ingress` API แบบเดิมต่อไป — พิสูจน์ใน deep review ที่คอร์สนี้สร้างขึ้นบนนั้นแล้วว่า Ingress แช่แข็งและ `ingress-nginx` กำลังจะ retire งานใหม่ควรอยู่บน Gateway API แทน
+- "reconciliation loop รันเป็นช่วง ๆ ประมาณทุกไม่กี่วินาที/นาที" เป็นคำอธิบายว่า self-healing ทำงานยังไง — พิสูจน์ข้างบนด้วย timestamp จริงแล้วว่า trigger จริงคือ state ที่ถูก watch เปลี่ยน ไม่ใช่ timer
+
+<SpotTheBug code={`## Proposed architecture (from a generated onboarding doc)
+"Kubernetes will run our CI pipeline: on every git push, the cluster
+detects the new commit, builds the Docker image, runs our test suite,
+and updates the Ingress rules automatically -- no separate CI/CD tool needed."`}>
+ไม่มีสักอย่างในนี้ที่ Kubernetes ทำเองได้ พิสูจน์ข้างบนแล้วว่างานของ Kubernetes คือ reconcile *container และ object ที่คุณ declare* ให้ตรงกับ desired state — มันไม่มีแนวคิดเรื่อง "git push" เลย ไม่มี image builder ในตัว และไม่มี test runner การจับ commit ใหม่แล้ว trigger build เป็นหน้าที่ของระบบ CI (GitHub Actions, GitLab CI, Jenkins, …) การเอา*ผลลัพธ์*ของ build นั้นไป apply กับ cluster แบบ declarative เป็นหน้าที่ของ GitOps tool (Argo CD, Flux) ที่วางอยู่ทับ `kubectl apply`/server-side apply ไม่ใช่ feature ของ Kubernetes และ "อัปเดต Ingress rule ให้อัตโนมัติ" ยิ่งซ้ำความผิดพลาดสองชั้น แม้จะไม่พูดถึงว่าทั้ง pipeline นี้เป็น tooling ภายนอกแล้วก็ตาม งานเรื่อง routing ใหม่บน cluster 1.37 ควรเล็งไปที่ Gateway API เพราะ Ingress API แบบเดิมแช่แข็งแล้วและ `ingress-nginx` กำลังจะ retire architecture ที่ตรงไปตรงมาต้องมีสามระบบแยกกันจริง ๆ คือ CI tool ที่ build และ test, GitOps tool ที่ apply manifest และ Kubernetes ที่ reconcile สิ่งที่ manifest เหล่านั้น declare ไว้ — ไม่ใช่ระบบเดียวที่ทำทั้งสามอย่าง
+</SpotTheBug>
+
+<Callout title="สรุปหนึ่งบรรทัด">
+Kubernetes เป็น **container orchestrator** ที่มาจากประสบการณ์ Borg ของ Google และตอนนี้เป็น **CNCF graduated project** โดยแก้ปัญหาที่ `docker run` เฉย ๆ ทิ้งให้คุณจัดการเอง ไม่ว่าจะเป็นการ restart container ที่ล้ม การ scale out การ discover service และการ roll out update ด้วยการให้คุณ **declare desired state** แล้วปล่อยให้ **controller** รัน **reconciliation loop** ต่อเนื่องเพื่อดัน actual state ของ cluster ให้ตรงกับ desired state นั้น (พิสูจน์ข้างบนด้วยการแทนที่ Pod ภายในวินาทีเดียวกันหลัง `kubectl delete pod` จริง) ผ่าน **control plane** ที่ตัดสินใจ และ **node** ชุดหนึ่งที่รันงานจริง มัน**ไม่ใช่** PaaS **ไม่มี CI ในตัว** และ **Ingress API** แบบเดิมของมัน**แช่แข็งแล้ว**เพื่อให้ Gateway API มาแทน — สามขอบเขตที่ควรรู้ก่อนจะให้เครดิต Kubernetes กับสิ่งที่จริง ๆ แล้วเครื่องมือแยกต่างหากเป็นคนทำ
 </Callout>
+
+## Mental Model
+
+ทุก feature ที่คอร์สนี้ครอบคลุม ในทุก module ถัดไป คือตัวอย่างของไอเดียเดียวกันเป๊ะ คือมีบางอย่าง declare desired state แล้ว controller ขับเคลื่อน actual state ให้ไปหามันตลอดเวลา "3 replica" ของ ReplicaSet กับ target CPU percentage ของ HorizontalPodAutoscaler คือ pattern เดียวกันคนละชั้น — บทนี้แค่พิสูจน์ pattern นั้นครั้งเดียวด้วยนาฬิกาจับเวลา เพื่อให้ "Deployment controller ทยอยแทนที่ Pod ให้เองทีละส่วน" ใน module ถัดไป อ่านเป็นข้อเท็จจริงที่คุณเคยเห็นเกิดขึ้นแล้ว ไม่ใช่คำกล่าวอ้างที่ต้องเชื่อเฉย ๆ
+
+## ข้อแลกเปลี่ยน
+
+| ทางเลือก | ข้อดี | ต้นทุน |
+|---|---|---|
+| Declarative desired state + reconciliation | self-healing เกิดขึ้นอัตโนมัติและต่อเนื่อง พิสูจน์ข้างบนด้วย timestamp วินาทีเดียวกันจริง คุณอธิบายเป้าหมาย ไม่ใช่ขั้นตอน | คุณเสีย control ระดับละเอียดเหนือลำดับ operation ที่แท้จริงไป — controller เป็นคนตัดสินใจว่า *ยังไง* ไม่ใช่แค่ *จะทำไหม* |
+| Kubernetes เป็น "แค่" orchestrator (ไม่มี CI/PaaS ในตัว) | ประกอบร่างได้ — เอา CI tool, GitOps tool, image builder อะไรก็ได้ที่คุณใช้อยู่แล้วมาต่อ | มีชิ้นส่วนต้องต่อเองเยอะขึ้น ไม่มีอะไรมาพร้อมแบบ batteries-included ให้ตลอดทางจาก git push ถึง Pod ที่รันอยู่ |
+| Gateway API แทน Ingress API ที่แช่แข็งแล้วสำหรับงานใหม่ | พัฒนาต่อเนื่องอยู่ routing แสดงออกได้มากกว่า (พิสูจน์จริงใน deep review ของคอร์สนี้เอง) | setup ที่ใช้ Ingress อยู่แล้วต้อง migrate อย่างตั้งใจ ไม่ใช่ upgrade อัตโนมัติ |
+
+## ความเข้าใจผิดที่พบบ่อย
+
+- **"Kubernetes build และ deploy โค้ดจาก git push ให้"** พิสูจน์ข้างบนแล้วว่ามันแค่ reconcile container และ object ที่คุณ declare ระบบ CI เป็นคน build image GitOps tool เป็นคน apply ผลลัพธ์ — Kubernetes เองไม่ทำทั้งสองอย่าง
+- **"reconciliation loop รันตาม timer เช็กทุกไม่กี่วินาที"** พิสูจน์ข้างบนด้วย timestamp จริงแล้วว่า Pod ที่ถูกลบมีตัวแทนถูกสร้างในวินาทีเดียวกัน ขับเคลื่อนด้วย watch บนการเปลี่ยนแปลงจริง ไม่ใช่ polling interval
+- **"Kubernetes ก็คือ PaaS แบบ Heroku แค่ซับซ้อนกว่า"** พิสูจน์ข้างบนแล้วว่า PaaS ตัดสินใจวิธี build และ deploy แอปให้คุณ ส่วน Kubernetes แค่รัน container และ object ที่คุณ declare ไว้แล้วเท่านั้น — deploy pipeline เป็นชั้นแยกที่คุณต้องเอามาต่อเองเสมอ
+- **"Ingress ยังคือที่ที่ routing feature ใหม่จะลงมา"** พิสูจน์ใน deep review ของคอร์สนี้แล้วว่า Ingress API แบบเดิมแช่แข็งแล้ว และ `ingress-nginx` กำลังจะ retire (มีนาคม 2026) — งาน routing ใหม่เล็งไปที่ Gateway API
 
 export const quizWhatIsK8s = [
   {
@@ -84,6 +151,7 @@ export const quizWhatIsK8s = [
       'แทนที่ container runtime ไปเลยทั้งหมด',
     ],
     answer: 1,
+    explain: 'docker run เฉย ๆ ทิ้งการ restart container ที่ล้ม, scale out และ roll out update ให้คุณจัดการเอง — orchestrator ทำสิ่งนี้ให้อัตโนมัติแบบต่อเนื่อง',
   },
   {
     q: 'คำว่า declarative ในบริบทของ Kubernetes หมายความว่าอะไร',
@@ -94,6 +162,7 @@ export const quizWhatIsK8s = [
       'คุณใช้ได้แค่ graphical dashboard เท่านั้น ห้ามใช้ YAML',
     ],
     answer: 1,
+    explain: 'คุณ declare "3 replica ของ image นี้" แล้ว controller หาวิธีและรักษาให้อยู่ที่นั่นตลอด — พิสูจน์ข้างบนด้วยการแทนที่ Pod จริงภายในวินาทีเดียวกัน',
   },
   {
     q: 'พูดสั้น ๆ reconciliation (control) loop ทำหน้าที่อะไร',
@@ -104,6 +173,7 @@ export const quizWhatIsK8s = [
       'แทนที่ etcd ด้วย relational database',
     ],
     answer: 2,
+    explain: 'มันรันตลอดไป ไม่ใช่แค่ครั้งเดียว — พิสูจน์ข้างบนแล้วว่า Pod ที่ลบด้วยมือได้ตัวแทนภายในวินาทีเดียวกัน เพราะ controller สังเกตเห็นความลดลงแล้วลงมือทันที',
   },
   {
     q: 'Kubernetes cluster ประกอบด้วยสองส่วนอะไรบ้าง',
@@ -114,6 +184,29 @@ export const quizWhatIsK8s = [
       'Ingress controller กับ Egress controller',
     ],
     answer: 1,
+    explain: 'control plane ตัดสินใจและจดจำ ส่วน node รัน container ของคุณจริง ๆ ห่อหุ้มเป็น Pod',
+  },
+  {
+    q: '```text\n$ kubectl get pods -l app=web -o custom-columns=NAME:.metadata.name,CREATED:.metadata.creationTimestamp\nweb-...-fmcq2   2026-09-26T08:33:54Z\n$ kubectl delete pod web-...-fmcq2\npod deleted\n$ kubectl get pods -l app=web -o custom-columns=NAME:.metadata.name,CREATED:.metadata.creationTimestamp\nweb-...-45pp7   2026-09-26T08:35:08Z\n```\ncreation timestamp ของ Pod ที่มาแทน ซึ่งตกในวินาทีเดียวกับที่ delete นั้น พิสูจน์อะไรจริง ๆ',
+    options: [
+      'Kubernetes สร้าง Pod สำรองไว้ล่วงหน้าเผื่อไว้',
+      'controller ที่ watch replica count จริงตอบสนองต่อการลดลงทันที -- reconciliation ขับเคลื่อนด้วย event ไม่ใช่การเช็ก timer เป็นช่วง ๆ',
+      'นี่คือ artifact ของ cache และ timestamp ไม่มีความหมายอะไร',
+      'คำสั่ง delete ล้มเหลวแบบเงียบ ๆ และไม่มี Pod ถูกลบจริง',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบนแล้วว่าไม่มีการรันคำสั่งที่สองเลย -- watch ของ ReplicaSet controller เห็นความลดลงจาก 3 เหลือ 2 replica แล้วสร้างตัวแทนภายในวินาทีเดียวกัน',
+  },
+  {
+    q: 'ข้อไหนคือสิ่งที่ Kubernetes ไม่ได้ให้มาในตัวจริง ๆ',
+    options: [
+      'restart container ที่ crash',
+      'ระบบ CI ในตัวที่ build และ test โค้ดของคุณทุกครั้งที่ push',
+      'schedule Pod ไปที่ node ที่มี resource พอ',
+      'roll out container image ใหม่แบบทยอย',
+    ],
+    answer: 1,
+    explain: 'พิสูจน์ข้างบนแล้วว่าไม่มี primitive "รัน test suite ทุกครั้งที่ push" อยู่ใน Kubernetes เอง -- pipeline แบบนั้นเป็น CI/CD tool แยกต่างหากที่วางทับไว้ข้างบนเสมอ ครอบคลุมใน module GitOps ของคอร์สนี้',
   },
 ];
 

@@ -9,6 +9,7 @@ import Mermaid from '../../../../components/Mermaid.astro';
 import Callout from '../../../../components/Callout.astro';
 import Quiz from '../../../../components/Quiz.tsx';
 import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+import SpotTheBug from '../../../../components/SpotTheBug.astro';
 
 ## The idea in one sentence
 
@@ -48,6 +49,119 @@ kubectl describe node <node-name>
 
 This is the architectural fact worth memorizing: **kube-scheduler, kube-controller-manager, kubelet, and everything else never touch etcd directly.** They all read and write cluster state exclusively by calling the API server, which is the single source of truth and authority for the entire cluster. This gives Kubernetes one consistent point for authentication, authorization, validation, and watch notifications — every controller and every kubelet is really just a client of the same REST API you use with `kubectl`.
 
+## How controllers actually notice a change: watches, not polling
+
+Every controller and every `kubectl get --watch` opens a long-lived HTTP connection to the API server and receives a stream of `ADDED`/`MODIFIED`/`DELETED` events the instant something changes — it is never polling in a loop. `--output-watch-events` shows the event type alongside the usual columns. Proof: a watch started on a namespace, then a Pod created and deleted while it runs:
+
+```bash
+kubectl get pods -n foundations-demo --watch --output-watch-events -o wide
+```
+
+Real stream (existing Pods arrive as `ADDED` first, then a brand-new Pod's full lifecycle plays out as a sequence of `MODIFIED` events, ending in `DELETED`):
+
+```text
+EVENT      NAME                   READY   STATUS    RESTARTS   AGE   IP            NODE
+ADDED      web-69d5569566-fmcq2   1/1     Running   0          19s   10.244.2.10   foundations-worker
+ADDED      watchtest              0/1     Pending   0          0s    <none>        <none>
+MODIFIED   watchtest              0/1     Pending   0          0s    <none>        foundations-worker2
+MODIFIED   watchtest              0/1     ContainerCreating   0     0s    <none>        foundations-worker2
+MODIFIED   watchtest              1/1     Running             0     1s    10.244.1.9    foundations-worker2
+MODIFIED   watchtest              1/1     Terminating         0     3s    10.244.1.9    foundations-worker2
+MODIFIED   watchtest              0/1     Completed           0     3s    10.244.1.9    foundations-worker2
+DELETED    watchtest              0/1     Completed           0     4s    10.244.1.9    foundations-worker2
+```
+
+Every one of those lines is the API server pushing a change down an already-open connection — this is exactly the mechanism kube-controller-manager, kube-scheduler, and kubelet all use to react to cluster state instead of asking "did anything change yet?" in a loop. The deeper mechanics — `resourceVersion`, watch bookmarks, and how an **informer** builds a local cache on top of this same stream — belong to the internals module; this lesson only needs you to recognize that "controllers react" means "controllers watch."
+
+## `kubectl get --raw`: talking to the API server with nothing in between
+
+`kubectl get --raw <path>` sends a request straight at an API server path and prints the raw response — no object formatting, no table view — useful for endpoints that aren't a normal resource at all:
+
+```text
+$ kubectl get --raw /healthz
+ok
+
+$ kubectl get --raw /version
+{
+  "major": "1",
+  "minor": "37",
+  "gitVersion": "v1.37.0",
+  "gitCommit": "f54c212e3a2f75d674b717a9b29052b20b60aefc",
+  "buildDate": "2026-08-26T10:44:25Z",
+  "goVersion": "go1.26.6",
+  "platform": "linux/arm64"
+}
+```
+
+## `-v=8`: watching kubectl's own HTTP requests
+
+Every `kubectl` command is, underneath, an HTTP call to the API server — `-v=8` prints the real request line, headers, and response body kubectl sends and receives, which is the fastest way to stop guessing what a command "really does":
+
+```text
+$ kubectl get pods -n foundations-demo -v=8
+...
+I0926 15:34:31.288997 round_trippers.go:527] "Request" verb="GET" url="https://127.0.0.1:52255/api/v1/namespaces/foundations-demo/pods?limit=500"
+I0926 15:34:31.296968 round_trippers.go:632] "Response" status="200 OK" headers=<...>
+I0926 15:34:31.297057 helper.go:113] "Response Body" body="{\"kind\":\"Table\",\"apiVersion\":\"meta.k8s.io/v1\", ...}"
+```
+
+`kubectl get` without `-o` actually requests `meta.k8s.io/v1, Kind=Table` from the server — the column formatting you see in a normal `kubectl get pods` is computed server-side and sent back as structured data, not guessed by the client from a plain object list.
+
+## Where etcd actually lives in a kind cluster
+
+kind runs the control plane the same way `kubeadm` does anywhere else: as **static Pods**, defined by plain manifest files that kubelet watches directly on disk, not through the API server. On the control-plane node:
+
+```text
+$ docker exec foundations-control-plane ls /etc/kubernetes/manifests/
+etcd.yaml
+kube-apiserver.yaml
+kube-controller-manager.yaml
+kube-scheduler.yaml
+```
+
+Real (trimmed) `etcd.yaml` — this is the exact command line etcd starts with, no abstraction in between:
+
+```text
+$ docker exec foundations-control-plane cat /etc/kubernetes/manifests/etcd.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: etcd
+  namespace: kube-system
+spec:
+  containers:
+  - command:
+    - etcd
+    - --advertise-client-urls=https://172.19.0.7:2379
+    - --data-dir=/var/lib/etcd
+    - --initial-cluster=foundations-control-plane=https://172.19.0.7:2380
+    - --listen-client-urls=https://127.0.0.1:2379,https://172.19.0.7:2379
+```
+
+The kind node image ships no `etcdctl` binary, so `member list` isn't available inside the node the way it might be on a kubeadm cluster you built yourself with the full etcd tooling installed — the honest fallback for "is etcd healthy" on kind is watching its static Pod through the API server like anything else:
+
+```text
+$ kubectl -n kube-system get pods
+NAME                                                READY   STATUS    RESTARTS   AGE
+etcd-foundations-control-plane                      1/1     Running   0          3m24s
+kube-apiserver-foundations-control-plane            1/1     Running   0          3m24s
+kube-controller-manager-foundations-control-plane   1/1     Running   0          3m23s
+kube-scheduler-foundations-control-plane            1/1     Running   0          3m24s
+```
+
+## kubelet and the container runtime, on a real node
+
+On a worker node, `kubelet` and `containerd` are separate host processes — kubelet never runs a container itself, it tells containerd (via CRI) to do it, and containerd hands each container off to a `containerd-shim-runc-v2` process:
+
+```text
+$ docker exec foundations-worker sh -c 'ps aux | grep -E "kubelet|containerd" | grep -v grep'
+root   130  /usr/local/bin/containerd
+root   242  /usr/bin/kubelet --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf --config=/var/lib/kubelet/config.yaml
+root   294  /usr/local/bin/containerd-shim-runc-v2 -namespace k8s.io -id bf542e6a6f4bd107dc83be43e581da8a6b297fb39d17fbfb1291a33f75834384
+```
+
+One shim process per running container, each a direct child of containerd, not of kubelet — kubelet's job stops at telling containerd what should be running; it is containerd (and the shim underneath it) that actually owns the running process tree.
+
 <Mermaid title="Control plane and node components, and the single path to etcd" code={architectureDiagram} />
 
 export const architectureDiagram = `flowchart TB
@@ -68,9 +182,46 @@ export const architectureDiagram = `flowchart TB
   kubelet --> api
   proxy --> api`;
 
+## Reading AI-generated code
+
+When reviewing generated architecture diagrams, runbooks, or debugging instructions, check for:
+
+- Any instruction to `curl` or otherwise talk to etcd directly from an application or a script — proven above, only the API server is meant to touch etcd; a healthy cluster's etcd port is not something your own workloads should ever be pointed at.
+- "Poll the API server every N seconds to detect changes" as a design for a controller or automation script — proven above, the real mechanism every built-in controller uses is a **watch** (a long-lived connection receiving `ADDED`/`MODIFIED`/`DELETED` events), not polling; a generated controller sketch that polls is describing something much slower and heavier than what Kubernetes itself does.
+- Debugging instructions for a managed cloud cluster (EKS/GKE/AKS) that say to `docker exec` into a control-plane node or read `/etc/kubernetes/manifests/etcd.yaml` — proven above, that path is real for a **kubeadm-style** cluster (including kind), but a managed cluster's control plane is not run as Pods on nodes you can shell into at all; the equivalent commands don't exist there.
+- `etcdctl` assumed to be present on every Kubernetes node — proven above, it is not part of the kind node image; the fallback (`kubectl -n kube-system get pods`) is a real, working substitute worth knowing, not a compromise.
+- Confusing kubelet with the container runtime — proven above, kubelet only calls containerd (via CRI); it is containerd and its shim process that actually own the running container process tree.
+
+<SpotTheBug code={`# From a generated "custom health checker" script
+ETCD_ENDPOINT="https://172.19.0.7:2379"
+curl --cacert /etc/kubernetes/pki/etcd/ca.crt "\$ETCD_ENDPOINT/health"
+# ...then feed the result straight into a scaling decision`}>
+This script talks to etcd directly from outside the control plane, bypassing the API server entirely. Proven above, in a real kind cluster: kube-scheduler, kube-controller-manager, kubelet, and every `kubectl` command all reach etcd through exactly one door, the API server — nothing else is meant to open a client connection to it. Even setting aside that etcd's client certs (`/etc/kubernetes/pki/etcd/*`) are not something an application should ever hold, basing a scaling decision on a raw etcd health check throws away every authentication, authorization, validation, and watch-notification guarantee the API server exists to provide. The fix is `kubectl get --raw /healthz` (or the equivalent client-go call against the API server), proven above to be the real, supported way to ask "is the API reachable" without touching etcd at all.
+</SpotTheBug>
+
 <Callout title="The one-line takeaway">
-The **control plane** — **kube-apiserver**, **etcd**, **kube-scheduler**, and **kube-controller-manager** (plus an optional **cloud-controller-manager**) — decides what should happen and remembers all cluster state, while each **node** runs **kubelet** (which actually starts and watches containers), **kube-proxy** (which makes Services reachable), and a **container runtime** speaking **CRI**; every one of these components, without exception, reads and writes state only through the **API server**, which is the sole gateway to **etcd**.
+The **control plane** — **kube-apiserver**, **etcd**, **kube-scheduler**, and **kube-controller-manager** (plus an optional **cloud-controller-manager**) — decides what should happen and remembers all cluster state, while each **node** runs **kubelet** (which actually starts and watches containers via containerd/CRI, proven above), **kube-proxy** (which makes Services reachable), and a **container runtime** speaking **CRI**; every one of these components, without exception, reads and writes state only through the **API server** by opening a **watch** rather than polling (proven above with a real event stream), and the API server is the sole gateway to **etcd**, which on a kind/kubeadm cluster lives as a static Pod defined in `/etc/kubernetes/manifests/etcd.yaml` (proven above). `kubectl get --raw` and `-v=8` are the two fastest ways to see exactly what kubectl actually asks the API server.
 </Callout>
+
+## Mental Model
+
+Treat the control plane as a database (etcd) with exactly one front door (the API server) and a small crowd of clients standing outside that door, all doing the same two things forever: reading the current state through a watch, and writing back the small delta needed to move it toward what's desired. kube-scheduler, kube-controller-manager, kubelet, kube-proxy, and `kubectl` itself are architecturally identical from etcd's point of view — every one of them is just another watch-and-patch client of the same REST API, with no back door and no special access. Once that clicks, "why can't I read etcd directly on my managed cluster" and "why does `kubectl get --watch` never seem to stop" both answer themselves: there is no other way in, and there is no polling loop to stop.
+
+## Trade-offs
+
+| Choice | Benefit | Cost |
+|---|---|---|
+| Single API server as the only etcd client | One consistent point for auth, validation, and watch notifications (proven above) | Every component's availability is bounded by API server availability — no component has a private fallback path to state |
+| Watches instead of polling | Near-instant reaction to change, proven above with a real event stream; no wasted "did anything change?" requests | A controller must handle a dropped/expired watch connection and re-list, which is more state to manage correctly than a naive poll loop |
+| Static Pods for the control plane (kubeadm/kind) | Simple, inspectable — literally a YAML file kubelet watches on disk, provable with `docker exec` + `cat` above | Not how a managed cloud cluster works at all; debugging instructions written against kind/kubeadm do not transfer |
+| kubelet delegates to containerd via CRI instead of running containers itself | Runtime is swappable (containerd, CRI-O) without changing kubelet | One more process boundary and one more thing that can be out of sync (kubelet up, containerd degraded, or vice versa) |
+
+## Common Misconceptions
+
+- **"An application or script can talk to etcd directly for a quick read, as long as it has the certs."** Proven above: nothing but the API server is meant to touch etcd, and the SpotTheBug above shows exactly why that matters — every other guarantee (auth, validation, watch notifications) is bypassed the moment you do.
+- **"Controllers detect change by polling the API server on a timer."** Proven above with a real `--output-watch-events` stream: the actual mechanism is a long-lived watch connection receiving push events, not a request-response poll loop.
+- **"Every Kubernetes cluster has an `/etc/kubernetes/manifests/` directory you can inspect for the control plane."** Proven above: true for kind and any kubeadm-built cluster, but not for a managed cloud cluster (EKS/GKE/AKS), where the control plane isn't Pods on nodes you can reach at all.
+- **"kubelet runs containers."** Proven above: kubelet calls containerd through the Container Runtime Interface; it is containerd (and its per-container shim process) that actually owns the running process.
 
 export const quizArchitecture = [
   {
@@ -82,6 +233,7 @@ export const quizArchitecture = [
       'The credentials used to authenticate to kubectl',
     ],
     answer: 2,
+    explain: 'etcd is the distributed, consistent key-value store holding every object and its status -- if it is lost without a backup, the cluster\'s memory is lost with it.',
   },
   {
     q: 'What is kubelet responsible for on a node?',
@@ -92,6 +244,7 @@ export const quizArchitecture = [
       'Storing the cluster manifests submitted with kubectl apply',
     ],
     answer: 2,
+    explain: 'kubelet is the node agent -- proven above, it delegates the actual container process to containerd via CRI, but it is kubelet that ensures the right containers exist, restarts them, runs probes, and reports status.',
   },
   {
     q: 'Which component decides which node a newly created Pod is scheduled to?',
@@ -102,6 +255,7 @@ export const quizArchitecture = [
       'kube-scheduler',
     ],
     answer: 3,
+    explain: 'kube-scheduler watches for Pods with no node assigned and decides which node each should run on, based on resource requirements, constraints, and current cluster load.',
   },
   {
     q: 'Why is the API server the only component that talks directly to etcd?',
@@ -112,6 +266,29 @@ export const quizArchitecture = [
       'kube-scheduler requires exclusive write access to function',
     ],
     answer: 1,
+    explain: 'One gateway means one consistent point for authentication, authorization, validation, and watch notifications -- proven above, bypassing it (as in the SpotTheBug) throws all of that away.',
+  },
+  {
+    q: '```text\nEVENT      NAME        READY   STATUS    RESTARTS   AGE\nADDED      watchtest   0/1     Pending   0          0s\nMODIFIED   watchtest   1/1     Running   0          1s\nMODIFIED   watchtest   0/1     Completed 0          3s\nDELETED    watchtest   0/1     Completed 0          4s\n```\nThis is real output from `kubectl get pods --output-watch-events`. What does it prove about how controllers detect change?',
+    options: [
+      'Kubernetes polls the API server on a fixed interval and reports differences',
+      'This is a long-lived watch connection pushing ADDED/MODIFIED/DELETED events as they happen -- the same mechanism every built-in controller uses to react to state changes',
+      'This output only applies to kubectl, not to internal controllers',
+      'Each line represents a separate, independent kubectl request',
+    ],
+    answer: 1,
+    explain: 'Proven above: a watch is one open connection receiving a stream of events, not repeated polling -- kube-controller-manager, kube-scheduler, and kubelet all use this exact mechanism.',
+  },
+  {
+    q: '```text\n$ docker exec foundations-control-plane cat /etc/kubernetes/manifests/etcd.yaml\napiVersion: v1\nkind: Pod\nmetadata:\n  name: etcd\n  namespace: kube-system\n```\nWhat does this real file prove about how a kind (or kubeadm-built) cluster runs its control plane?',
+    options: [
+      'etcd runs as a systemd service, unrelated to Kubernetes',
+      'etcd (and the rest of the control plane) runs as a static Pod, defined by a manifest file kubelet watches directly on disk -- this does not apply to managed cloud clusters',
+      'This file only exists in a test/demo environment, never in a real kubeadm cluster',
+      'etcd is optional and this file can be deleted safely',
+    ],
+    answer: 1,
+    explain: 'Proven above: kind runs the control plane exactly the way kubeadm does, as static Pods kubelet finds on disk -- a fact that does not transfer to a managed cloud cluster, whose control plane you cannot docker exec into at all.',
   },
 ];
 
